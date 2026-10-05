@@ -241,7 +241,9 @@ async fn call_openai_compatible(config: &ProviderConfig, prompt: &str) -> Result
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut request = client.post(endpoint).json(&serde_json::json!({ "model": config.model, "messages": [{ "role": "user", "content": prompt }], "stream": false }));
+    let mut request = client
+        .post(endpoint)
+        .json(&completion_request_body(&config.model, prompt));
     if !config.api_key.trim().is_empty() {
         request = request.bearer_auth(&config.api_key);
     }
@@ -252,9 +254,16 @@ async fn call_openai_compatible(config: &ProviderConfig, prompt: &str) -> Result
     let status = response.status();
     let body = response.text().await.map_err(|e| e.to_string())?;
     if !status.is_success() {
+        let hint = if status == reqwest::StatusCode::FORBIDDEN {
+            " Check that this API key is authorized for the selected model and that the provider account permits inference."
+        } else if status == reqwest::StatusCode::UNAUTHORIZED {
+            " Check that the API key is valid and has not expired."
+        } else {
+            ""
+        };
         return Err(format!(
-            "provider returned HTTP {status}: {}",
-            redact_body(&body)
+            "provider returned HTTP {status}:{hint} {}",
+            redact_body(&body),
         ));
     }
     let completion: ChatCompletionResponse =
@@ -264,6 +273,15 @@ async fn call_openai_compatible(config: &ProviderConfig, prompt: &str) -> Result
         .first()
         .and_then(|choice| content_text(&choice.message.content))
         .ok_or_else(|| "provider returned no choices".into())
+}
+
+fn completion_request_body(model: &str, prompt: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "stream": false,
+        "max_completion_tokens": 2048,
+    })
 }
 
 fn content_text(content: &serde_json::Value) -> Option<String> {
@@ -332,5 +350,13 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn completion_request_uses_strict_max_completion_tokens() {
+        let body = super::completion_request_body("gpt-5-nano", "hello");
+        assert_eq!(body["max_completion_tokens"], 2048);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["model"], "gpt-5-nano");
     }
 }
