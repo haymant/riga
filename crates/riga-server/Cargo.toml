@@ -9,7 +9,7 @@ description = "RIGA authenticated HTTP adapter"
 
 [dependencies]
 async-stream = "0.3"
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 riga-kernel = { path = "../riga-kernel" }
 serde = { version = "1", features = ["derive"] }

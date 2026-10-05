@@ -1,0 +1,22 @@
+{
+  "status": "PASS",
+  "command": "npm run start",
+  "preview_url": "https://1420-i9141dqdryhi087rg9m0a-3c741fda.sg2.manus.computer/",
+  "checks": [
+    { "name": "single_command_startup", "status": "PASS" },
+    { "name": "public_vite_host_allowlist", "status": "PASS" },
+    { "name": "manus_routes_manifest", "status": "PASS" },
+    { "name": "health_proxy", "status": "PASS" },
+    { "name": "public_browser_render", "status": "PASS" },
+    { "name": "public_websocket_handshake", "status": "PASS" },
+    { "name": "public_websocket_kernel_event_stream", "status": "PASS" },
+    { "name": "vitest", "status": "PASS", "tests": 9, "line_coverage": 81.96, "branch_coverage": 92.68, "function_coverage": 95.23 },
+    { "name": "rust_workspace", "status": "PASS" },
+    { "name": "production_build", "status": "PASS" }
+  ],
+  "transport": {
+    "websocket": "/ws",
+    "sse_compatibility": "/runs/{run_id}/events",
+    "http": ["/health", "/sessions"]
+  }
+}

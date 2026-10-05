@@ -53,3 +53,5 @@ export class RigaHttpClient {
     return (await response.json()) as T;
   }
 }
+
+export * from "./websocket";

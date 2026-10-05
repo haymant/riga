@@ -1,0 +1,121 @@
+import type { RigaEventEnvelope } from "./index";
+
+export type RigaWebSocketClientMessage =
+  | { type: "hello"; client_version: string }
+  | { type: "start_run"; run_id: string; session_id: string; prompt: string }
+  | { type: "cancel_run"; run_id: string }
+  | { type: "approval"; run_id: string; approval_id: string; approved: boolean }
+  | { type: "ping"; nonce: string };
+
+export type RigaWebSocketServerMessage =
+  | { type: "ready"; protocol_version: number; server_version: string }
+  | { type: "event"; envelope: RigaEventEnvelope }
+  | { type: "run_cancelled"; run_id: string }
+  | { type: "approval_recorded"; run_id: string; approval_id: string; approved: boolean }
+  | { type: "pong"; nonce: string }
+  | { type: "error"; code: string; message: string };
+
+export interface RigaWebSocketLike {
+  onopen: (() => void) | null;
+  onmessage: ((event: { data: string }) => void) | null;
+  onerror: (() => void) | null;
+  onclose: (() => void) | null;
+  send(data: string): void;
+  close(): void;
+}
+
+export type RigaWebSocketFactory = (url: string) => RigaWebSocketLike;
+
+export class RigaWebSocketClient {
+  private socket: RigaWebSocketLike | null = null;
+  private ready: Promise<void> | null = null;
+  private readonly makeSocket: RigaWebSocketFactory;
+  private readonly onEvent: (envelope: RigaEventEnvelope) => void;
+  private readonly onStatus: (status: "connecting" | "connected" | "closed" | "error") => void;
+
+  constructor(options: { url: string; onEvent: (envelope: RigaEventEnvelope) => void; onStatus?: (status: "connecting" | "connected" | "closed" | "error") => void; socketFactory?: RigaWebSocketFactory }) {
+    this.url = options.url;
+    this.onEvent = options.onEvent;
+    this.onStatus = options.onStatus ?? (() => undefined);
+    this.makeSocket = options.socketFactory ?? ((url) => {
+      const native = new WebSocket(url);
+      let onopen: (() => void) | null = null;
+      let onmessage: ((event: { data: string }) => void) | null = null;
+      let onerror: (() => void) | null = null;
+      let onclose: (() => void) | null = null;
+      native.onopen = () => onopen?.();
+      native.onmessage = (event) => onmessage?.({ data: event.data });
+      native.onerror = () => onerror?.();
+      native.onclose = () => onclose?.();
+      return {
+        get onopen() { return onopen; },
+        set onopen(value) { onopen = value; },
+        get onmessage() { return onmessage; },
+        set onmessage(value) { onmessage = value; },
+        get onerror() { return onerror; },
+        set onerror(value) { onerror = value; },
+        get onclose() { return onclose; },
+        set onclose(value) { onclose = value; },
+        send: (data: string) => native.send(data),
+        close: () => native.close(),
+      } satisfies RigaWebSocketLike;
+    });
+  }
+
+  private readonly url: string;
+
+  connect(): Promise<void> {
+    if (this.ready) return this.ready;
+    this.onStatus("connecting");
+    this.ready = new Promise<void>((resolve, reject) => {
+      const socket = this.makeSocket(this.url);
+      this.socket = socket;
+      socket.onopen = () => {
+        this.send({ type: "hello", client_version: "0.1.0" });
+      };
+      socket.onmessage = (message) => {
+        const parsed = JSON.parse(message.data) as RigaWebSocketServerMessage;
+        if (parsed.type === "ready") {
+          this.onStatus("connected");
+          resolve();
+        } else if (parsed.type === "event") {
+          this.onEvent(parsed.envelope);
+        } else if (parsed.type === "error") {
+          this.onStatus("error");
+        }
+      };
+      socket.onerror = () => {
+        this.onStatus("error");
+        reject(new Error("RIGA WebSocket connection failed"));
+      };
+      socket.onclose = () => this.onStatus("closed");
+    });
+    return this.ready;
+  }
+
+  async startRun(runId: string, sessionId: string, prompt: string): Promise<void> {
+    await this.connect();
+    this.send({ type: "start_run", run_id: runId, session_id: sessionId, prompt });
+  }
+
+  async cancelRun(runId: string): Promise<void> {
+    await this.connect();
+    this.send({ type: "cancel_run", run_id: runId });
+  }
+
+  async respondToApproval(runId: string, approvalId: string, approved: boolean): Promise<void> {
+    await this.connect();
+    this.send({ type: "approval", run_id: runId, approval_id: approvalId, approved });
+  }
+
+  close(): void {
+    this.socket?.close();
+    this.socket = null;
+    this.ready = null;
+  }
+
+  private send(message: RigaWebSocketClientMessage): void {
+    if (!this.socket) throw new Error("RIGA WebSocket is not connected");
+    this.socket.send(JSON.stringify(message));
+  }
+}

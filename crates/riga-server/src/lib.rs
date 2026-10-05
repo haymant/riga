@@ -23,6 +23,8 @@ use riga_kernel::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+pub mod ws;
+
 pub const ADAPTER_NAME: &str = "riga-server";
 
 #[derive(Clone)]
@@ -57,7 +59,12 @@ pub fn router(state: ServerState) -> Router {
         .route("/health", get(health))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/runs/{run_id}/events", get(stream_events))
+        .route("/ws", get(ws_upgrade))
         .with_state(state)
+}
+
+async fn ws_upgrade(upgrade: axum::extract::ws::WebSocketUpgrade) -> impl IntoResponse {
+    upgrade.on_upgrade(ws::upgrade)
 }
 
 async fn health() -> Json<HealthResponse> {

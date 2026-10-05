@@ -1,5 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { createRoot } from "react-dom/client";
 import { RIGA_ASSISTANT_UI_VERSION } from "@riga/assistant-ui";
+import { RigaWebSocketClient, type RigaEventEnvelope } from "@riga/transport-http";
 import {
   Bell,
   Bot,
@@ -55,8 +57,32 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [transportStatus, setTransportStatus] = useState<"connecting" | "connected" | "closed" | "error">("connecting");
+  const transportRef = useRef<RigaWebSocketClient | null>(null);
 
   const activeSession = useMemo(() => sessions.find((session) => session.active) ?? sessions[0], [sessions]);
+
+  useEffect(() => {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const client = new RigaWebSocketClient({
+      url: `${protocol}//${window.location.host}/ws`,
+      onStatus: setTransportStatus,
+      onEvent: (envelope: RigaEventEnvelope) => {
+        const event = envelope.event;
+        if (typeof event === "object" && event !== null && "TextDelta" in event) {
+          const delta = (event as { TextDelta: { delta: string } }).TextDelta.delta;
+          setTranscript((current) => [...current, { id: envelope.event_id, role: "assistant", text: delta, time: "now" }]);
+        } else if (typeof event === "object" && event !== null && "RunCompleted" in event) {
+          setIsRunning(false);
+        } else if (event === "RunStarted") {
+          setIsRunning(true);
+        }
+      },
+    });
+    transportRef.current = client;
+    client.connect().catch(() => setTransportStatus("error"));
+    return () => client.close();
+  }, []);
 
   function selectSession(id: string) {
     setSessions((current) => current.map((session) => ({ ...session, active: session.id === id })));
@@ -77,6 +103,13 @@ function App() {
     setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "user", text, time: "now" }]);
     setDraft("");
     setIsRunning(true);
+    if (transportRef.current && transportStatus === "connected") {
+      void transportRef.current.startRun(crypto.randomUUID(), activeSession.id, text).catch(() => {
+        setTransportStatus("error");
+        setIsRunning(false);
+      });
+      return;
+    }
     window.setTimeout(() => {
       setTranscript((current) => [
         ...current,
@@ -89,6 +122,7 @@ function App() {
 
   function approve() {
     setApproval(false);
+    void transportRef.current?.respondToApproval("active-run", "transport-write", true);
     setIsRunning(true);
     setTranscript((current) => [
       ...current,
@@ -104,6 +138,7 @@ function App() {
 
   function deny() {
     setApproval(false);
+    void transportRef.current?.respondToApproval("active-run", "transport-write", false);
     setToast("Approval declined; no workspace mutation was made");
   }
 
@@ -132,7 +167,7 @@ function App() {
           ))}
         </nav>
         <div className="sidebar-footer">
-          <div className="connection-status"><span className="online-dot" /> Local kernel connected · UI {RIGA_ASSISTANT_UI_VERSION}</div>
+          <div className="connection-status"><span className={transportStatus === "connected" ? "online-dot" : "pulse-dot"} /> WebSocket {transportStatus} · UI {RIGA_ASSISTANT_UI_VERSION}</div>
           <button className="footer-link"><Settings2 size={15} /> Settings <span>⌘ ,</span></button>
           <button className="footer-link"><Bell size={15} /> Notifications <span className="notification-count">2</span></button>
         </div>
@@ -146,7 +181,7 @@ function App() {
           <div className="topbar-actions"><div className="run-indicator"><span className={isRunning ? "pulse-dot" : "online-dot"} /> {isRunning ? "Run in progress" : "Ready"}</div><button className="icon-button" aria-label="More options"><MoreHorizontal size={19} /></button><div className="avatar">AM</div></div>
         </header>
 
-        <section className="run-strip"><div className="run-strip-main"><div className="run-icon"><Sparkles size={16} /></div><div><strong>Agent run</strong><span>{isRunning ? "Executing with approval policy" : "Paused at approval checkpoint"}</span></div></div><div className="run-strip-meta"><span><GitBranch size={14} /> main</span><span><Clock3 size={14} /> 00:42</span>{isRunning && <button className="stop-run" onClick={() => { setIsRunning(false); setToast("Run cancelled safely"); }}><CircleStop size={14} /> Stop</button>}</div></section>
+        <section className="run-strip"><div className="run-strip-main"><div className="run-icon"><Sparkles size={16} /></div><div><strong>Agent run</strong><span>{isRunning ? "Executing with approval policy" : "Paused at approval checkpoint"}</span></div></div><div className="run-strip-meta"><span><GitBranch size={14} /> main</span><span><Clock3 size={14} /> 00:42</span>{isRunning && <button className="stop-run" onClick={() => { void transportRef.current?.cancelRun("active-run"); setIsRunning(false); setToast("Run cancelled safely"); }}><CircleStop size={14} /> Stop</button>}</div></section>
 
         <section className="content-column">
           <div className="conversation-header"><div><p className="eyebrow">SESSION / {activeSession.id.toUpperCase()}</p><h1>Build with confidence.</h1><p className="subtitle">A durable, inspectable coding-agent workspace.</p></div><button className="outline-button"><TerminalSquare size={15} /> Open terminal</button></div>
@@ -172,3 +207,5 @@ function TranscriptItemView({ item }: { item: TranscriptItem }) {
 }
 
 export default App;
+
+createRoot(document.getElementById("root")!).render(<App />);
