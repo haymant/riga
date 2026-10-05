@@ -71,6 +71,82 @@ struct ApprovalReply {
     always: bool,
 }
 
+#[derive(Clone, Default)]
+struct RunEvidence {
+    /// Set once any workspace-write or process-execution tool succeeds, in this
+    /// loop or any subagent's, so a child's work counts toward the parent.
+    mutated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RunEvidence {
+    /// Record a tool result. Only a *successful* mutating call counts; a failed
+    /// write or a denied approval is not evidence of work.
+    fn record(&self, tool: &str, ok: bool) {
+        if ok && is_mutating_tool(tool) {
+            self.mutated
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn has_work(&self) -> bool {
+        self.mutated.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Whether a successful call to this tool changes the workspace or runs a
+/// process. A read, glob, grep, or web fetch proves nothing was built.
+fn is_mutating_tool(tool: &str) -> bool {
+    matches!(
+        riga_kernel::policy::ToolRisk::for_tool(tool),
+        riga_kernel::policy::ToolRisk::WorkspaceWrite
+            | riga_kernel::policy::ToolRisk::ProcessExecution
+    )
+}
+
+/// Completion claims that a run must be able to back with a tool result.
+///
+/// Deliberately narrow. Bare "created"/"implemented" appear in ordinary
+/// explanation, so only first-person and passive completion phrasing counts;
+/// the guard must not fire on a run that was asked a question and answered it.
+const WORK_CLAIMS: [&str; 21] = [
+    "has been created",
+    "have been created",
+    "was created",
+    "were created",
+    "i created",
+    "i've created",
+    "i have created",
+    "i wrote",
+    "i've written",
+    "i have written",
+    "i added",
+    "i've added",
+    "i implemented",
+    "i installed",
+    "i started",
+    "i ran ",
+    "successfully created",
+    "successfully installed",
+    "the server is running",
+    "now listening on",
+    "files changed",
+];
+
+/// True when the final prose claims work that only a tool result can prove.
+fn claims_work(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    WORK_CLAIMS.iter().any(|claim| lower.contains(claim))
+}
+
+/// How many times a run is told to actually do the work before its claim is
+/// annotated instead. Two gives the model a chance to recover from a mistaken
+/// summary without letting it loop on one.
+const MAX_CLAIM_NUDGES: usize = 2;
+
+const CLAIM_NUDGE: &str = "You reported changes, but no successful file write or command was recorded in this run. \
+Use the `write` or `bash` tool to actually make the change now, or correct your answer to state that nothing was changed. \
+Do not repeat a claim you cannot back with a tool result.";
+
 /// Resolves tool approvals for one WebSocket session.
 ///
 /// A run suspends inside `request_approval`; the socket's read loop resolves it
@@ -884,6 +960,10 @@ where
     )
     .await?;
     let (trace_sender, mut trace_receiver) = mpsc::channel(1);
+    // Tracks whether any mutating tool succeeded anywhere in the run, including
+    // inside subagents. Used to reject a final answer that claims work the run
+    // never did.
+    let evidence = RunEvidence::default();
     // A leading `@agent` runs that subagent directly; otherwise the
     // orchestrator model decides what to do.
     let mut provider_call: std::pin::Pin<
@@ -895,6 +975,7 @@ where
         let trace = trace_sender.clone();
         let broker = broker.clone();
         let local_models = config.is_local().then(|| local_models.clone());
+        let evidence = evidence.clone();
         Box::pin(async move {
             let input = serde_json::json!({
                 "action": "dispatch",
@@ -911,6 +992,7 @@ where
                 0,
                 &broker,
                 local_models.as_ref(),
+                &evidence,
             )
             .await
             .map(|output| AgentResult { output })
@@ -925,6 +1007,7 @@ where
             local_models,
             history,
             broker,
+            &evidence,
         ))
     };
     let mut sequence = 2;
@@ -992,6 +1075,23 @@ where
     }
     match result {
         Ok(result) => {
+            // The guard: a final answer must not claim files were written or
+            // commands run when no mutating tool succeeded. The loops already
+            // try to nudge the model into doing the work; this catches a claim
+            // that survives that, such as from the Responses path, which runs
+            // no tools at all.
+            let output = if claims_work(&result.output) && !evidence.has_work() {
+                tracing::warn!(
+                    run_id,
+                    "final answer claimed work but no mutating tool ran; annotating"
+                );
+                format!(
+                    "{}\n\n[verification] No successful file write or command was recorded in this run, so the changes described above were not actually made.",
+                    result.output
+                )
+            } else {
+                result.output
+            };
             emit_event(
                 sender,
                 &mut journal,
@@ -1000,12 +1100,11 @@ where
                     session_id,
                     sequence,
                     RigaEvent::TextDelta {
-                        delta: result.output.clone(),
+                        delta: output.clone(),
                     },
                 ),
             )
             .await?;
-            let output = result.output;
             emit_event(
                 sender,
                 &mut journal,
@@ -1153,6 +1252,7 @@ async fn call_openai_compatible(
     local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
     history: &[ConversationTurn],
     broker: &ApprovalBroker,
+    evidence: &RunEvidence,
 ) -> Result<AgentResult, String> {
     // A local model short-circuits every HTTP path: there is no endpoint to
     // call and no Responses API, so the API shape must not be consulted.
@@ -1166,6 +1266,7 @@ async fn call_openai_compatible(
             local_models,
             history,
             broker,
+            evidence,
         )
         .await;
     }
@@ -1190,11 +1291,13 @@ async fn call_openai_compatible(
                 trace_sender,
                 history,
                 broker,
+                evidence,
             )
             .await
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
 async fn call_chat_with_tools(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
@@ -1203,6 +1306,7 @@ async fn call_chat_with_tools(
     trace_sender: mpsc::Sender<ToolTraceEvent>,
     history: &[ConversationTurn],
     broker: &ApprovalBroker,
+    evidence: &RunEvidence,
 ) -> Result<AgentResult, String> {
     run_chat_loop(
         config,
@@ -1216,6 +1320,7 @@ async fn call_chat_with_tools(
         0,
         broker,
         None,
+        evidence,
     )
     .await
 }
@@ -1236,6 +1341,7 @@ async fn run_chat_loop(
     depth: usize,
     broker: &ApprovalBroker,
     task_id: Option<&str>,
+    evidence: &RunEvidence,
 ) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
@@ -1274,6 +1380,7 @@ async fn run_chat_loop(
             .map(|turn| serde_json::json!({ "role": turn.role, "content": turn.content })),
     );
     messages.push(serde_json::json!({ "role": "user", "content": prompt }));
+    let mut nudges = 0usize;
     for _ in 0..24 {
         let mut request = client
             .post(&endpoint)
@@ -1312,12 +1419,18 @@ async fn run_chat_loop(
             .cloned()
             .unwrap_or_default();
         if tool_calls.is_empty() {
-            return Ok(AgentResult {
-                output: message
-                    .get("content")
-                    .and_then(content_text)
-                    .ok_or_else(|| "provider returned no assistant text".to_owned())?,
-            });
+            let text = message
+                .get("content")
+                .and_then(content_text)
+                .ok_or_else(|| "provider returned no assistant text".to_owned())?;
+            // Nudge a claim the run cannot back before accepting the answer.
+            if claims_work(&text) && !evidence.has_work() && nudges < MAX_CLAIM_NUDGES {
+                nudges += 1;
+                messages.push(message);
+                messages.push(serde_json::json!({ "role": "user", "content": CLAIM_NUDGE }));
+                continue;
+            }
+            return Ok(AgentResult { output: text });
         }
         messages.push(message);
         // Parse every call first so the order of results does not depend on the
@@ -1406,6 +1519,7 @@ async fn run_chat_loop(
                             depth,
                             &broker,
                             None,
+                            evidence,
                         )
                         .await
                         .map(|output| format!("[{agent} subagent result]\n{output}")),
@@ -1451,6 +1565,7 @@ async fn run_chat_loop(
                             depth,
                             broker,
                             None,
+                            evidence,
                         ))
                         .await
                         .map(|output| format!("[{agent} subagent result]\n{output}"))
@@ -1474,6 +1589,7 @@ async fn run_chat_loop(
                     Err(error) => (false, format!("tool error: {error}")),
                 }
             };
+            evidence.record(&call.name, ok);
             let trace = ToolTrace {
                 call: call.call.clone(),
                 name: call.name.clone(),
@@ -1545,6 +1661,7 @@ async fn dispatch_subagent(
     depth: usize,
     broker: &ApprovalBroker,
     local_models: Option<&std::sync::Arc<crate::local_model::LocalModelRuntime>>,
+    evidence: &RunEvidence,
 ) -> Result<String, String> {
     if depth + 1 > riga_kernel::task::MAX_TASK_DEPTH {
         return Err(format!(
@@ -1625,6 +1742,7 @@ async fn dispatch_subagent(
                 depth + 1,
                 broker,
                 Some(&task_id),
+                evidence,
             ))
             .await
         }
@@ -1641,6 +1759,7 @@ async fn dispatch_subagent(
                 depth + 1,
                 broker,
                 Some(&task_id),
+                evidence,
             ))
             .await
         }
@@ -1822,6 +1941,7 @@ async fn call_local_model(
     local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
     history: &[ConversationTurn],
     broker: &ApprovalBroker,
+    evidence: &RunEvidence,
 ) -> Result<AgentResult, String> {
     run_local_loop(
         config,
@@ -1836,6 +1956,7 @@ async fn call_local_model(
         0,
         broker,
         None,
+        evidence,
     )
     .await
 }
@@ -1856,6 +1977,7 @@ async fn run_local_loop(
     depth: usize,
     broker: &ApprovalBroker,
     task_id: Option<&str>,
+    evidence: &RunEvidence,
 ) -> Result<AgentResult, String> {
     let mut definitions = mcp_runtime.tool_definitions().await;
     if let Some(allowed) = allowed_tools {
@@ -1875,6 +1997,7 @@ async fn run_local_loop(
         content: prompt.to_owned(),
     });
     let mut final_text = String::new();
+    let mut nudges = 0usize;
     for turn in 0..LOCAL_MAX_TURNS {
         // Generation is blocking C, so it runs on the blocking pool. The future
         // is awaited directly: nothing else in this task needs the executor, and
@@ -1895,13 +2018,24 @@ async fn run_local_loop(
             final_text = prose.clone();
         }
         if tool_calls.is_empty() {
-            return Ok(AgentResult {
-                output: if final_text.is_empty() {
-                    text
-                } else {
-                    final_text
-                },
-            });
+            let answer = if final_text.is_empty() {
+                text.clone()
+            } else {
+                final_text.clone()
+            };
+            if claims_work(&answer) && !evidence.has_work() && nudges < MAX_CLAIM_NUDGES {
+                nudges += 1;
+                messages.push(crate::local_model::ChatMessage {
+                    role: "assistant".into(),
+                    content: text.clone(),
+                });
+                messages.push(crate::local_model::ChatMessage {
+                    role: "user".into(),
+                    content: CLAIM_NUDGE.into(),
+                });
+                continue;
+            }
+            return Ok(AgentResult { output: answer });
         }
         // Record the assistant turn so the model can see what it asked for.
         messages.push(crate::local_model::ChatMessage {
@@ -1944,6 +2078,7 @@ async fn run_local_loop(
                             depth,
                             broker,
                             Some(local_models),
+                            evidence,
                         ))
                         .await
                         .map(|output| format!("[{agent} subagent result]\n{output}"))
@@ -1967,6 +2102,7 @@ async fn run_local_loop(
                 Ok(output) => (true, output),
                 Err(error) => (false, format!("tool error: {error}")),
             };
+            evidence.record(&call.name, ok);
             trace_sender
                 .send(ToolTraceEvent::Completed(ToolTrace {
                     call: payload,
@@ -3059,5 +3195,50 @@ mod tests {
             receiver.try_recv().is_err(),
             "read must not request approval"
         );
+    }
+
+    #[test]
+    fn work_claims_are_detected_but_ordinary_explanations_are_not() {
+        // The reported hallucination: this exact phrasing, with no write.
+        assert!(super::claims_work(
+            "An Express web service has been created and a React app has been served from it."
+        ));
+        assert!(super::claims_work(
+            "I created the app and started the server."
+        ));
+        assert!(super::claims_work("Files changed: 3"));
+        // Explanation is not a claim; the guard must not fire on a Q&A run.
+        assert!(!super::claims_work(
+            "The function creates a file when it is called."
+        ));
+        assert!(!super::claims_work("We will create the app next."));
+        assert!(!super::claims_work("Here is how to write a Node server."));
+    }
+
+    #[test]
+    fn only_write_and_shell_count_as_work() {
+        assert!(super::is_mutating_tool("write"));
+        assert!(super::is_mutating_tool("bash"));
+        assert!(super::is_mutating_tool("shell"));
+        for read_only in ["read", "glob", "grep", "web", "task"] {
+            assert!(
+                !super::is_mutating_tool(read_only),
+                "`{read_only}` must not count as work"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_only_records_successful_mutations() {
+        let evidence = super::RunEvidence::default();
+        assert!(!evidence.has_work());
+        // A failed write is not evidence of work.
+        evidence.record("write", false);
+        assert!(!evidence.has_work());
+        // A read is not work either.
+        evidence.record("read", true);
+        assert!(!evidence.has_work());
+        evidence.record("bash", true);
+        assert!(evidence.has_work());
     }
 }
