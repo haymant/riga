@@ -25,6 +25,12 @@ pub struct SkillSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileCandidate {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerSummary {
     pub name: String,
     pub command: String,
@@ -105,6 +111,31 @@ pub fn load_skills(root: &Path) -> Vec<SkillSummary> {
                 path: path.display().to_string(),
             })
         })
+        .collect()
+}
+
+pub fn load_workspace_files(root: &Path) -> Vec<FileCandidate> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !matches!(name.as_ref(), ".git" | "node_modules" | "target")
+        })
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| {
+            let path = entry
+                .path()
+                .strip_prefix(root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            Some(FileCandidate {
+                name: entry.file_name().to_string_lossy().into_owned(),
+                path,
+            })
+        })
+        .take(1_000)
         .collect()
 }
 
@@ -551,6 +582,10 @@ pub fn catalog(root: &Path) -> BTreeMap<String, serde_json::Value> {
     result.insert(
         "skills".into(),
         serde_json::to_value(load_skills(root)).unwrap(),
+    );
+    result.insert(
+        "files".into(),
+        serde_json::to_value(load_workspace_files(root)).unwrap(),
     );
     result.insert(
         "mcp_servers".into(),
