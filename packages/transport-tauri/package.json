@@ -1,7 +1,23 @@
 {
-  "name": "@riga/transport-tauri",
+  "name": "@haymant/transport-tauri",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
-  "exports": { ".": "./src/index.ts" }
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "description": "Tauri transport boundary for RIGA-compatible desktop clients.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/haymant/riga.git",
+    "directory": "packages/transport-tauri"
+  },
+  "bugs": {
+    "url": "https://github.com/haymant/riga/issues"
+  },
+  "homepage": "https://github.com/haymant/riga#readme",
+  "files": [
+    "src"
+  ]
 }

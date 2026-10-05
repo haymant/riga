@@ -10,13 +10,13 @@ use std::sync::{
 use async_stream::stream;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Multipart, Path, State},
     http::StatusCode,
     response::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::get,
+    routing::{get, post},
 };
 use riga_kernel::{
     events::{RigaEvent, RigaEventEnvelope},
@@ -72,6 +72,7 @@ pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/catalog", get(tool_catalog))
+        .route("/attachments", post(upload_attachment))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/runs/{run_id}/events", get(stream_events))
         .route("/ws", get(ws_upgrade))
@@ -97,6 +98,79 @@ async fn tool_catalog(
     State(state): State<ServerState>,
 ) -> Json<std::collections::BTreeMap<String, serde_json::Value>> {
     Json(catalog::catalog(&state.workspace_root))
+}
+
+async fn upload_attachment(
+    State(state): State<ServerState>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let Some(field) = (multipart.next_field().await).ok().flatten() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "a file field is required" })),
+        )
+            .into_response();
+    };
+    let original_name = field.file_name().unwrap_or("attachment").to_owned();
+    let bytes = match field.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("unable to read attachment: {error}") })),
+            )
+                .into_response();
+        }
+    };
+    let safe_name = original_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let safe_name = if safe_name.is_empty() {
+        "attachment".to_owned()
+    } else {
+        safe_name
+    };
+    let relative_path = format!(
+        "tmp/riga-attachments/{}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
+        safe_name
+    );
+    let path = state.workspace_root.join(&relative_path);
+    if let Some(parent) = path.parent()
+        && let Err(error) = tokio::fs::create_dir_all(parent).await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    if let Err(error) = tokio::fs::write(&path, &bytes).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "name": original_name,
+            "path": relative_path,
+            "size": bytes.len(),
+        })),
+    )
+        .into_response()
 }
 
 async fn list_sessions(State(state): State<ServerState>) -> Json<Vec<Session>> {

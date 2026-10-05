@@ -134,6 +134,99 @@ pub fn workspace_root() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().expect("current directory"))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RigaTask {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub description: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub fn execute_task(input: &serde_json::Value) -> Result<String, String> {
+    let store = crate::secure_store::SecureStore::from_env()
+        .ok_or("task persistence requires RIGA_TOKEN")?;
+    let mut tasks = store.load::<Vec<RigaTask>>("tasks")?.unwrap_or_default();
+    let action = input
+        .get("action")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("list");
+    match action {
+        "list" => serde_json::to_string_pretty(&tasks).map_err(|error| error.to_string()),
+        "inspect" => {
+            let id = input
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("task inspect requires task_id")?;
+            let task = tasks
+                .iter()
+                .find(|task| task.id == id)
+                .ok_or_else(|| format!("task not found: {id}"))?;
+            serde_json::to_string_pretty(task).map_err(|error| error.to_string())
+        }
+        "create" => {
+            let title = input
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .filter(|title| !title.trim().is_empty())
+                .ok_or("task create requires title")?;
+            let now = unix_timestamp();
+            let task = RigaTask {
+                id: format!("task-{now}"),
+                title: title.to_owned(),
+                status: input
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("open")
+                    .to_owned(),
+                description: input
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                created_at: now.to_string(),
+                updated_at: now.to_string(),
+            };
+            tasks.push(task.clone());
+            store.save("tasks", &tasks)?;
+            serde_json::to_string_pretty(&task).map_err(|error| error.to_string())
+        }
+        "update" => {
+            let id = input
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("task update requires task_id")?;
+            let task = tasks
+                .iter_mut()
+                .find(|task| task.id == id)
+                .ok_or_else(|| format!("task not found: {id}"))?;
+            if let Some(title) = input.get("title").and_then(serde_json::Value::as_str) {
+                task.title = title.to_owned();
+            }
+            if let Some(status) = input.get("status").and_then(serde_json::Value::as_str) {
+                task.status = status.to_owned();
+            }
+            if let Some(description) = input.get("description").and_then(serde_json::Value::as_str)
+            {
+                task.description = description.to_owned();
+            }
+            task.updated_at = unix_timestamp().to_string();
+            let updated = task.clone();
+            store.save("tasks", &tasks)?;
+            serde_json::to_string_pretty(&updated).map_err(|error| error.to_string())
+        }
+        _ => Err("task action must be list, inspect, create, or update".into()),
+    }
+}
+
+fn unix_timestamp() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
 fn safe_path(root: &Path, requested: &str) -> Result<PathBuf, String> {
     let candidate = root.join(requested);
     let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;

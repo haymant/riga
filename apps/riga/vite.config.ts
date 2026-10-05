@@ -12,6 +12,7 @@ export default defineConfig({
       "/ws": { target: "ws://127.0.0.1:8787", ws: true },
       "/health": { target: "http://127.0.0.1:8787" },
       "/catalog": { target: "http://127.0.0.1:8787" },
+      "/attachments": { target: "http://127.0.0.1:8787" },
       "/sessions": { target: "http://127.0.0.1:8787" },
     },
   },

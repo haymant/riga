@@ -1,8 +1,26 @@
 {
-  "name": "@riga/assistant-ui",
+  "name": "@haymant/assistant-ui",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
-  "exports": { ".": "./src/index.ts" },
-  "scripts": { "typecheck": "tsc --noEmit" }
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "description": "Shared assistant UI contracts for RIGA-compatible clients.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/haymant/riga.git",
+    "directory": "packages/assistant-ui"
+  },
+  "bugs": {
+    "url": "https://github.com/haymant/riga/issues"
+  },
+  "homepage": "https://github.com/haymant/riga#readme",
+  "files": [
+    "src"
+  ]
 }

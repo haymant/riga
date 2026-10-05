@@ -14,7 +14,9 @@
     "@tauri-apps/api": "^2.12.1",
     "lucide-react": "^1.52.0",
     "react": "^19.3.0",
-    "react-dom": "^19.3.0"
+    "react-dom": "^19.3.0",
+    "@haymant/assistant-ui": "file:../../packages/assistant-ui",
+    "@haymant/transport-http": "file:../../packages/transport-http"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^6.1.1",

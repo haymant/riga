@@ -8,7 +8,7 @@ repository.workspace = true
 description = "RIGA command-line adapter"
 
 [dependencies]
-riga-kernel = { path = "../riga-kernel" }
+riga-kernel = { version = "0.1.0", path = "../riga-kernel" }
 
 [lints]
 workspace = true

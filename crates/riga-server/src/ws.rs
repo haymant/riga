@@ -9,6 +9,12 @@ pub struct ProviderConfig {
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
+}
+
+fn default_reasoning_effort() -> String {
+    "low".into()
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,7 +55,9 @@ pub enum ServerMessage {
         server_version: &'static str,
     },
     ProviderConfigured {
+        endpoint: String,
         model: String,
+        reasoning_effort: String,
     },
     Event {
         envelope: RigaEventEnvelope,
@@ -99,16 +107,44 @@ pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf) {
                     {
                         return;
                     }
+                    if let Some(config) = &provider
+                        && send(
+                            &mut sender,
+                            ServerMessage::ProviderConfigured {
+                                endpoint: config.endpoint.clone(),
+                                model: config.model.clone(),
+                                reasoning_effort: config.reasoning_effort.clone(),
+                            },
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
-                Ok(ClientMessage::ConfigureProvider(config)) => {
+                Ok(ClientMessage::ConfigureProvider(mut config)) => {
+                    if config.api_key.trim().is_empty()
+                        && let Some(existing) = &provider
+                    {
+                        config.api_key = existing.api_key.clone();
+                    }
                     let model = config.model.clone();
+                    let endpoint = config.endpoint.clone();
+                    let reasoning_effort = config.reasoning_effort.clone();
                     if let Some(store) = &secure_store {
                         let _ = store.save("provider", &config);
                     }
                     provider = Some(config);
-                    if send(&mut sender, ServerMessage::ProviderConfigured { model })
-                        .await
-                        .is_err()
+                    if send(
+                        &mut sender,
+                        ServerMessage::ProviderConfigured {
+                            endpoint,
+                            model,
+                            reasoning_effort,
+                        },
+                    )
+                    .await
+                    .is_err()
                     {
                         return;
                     }
@@ -266,16 +302,34 @@ async fn execute_tool(
             )
             .await
         }
-        "task" => Ok("task tool is available through the RIGA task adapter".into()),
+        "task" => crate::catalog::execute_task(&input),
         "skill" => {
-            let name = input
+            if let Some(name) = input
                 .get("name")
                 .and_then(serde_json::Value::as_str)
-                .ok_or("skill requires name")?;
-            crate::catalog::execute_read(workspace_root, &format!("skills/{name}/SKILL.md")).await
+                .filter(|name| !name.trim().is_empty())
+            {
+                crate::catalog::execute_read(workspace_root, &format!("skills/{name}/SKILL.md"))
+                    .await
+            } else {
+                let skills = crate::catalog::load_skills(workspace_root);
+                serde_json::to_string_pretty(&skills).map_err(|error| error.to_string())
+            }
         }
         _ => Err(format!("unknown or unavailable tool: {name}")),
     }
+}
+
+struct ToolTrace {
+    call: serde_json::Value,
+    name: String,
+    output: String,
+    ok: bool,
+}
+
+struct AgentResult {
+    output: String,
+    traces: Vec<ToolTrace>,
 }
 
 async fn send_provider_events<S>(
@@ -297,16 +351,40 @@ where
     )
     .await?;
     match call_openai_compatible(config, workspace_root, prompt).await {
-        Ok(output) => {
+        Ok(result) => {
+            let mut sequence = 2;
+            for trace in result.traces {
+                let call_id = trace
+                    .call
+                    .get("call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool-call")
+                    .to_owned();
+                send(
+                    sender,
+                    ServerMessage::Event {
+                        envelope: envelope(
+                            run_id,
+                            session_id,
+                            sequence,
+                            RigaEvent::ToolCallStarted { call: trace.call },
+                        ),
+                    },
+                )
+                .await?;
+                sequence += 1;
+                send(sender, ServerMessage::Event { envelope: envelope(run_id, session_id, sequence, RigaEvent::ToolResult { result: serde_json::json!({"call_id": call_id, "name": trace.name, "output": trace.output, "ok": trace.ok}) }) }).await?;
+                sequence += 1;
+            }
             send(
                 sender,
                 ServerMessage::Event {
                     envelope: envelope(
                         run_id,
                         session_id,
-                        2,
+                        sequence,
                         RigaEvent::TextDelta {
-                            delta: output.clone(),
+                            delta: result.output.clone(),
                         },
                     ),
                 },
@@ -315,7 +393,14 @@ where
             send(
                 sender,
                 ServerMessage::Event {
-                    envelope: envelope(run_id, session_id, 3, RigaEvent::RunCompleted { output }),
+                    envelope: envelope(
+                        run_id,
+                        session_id,
+                        sequence + 1,
+                        RigaEvent::RunCompleted {
+                            output: result.output,
+                        },
+                    ),
                 },
             )
             .await
@@ -341,9 +426,9 @@ async fn call_openai_compatible(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
     prompt: &str,
-) -> Result<String, String> {
+) -> Result<AgentResult, String> {
     if config.model.to_ascii_lowercase().starts_with("gpt-5") {
-        return call_responses_api(config, prompt).await;
+        return call_responses_api(config, workspace_root, prompt).await;
     }
     call_chat_with_tools(config, workspace_root, prompt).await
 }
@@ -352,7 +437,7 @@ async fn call_chat_with_tools(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
     prompt: &str,
-) -> Result<String, String> {
+) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
         .trim_end_matches('/')
@@ -367,6 +452,7 @@ async fn call_chat_with_tools(
         .build()
         .map_err(|e| e.to_string())?;
     let mut messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
+    let mut traces = Vec::new();
     for _ in 0..6 {
         let mut request = client
             .post(&endpoint)
@@ -404,10 +490,13 @@ async fn call_chat_with_tools(
             .cloned()
             .unwrap_or_default();
         if tool_calls.is_empty() {
-            return message
-                .get("content")
-                .and_then(content_text)
-                .ok_or_else(|| "provider returned no assistant text".to_owned());
+            return Ok(AgentResult {
+                output: message
+                    .get("content")
+                    .and_then(content_text)
+                    .ok_or_else(|| "provider returned no assistant text".to_owned())?,
+                traces,
+            });
         }
         messages.push(message);
         for tool_call in tool_calls {
@@ -428,9 +517,17 @@ async fn call_chat_with_tools(
                 .unwrap_or("{}");
             let input: serde_json::Value = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            let output = execute_tool(workspace_root, name, input)
-                .await
-                .unwrap_or_else(|error| format!("tool error: {error}"));
+            let result = execute_tool(workspace_root, name, input.clone()).await;
+            let (ok, output) = match result {
+                Ok(output) => (true, output),
+                Err(error) => (false, format!("tool error: {error}")),
+            };
+            traces.push(ToolTrace {
+                call: serde_json::json!({"call_id": call_id, "name": name, "arguments": input}),
+                name: name.into(),
+                output: output.clone(),
+                ok,
+            });
             messages.push(
                 serde_json::json!({ "role": "tool", "tool_call_id": call_id, "content": output }),
             );
@@ -439,7 +536,11 @@ async fn call_chat_with_tools(
     Err("provider exceeded the maximum tool-call turns".into())
 }
 
-async fn call_responses_api(config: &ProviderConfig, prompt: &str) -> Result<String, String> {
+async fn call_responses_api(
+    config: &ProviderConfig,
+    workspace_root: &std::path::Path,
+    prompt: &str,
+) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
         .trim_end_matches('/')
@@ -449,33 +550,106 @@ async fn call_responses_api(config: &ProviderConfig, prompt: &str) -> Result<Str
     } else {
         format!("{}/responses", config.endpoint.trim_end_matches('/'))
     };
+    let effort = match config.reasoning_effort.as_str() {
+        "medium" | "high" => config.reasoning_effort.as_str(),
+        _ => "low",
+    };
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut request = client.post(endpoint).json(&serde_json::json!({
-        "model": config.model,
-        "input": prompt,
-        "max_output_tokens": 1024,
-        "reasoning": { "effort": "minimal" },
-    }));
-    if !config.api_key.trim().is_empty() {
-        request = request.bearer_auth(&config.api_key);
+    let mut input = serde_json::json!(prompt);
+    let mut previous_response_id: Option<String> = None;
+    let mut traces = Vec::new();
+    for _ in 0..6 {
+        let mut body = serde_json::json!({
+            "model": config.model,
+            "input": input,
+            "max_output_tokens": 1024,
+            "reasoning": { "effort": effort },
+            "tools": responses_tool_schemas(),
+        });
+        if let Some(id) = &previous_response_id {
+            body["previous_response_id"] = serde_json::Value::String(id.clone());
+        }
+        let mut request = client.post(&endpoint).json(&body);
+        if !config.api_key.trim().is_empty() {
+            request = request.bearer_auth(&config.api_key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("provider connection failed: {e}"))?;
+        let status = response.status();
+        let raw = response.text().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!(
+                "provider Responses API returned HTTP {status}: {}",
+                redact_body(&raw)
+            ));
+        }
+        let response: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| format!("invalid provider Responses API response: {e}"))?;
+        let calls = response
+            .get("output")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+            })
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            return Ok(AgentResult {
+                output: extract_response_text(&response)?,
+                traces,
+            });
+        }
+        previous_response_id = Some(
+            response
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("provider response has no id for tool continuation")?
+                .to_owned(),
+        );
+        let mut outputs = Vec::new();
+        for call in calls {
+            let name = call
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("provider function call has no name")?;
+            let arguments = call
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("{}");
+            let input_value: serde_json::Value = serde_json::from_str(arguments)
+                .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
+            let result = execute_tool(workspace_root, name, input_value.clone()).await;
+            let (ok, output) = match result {
+                Ok(output) => (true, output),
+                Err(error) => (false, format!("tool error: {error}")),
+            };
+            let call_id = call
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool-call");
+            traces.push(ToolTrace { call: serde_json::json!({"call_id": call_id, "name": name, "arguments": input_value}), name: name.into(), output: output.clone(), ok });
+            outputs.push(serde_json::json!({"type":"function_call_output", "call_id": call_id, "output": output}));
+        }
+        input = serde_json::Value::Array(outputs);
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("provider connection failed: {e}"))?;
-    let status = response.status();
-    let body = response.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        return Err(format!(
-            "provider Responses API returned HTTP {status}: {}",
-            redact_body(&body)
-        ));
+    Err("provider exceeded the maximum Responses tool-call turns".into())
+}
+
+fn extract_response_text(response: &serde_json::Value) -> Result<String, String> {
+    if let Some(text) = response
+        .get("output_text")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        return Ok(text.to_owned());
     }
-    let response: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("invalid provider Responses API response: {e}"))?;
+    let mut refusals = Vec::new();
     let output = response
         .get("output")
         .and_then(serde_json::Value::as_array)
@@ -484,25 +658,46 @@ async fn call_responses_api(config: &ProviderConfig, prompt: &str) -> Result<Str
         .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("message"))
         .filter_map(|item| item.get("content").and_then(serde_json::Value::as_array))
         .flatten()
-        .filter_map(|part| {
-            if part.get("type").and_then(serde_json::Value::as_str) == Some("output_text") {
-                part.get("text").and_then(serde_json::Value::as_str)
-            } else {
-                None
-            }
-        })
+        .filter_map(
+            |part| match part.get("type").and_then(serde_json::Value::as_str) {
+                Some("output_text") => part
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                Some("refusal") => {
+                    if let Some(text) = part.get("refusal").and_then(serde_json::Value::as_str) {
+                        refusals.push(text.to_owned());
+                    }
+                    None
+                }
+                _ => None,
+            },
+        )
         .collect::<Vec<_>>()
         .join("");
-    if output.is_empty() {
+    if !output.is_empty() {
+        return Ok(output);
+    }
+    if !refusals.is_empty() {
         return Err(format!(
-            "provider Responses API returned no output text (status: {})",
-            response
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown")
+            "provider refused the request: {}",
+            refusals.join(" ")
         ));
     }
-    Ok(output)
+    let status = response
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    Err(format!(
+        "provider Responses API returned no output text (status: {status})"
+    ))
+}
+
+fn responses_tool_schemas() -> Vec<serde_json::Value> {
+    tool_schemas().into_iter().filter_map(|tool| {
+        let function = tool.get("function")?;
+        Some(serde_json::json!({"type":"function", "name":function.get("name")?, "description":function.get("description")?, "parameters":function.get("parameters")?}))
+    }).collect()
 }
 
 fn completion_request_body_with_messages(
@@ -552,8 +747,13 @@ fn tool_schemas() -> Vec<serde_json::Value> {
             serde_json::json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
         ),
         function_schema(
+            "task",
+            "List, inspect, create, or update durable RIGA tasks",
+            serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list","inspect","create","update"]},"title":{"type":"string"},"description":{"type":"string"},"status":{"type":"string"},"task_id":{"type":"string"}},"required":[]}),
+        ),
+        function_schema(
             "skill",
-            "Load a repository skill document",
+            "Load a named repository skill document, or list all available skills when name is omitted",
             serde_json::json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
         ),
     ]
@@ -562,8 +762,16 @@ fn tool_schemas() -> Vec<serde_json::Value> {
 fn function_schema(
     name: &str,
     description: &str,
-    parameters: serde_json::Value,
+    mut parameters: serde_json::Value,
 ) -> serde_json::Value {
+    if parameters
+        .get("required")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(Vec::is_empty)
+        && let Some(object) = parameters.as_object_mut()
+    {
+        object.remove("required");
+    }
     serde_json::json!({"type":"function","function":{"name":name,"description":description,"parameters":parameters}})
 }
 
@@ -644,5 +852,33 @@ mod tests {
         assert_eq!(body["max_completion_tokens"], 2048);
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["model"], "gpt-5-nano");
+    }
+
+    #[test]
+    fn provider_defaults_to_low_reasoning_effort_and_responses_tools_are_flat() {
+        let config: ProviderConfig = serde_json::from_str(
+            r#"{"endpoint":"https://api.example/v1","api_key":"key","model":"gpt-5-codex"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.reasoning_effort, "low");
+        let tools = super::responses_tool_schemas();
+        assert_eq!(tools[0]["type"], "function");
+        assert!(tools[0].get("function").is_none());
+        assert_eq!(tools[0]["name"], "read");
+    }
+
+    #[test]
+    fn responses_text_extractor_handles_top_level_text_and_refusal() {
+        assert_eq!(
+            super::extract_response_text(&serde_json::json!({"output_text":"Example Domain"}))
+                .unwrap(),
+            "Example Domain"
+        );
+        let refusal = super::extract_response_text(&serde_json::json!({
+            "status": "completed",
+            "output": [{"type":"message", "content":[{"type":"refusal", "refusal":"not allowed"}]}]
+        }))
+        .unwrap_err();
+        assert!(refusal.contains("provider refused the request: not allowed"));
     }
 }

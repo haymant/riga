@@ -11,7 +11,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/riga-platform/riga"
+repository = "https://github.com/haymant/riga"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
