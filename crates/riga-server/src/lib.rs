@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 pub mod catalog;
+pub mod mcp;
 pub mod secure_store;
 pub mod ws;
 
@@ -38,6 +39,7 @@ pub struct ServerState {
     pub(crate) workspace_root: PathBuf,
     pub(crate) secure_store: Option<Arc<secure_store::SecureStore>>,
     pub(crate) mcp_registry: Arc<RwLock<Vec<catalog::McpServerRecord>>>,
+    pub(crate) mcp_runtime: mcp::McpRuntime,
 }
 
 impl Default for ServerState {
@@ -68,6 +70,7 @@ impl Default for ServerState {
             workspace_root,
             secure_store,
             mcp_registry: Arc::new(RwLock::new(mcp_registry)),
+            mcp_runtime: mcp::McpRuntime::new(),
         }
     }
 }
@@ -105,7 +108,23 @@ async fn ws_upgrade(
     State(state): State<ServerState>,
     upgrade: axum::extract::ws::WebSocketUpgrade,
 ) -> impl IntoResponse {
-    upgrade.on_upgrade(move |socket| ws::upgrade(socket, state.workspace_root.clone()))
+    upgrade.on_upgrade(move |socket| {
+        let runtime = state.mcp_runtime.clone();
+        let registry = state.mcp_registry.clone();
+        async move {
+            let mut records = registry.read().await.clone();
+            records.push(catalog::McpServerRecord {
+                summary: catalog::builtin_health_stdio(),
+                api_key: None,
+            });
+            records.push(catalog::McpServerRecord {
+                summary: catalog::builtin_health_http(),
+                api_key: None,
+            });
+            runtime.connect_records(&records).await;
+            ws::upgrade(socket, state.workspace_root.clone(), runtime).await;
+        }
+    })
 }
 
 async fn health() -> Json<HealthResponse> {

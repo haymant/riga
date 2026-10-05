@@ -4,6 +4,8 @@ use riga_kernel::events::{RigaEvent, RigaEventEnvelope};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::mcp::McpRuntime;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub endpoint: String,
@@ -85,7 +87,7 @@ pub enum ServerMessage {
     },
 }
 
-pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf) {
+pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf, mcp_runtime: McpRuntime) {
     let (mut sender, mut receiver) = socket.split();
     let secure_store = crate::secure_store::SecureStore::from_env();
     let mut provider: Option<ProviderConfig> = secure_store
@@ -175,7 +177,7 @@ pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf) {
                     name,
                     input,
                 }) => {
-                    let result = execute_tool(&workspace_root, &name, input).await;
+                    let result = execute_tool(&workspace_root, &mcp_runtime, &name, input).await;
                     let (ok, output) = match result {
                         Ok(output) => (true, output),
                         Err(error) => (false, error),
@@ -207,6 +209,7 @@ pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf) {
                         &run_id,
                         &session_id,
                         &prompt,
+                        &mcp_runtime,
                     )
                     .await
                     .is_err()
@@ -238,6 +241,7 @@ pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf) {
 
 async fn execute_tool(
     workspace_root: &std::path::Path,
+    mcp_runtime: &McpRuntime,
     name: &str,
     input: serde_json::Value,
 ) -> Result<String, String> {
@@ -316,7 +320,7 @@ async fn execute_tool(
                 serde_json::to_string_pretty(&skills).map_err(|error| error.to_string())
             }
         }
-        _ => Err(format!("unknown or unavailable tool: {name}")),
+        _ => mcp_runtime.execute(name, &input).await,
     }
 }
 
@@ -339,6 +343,7 @@ async fn send_provider_events<S>(
     run_id: &str,
     session_id: &str,
     prompt: &str,
+    mcp_runtime: &McpRuntime,
 ) -> Result<(), S::Error>
 where
     S: SinkExt<Message> + Unpin,
@@ -350,7 +355,7 @@ where
         },
     )
     .await?;
-    match call_openai_compatible(config, workspace_root, prompt).await {
+    match call_openai_compatible(config, workspace_root, prompt, mcp_runtime).await {
         Ok(result) => {
             let mut sequence = 2;
             for trace in result.traces {
@@ -426,17 +431,19 @@ async fn call_openai_compatible(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
     prompt: &str,
+    mcp_runtime: &McpRuntime,
 ) -> Result<AgentResult, String> {
     if config.model.to_ascii_lowercase().starts_with("gpt-5") {
-        return call_responses_api(config, workspace_root, prompt).await;
+        return call_responses_api(config, workspace_root, prompt, mcp_runtime).await;
     }
-    call_chat_with_tools(config, workspace_root, prompt).await
+    call_chat_with_tools(config, workspace_root, prompt, mcp_runtime).await
 }
 
 async fn call_chat_with_tools(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
     prompt: &str,
+    mcp_runtime: &McpRuntime,
 ) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
@@ -462,6 +469,7 @@ async fn call_chat_with_tools(
             .json(&completion_request_body_with_messages(
                 &config.model,
                 &messages,
+                &mcp_runtime.tool_definitions().await,
             ));
         if !config.api_key.trim().is_empty() {
             request = request.bearer_auth(&config.api_key);
@@ -520,7 +528,7 @@ async fn call_chat_with_tools(
                 .unwrap_or("{}");
             let input: serde_json::Value = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            let result = execute_tool(workspace_root, name, input.clone()).await;
+            let result = execute_tool(workspace_root, mcp_runtime, name, input.clone()).await;
             let (ok, output) = match result {
                 Ok(output) => (true, output),
                 Err(error) => (false, format!("tool error: {error}")),
@@ -543,6 +551,7 @@ async fn call_responses_api(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
     prompt: &str,
+    mcp_runtime: &McpRuntime,
 ) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
@@ -574,7 +583,7 @@ async fn call_responses_api(
             "input": input,
             "max_output_tokens": 1024,
             "reasoning": { "effort": effort },
-            "tools": responses_tool_schemas(),
+            "tools": responses_tool_schemas(&mcp_runtime.tool_definitions().await),
         });
         if let Some(id) = &previous_response_id {
             body["previous_response_id"] = serde_json::Value::String(id.clone());
@@ -631,7 +640,7 @@ async fn call_responses_api(
                 .unwrap_or("{}");
             let input_value: serde_json::Value = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            let result = execute_tool(workspace_root, name, input_value.clone()).await;
+            let result = execute_tool(workspace_root, mcp_runtime, name, input_value.clone()).await;
             let (ok, output) = match result {
                 Ok(output) => (true, output),
                 Err(error) => (false, format!("tool error: {error}")),
@@ -700,23 +709,21 @@ fn extract_response_text(response: &serde_json::Value) -> Result<String, String>
     ))
 }
 
-fn responses_tool_schemas() -> Vec<serde_json::Value> {
-    tool_schemas().into_iter().filter_map(|tool| {
-        let function = tool.get("function")?;
-        Some(serde_json::json!({"type":"function", "name":function.get("name")?, "description":function.get("description")?, "parameters":function.get("parameters")?}))
-    }).collect()
+fn responses_tool_schemas(mcp: &[rig_core::completion::ToolDefinition]) -> Vec<serde_json::Value> {
+    crate::mcp::merge_response_tool_schemas(tool_schemas(), mcp.to_vec())
 }
 
 fn completion_request_body_with_messages(
     model: &str,
     messages: &[serde_json::Value],
+    mcp: &[rig_core::completion::ToolDefinition],
 ) -> serde_json::Value {
     serde_json::json!({
         "model": model,
         "messages": messages,
         "stream": false,
         "max_completion_tokens": 2048,
-        "tools": tool_schemas(),
+        "tools": crate::mcp::merge_tool_schemas(tool_schemas(), mcp.to_vec()),
         "tool_choice": "auto",
     })
 }
@@ -859,6 +866,7 @@ mod tests {
         let body = super::completion_request_body_with_messages(
             "gpt-5-nano",
             &[serde_json::json!({"role": "user", "content": "hello"})],
+            &[],
         );
         assert_eq!(body["max_completion_tokens"], 2048);
         assert!(body.get("max_tokens").is_none());
@@ -879,7 +887,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.reasoning_effort, "low");
-        let tools = super::responses_tool_schemas();
+        let tools = super::responses_tool_schemas(&[]);
         assert_eq!(tools[0]["type"], "function");
         assert!(tools[0].get("function").is_none());
         assert_eq!(tools[0]["name"], "read");

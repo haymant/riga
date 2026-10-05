@@ -12,12 +12,17 @@ async-stream = "0.3"
 aes-gcm = "0.10"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 futures-util = "0.3"
+rig-agent = { version = "=0.43.0", features = ["test-utils"] }
+rig-core = "=0.43.0"
 riga-kernel = { version = "0.1.0", path = "../riga-kernel" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rig-rmcp = "=0.43.0"
+rmcp = { version = "=2.0.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "sync", "io-std"] }
+tracing = "0.1"
 walkdir = "2"
 
 [dev-dependencies]
