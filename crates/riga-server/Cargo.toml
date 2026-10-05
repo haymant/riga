@@ -8,7 +8,17 @@ repository.workspace = true
 description = "RIGA authenticated HTTP adapter"
 
 [dependencies]
+async-stream = "0.3"
+axum = "0.8"
+futures-util = "0.3"
 riga-kernel = { path = "../riga-kernel" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

@@ -1,0 +1,14 @@
+{
+  "phase": 5,
+  "status": "PASS",
+  "checks": [
+    { "name": "axum_http_router", "status": "PASS" },
+    { "name": "health_endpoint", "status": "PASS" },
+    { "name": "session_create_and_list", "status": "PASS" },
+    { "name": "sse_event_stream", "status": "PASS" },
+    { "name": "typed_browser_client", "status": "PASS" },
+    { "name": "live_http_smoke", "status": "PASS" },
+    { "name": "workspace_validation", "status": "PASS" }
+  ],
+  "next_phase_allowed": true
+}
