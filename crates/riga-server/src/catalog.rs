@@ -29,6 +29,10 @@ pub struct McpServerSummary {
     pub name: String,
     pub command: String,
     pub tools: Vec<String>,
+    #[serde(rename = "transport", skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 pub fn builtins() -> Vec<CatalogItem> {
@@ -123,9 +127,32 @@ pub fn load_mcp_servers(root: &Path) -> Vec<McpServerSummary> {
                     command: value
                         .get("command")
                         .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unknown")
+                        .unwrap_or_else(|| {
+                            if value.get("url").is_some() {
+                                "http-stream"
+                            } else {
+                                "unknown"
+                            }
+                        })
                         .into(),
                     tools: Vec::new(),
+                    transport: Some(
+                        value
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_else(|| {
+                                if value.get("url").is_some() {
+                                    "http"
+                                } else {
+                                    "stdio"
+                                }
+                            })
+                            .into(),
+                    ),
+                    url: value
+                        .get("url")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned),
                 })
                 .collect()
         })

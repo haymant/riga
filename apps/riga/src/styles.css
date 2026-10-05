@@ -106,10 +106,31 @@ h1 { margin: 0; color: #f4f4f6; font-size: clamp(28px, 4vw, 42px); letter-spacin
 .catalog-menu { position: relative; z-index: 5; display: grid; gap: 4px; margin-top: 7px; padding: 10px; max-height: 320px; overflow-y: auto; background: #151922; border: 1px solid #353d4d; border-radius: 9px; box-shadow: 0 16px 34px rgba(0,0,0,.3); }
 .catalog-menu > strong { color: #e8eaf0; font-size: 11px; padding: 2px 4px 5px; }
 .catalog-menu > small { color: #7e8798; text-transform: uppercase; letter-spacing: .1em; font: 9px 'DM Mono', monospace; padding: 7px 4px 2px; }
+.catalog-menu-header { display: flex; align-items: center; gap: 6px; min-height: 25px; }
+.catalog-menu-header strong { flex: 1; color: #e8eaf0; font-size: 11px; }
+.catalog-close, .catalog-back { display: grid; place-items: center; color: #8993a5; background: transparent; border: 0; border-radius: 5px; padding: 4px; }
+.catalog-close:hover, .catalog-back:hover { color: #fff; background: #242a37; }
+.catalog-search { width: 100%; padding: 8px 9px; color: #dfe3e9; background: #10141c; border: 1px solid #343d4d; border-radius: 7px; outline: none; font-size: 11px; }
+.catalog-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(121, 92, 206, .12); }
 .catalog-menu > button { display: grid; grid-template-columns: 115px 1fr; gap: 10px; text-align: left; color: #bfc6d2; background: transparent; border: 0; border-radius: 6px; padding: 7px 6px; }
 .catalog-menu > button:hover { background: #242a37; }
 .catalog-menu > button span { color: #cdbfff; font: 10px 'DM Mono', monospace; }
 .catalog-menu > button em { color: #7f899a; font-size: 10px; font-style: normal; }
+.catalog-category, .catalog-item { width: 100%; }
+.catalog-category span, .catalog-category em, .catalog-item em { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.catalog-category span { display: flex; align-items: center; gap: 7px; }
+.catalog-category em { display: flex; align-items: center; justify-content: flex-end; gap: 4px; }
+.catalog-inline-actions { display: grid; gap: 4px; }
+.catalog-item { grid-template-columns: 125px minmax(0, 1fr) !important; align-items: center; }
+.catalog-item em { position: relative; }
+.catalog-edit { float: right; display: inline-grid; place-items: center; color: #8993a5; background: transparent; border: 0; padding: 2px; }
+.catalog-edit:hover { color: #fff; }
+.catalog-empty { padding: 13px 6px; color: #778294; font-size: 11px; text-align: center; }
+.connector-form { display: grid; gap: 8px; padding: 4px 2px; }
+.connector-form label { display: grid; gap: 4px; color: #8e98aa; font-size: 10px; }
+.connector-form input, .connector-form select { width: 100%; padding: 8px; color: #dfe3e9; background: #10141c; border: 1px solid #343d4d; border-radius: 6px; outline: none; font-size: 10px; }
+.connector-form-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 4px; }
+.connector-form-actions .outline-button, .connector-form-actions .approve-button { padding: 7px 9px; font-size: 10px; }
 .composer { min-height: 53px; display: flex; align-items: center; gap: 8px; background: #151922; border: 1px solid #333b4b; border-radius: 9px; padding: 8px 9px; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
 .composer:focus-within { border-color: #65519d; box-shadow: 0 0 0 3px rgba(120,92,206,.11); }
 .composer textarea { resize: none; flex: 1; min-height: 32px; max-height: 110px; color: #dfe3e9; background: transparent; border: 0; outline: 0; padding: 7px 4px; line-height: 1.4; font-size: 12px; }

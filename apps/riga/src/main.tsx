@@ -7,6 +7,7 @@ import {
   Bot,
   Check,
   ChevronDown,
+  ChevronLeft,
   CircleStop,
   Clock3,
   Code2,
@@ -16,6 +17,7 @@ import {
   MessageSquare,
   MoreHorizontal,
   Paperclip,
+  Pencil,
   Moon,
   Sun,
   Play,
@@ -38,7 +40,9 @@ type TranscriptItem =
 type TranscriptBlock = TranscriptItem | { id: string; role: "timeline"; items: Extract<TranscriptItem, { role: "tool" }>[] };
 type CatalogItem = { id: string; kind: string; description: string; insert_text: string; requires_approval: boolean };
 type SkillSummary = { name: string; description: string; path: string };
-type McpServerSummary = { name: string; command: string; tools: string[] };
+type McpServerSummary = { name: string; command: string; tools: string[]; transport?: "stdio" | "http"; url?: string };
+type ConnectorDraft = { name: string; transport: "stdio" | "http"; command: string; args: string; url: string };
+type CatalogLayer = "root" | "connectors";
 type ReasoningEffort = "low" | "medium" | "high";
 type Attachment = { name: string; path: string; size: number };
 
@@ -105,10 +109,15 @@ function App() {
   const [theme, setTheme] = useState<"dark" | "light">(() => loadLocal("riga.theme.v1", "dark"));
   const [transportStatus, setTransportStatus] = useState<"connecting" | "connected" | "closed" | "error">("connecting");
   const [catalogOpen, setCatalogOpen] = useState(false);
+  const [catalogLayer, setCatalogLayer] = useState<CatalogLayer>("root");
+  const [catalogQuery, setCatalogQuery] = useState("");
+  const [editingConnector, setEditingConnector] = useState<string | null>(null);
+  const [connectorDraft, setConnectorDraft] = useState<ConnectorDraft>({ name: "", transport: "stdio", command: "", args: "", url: "" });
   const [catalogItems, setCatalogItems] = useState<CatalogItem[]>([]);
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [mcpServers, setMcpServers] = useState<McpServerSummary[]>([]);
   const transportRef = useRef<RigaWebSocketClient | null>(null);
+  const catalogRef = useRef<HTMLDivElement | null>(null);
 
   const activeSession = useMemo(() => sessions.find((session) => session.active) ?? sessions[0], [sessions]);
   const transcript = sessionTranscripts[activeSession.id] ?? [];
@@ -132,6 +141,38 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem("riga.transcripts.v1", JSON.stringify(sessionTranscripts));
   }, [sessionTranscripts]);
+
+  const savedConnectors = loadLocal<McpServerSummary[]>("riga.connectors.v1", []);
+  const allConnectors = useMemo(() => {
+    const merged = [...savedConnectors, ...mcpServers];
+    return merged.filter((server, index, list) => list.findIndex((candidate) => candidate.name === server.name) === index);
+  }, [mcpServers, savedConnectors]);
+
+  const triggerMatch = useMemo(() => {
+    const match = draft.match(/(?:^|\s)([@/])([^\s]*)$/);
+    return match ? { char: match[1], query: match[2] } : null;
+  }, [draft]);
+
+  useEffect(() => {
+    if (triggerMatch) {
+      setCatalogOpen(true);
+      setCatalogLayer("root");
+      setCatalogQuery(triggerMatch.query);
+    }
+  }, [triggerMatch]);
+
+  useEffect(() => {
+    if (!catalogOpen) return;
+    const onPointerDown = (event: PointerEvent) => {
+      if (!catalogRef.current?.contains(event.target as Node)) setCatalogOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setCatalogOpen(false); setCatalogQuery(""); setCatalogLayer("root"); }
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => { document.removeEventListener("pointerdown", onPointerDown); document.removeEventListener("keydown", onKeyDown); };
+  }, [catalogOpen]);
 
   useEffect(() => {
     void fetch("/catalog").then((response) => response.json()).then((value: { tools?: CatalogItem[]; skills?: SkillSummary[]; mcp_servers?: McpServerSummary[] }) => {
@@ -276,9 +317,42 @@ function App() {
   }
 
   function insertCatalog(text: string) {
-    setDraft((current) => `${current}${current ? "\n" : ""}${text}`);
+    setDraft((current) => {
+      if (triggerMatch) return current.replace(/(?:^|\s)([@/])([^\s]*)$/, (match) => `${match.startsWith(" ") ? " " : ""}${text}`);
+      return `${current}${current ? "\n" : ""}${text}`;
+    });
     setCatalogOpen(false);
+    setCatalogQuery("");
+    setCatalogLayer("root");
   }
+
+  function openConnectorEditor(server?: McpServerSummary) {
+    setEditingConnector(server?.name ?? null);
+    setConnectorDraft({ name: server?.name ?? "", transport: server?.transport ?? (server?.url ? "http" : "stdio"), command: server?.command === "unknown" ? "" : server?.command ?? "", args: "", url: server?.url ?? "" });
+  }
+
+  function saveConnector() {
+    const name = connectorDraft.name.trim();
+    if (!name || (connectorDraft.transport === "stdio" ? !connectorDraft.command.trim() : !connectorDraft.url.trim())) {
+      setToast("Connector name and transport details are required");
+      return;
+    }
+    const next: McpServerSummary = { name, command: connectorDraft.transport === "stdio" ? connectorDraft.command.trim() : "http-stream", tools: [], transport: connectorDraft.transport, url: connectorDraft.transport === "http" ? connectorDraft.url.trim() : undefined };
+    const updated = [...allConnectors.filter((server) => server.name !== name), next];
+    window.localStorage.setItem("riga.connectors.v1", JSON.stringify(updated));
+    setMcpServers(updated);
+    setEditingConnector(null);
+    setToast(`Connector ${name} saved`);
+  }
+
+  const searchableItems = useMemo(() => {
+    const query = catalogQuery.trim().toLowerCase();
+    const tools = catalogItems.filter((item) => !query || `${item.id} ${item.description}`.toLowerCase().includes(query));
+    const skillItems = skills.filter((skill) => !query || `${skill.name} ${skill.description}`.toLowerCase().includes(query));
+    const connectorItems = allConnectors.filter((server) => !query || `${server.name} ${server.command} ${server.url ?? ""}`.toLowerCase().includes(query));
+    const files = attachments.filter((file) => !query || file.name.toLowerCase().includes(query));
+    return { tools, skills: skillItems, connectors: connectorItems, files };
+  }, [allConnectors, attachments, catalogItems, catalogQuery, skills]);
 
   async function saveProvider() {
     if (providerMode === "local") {
@@ -347,7 +421,12 @@ function App() {
 
           {approval && <div className="approval-card"><div className="approval-icon"><ShieldCheck size={19} /></div><div className="approval-copy"><div className="approval-title"><strong>Approval required</strong><span>workspace mutation</span></div><p>Allow RIGA to write the transport adapter boundary in <code>crates/</code> and update the event journal contract?</p><div className="approval-details"><span><FolderOpen size={13} /> 3 files</span><span><GitBranch size={13} /> reversible change</span><span><Clock3 size={13} /> requested now</span></div></div><div className="approval-actions"><button className="deny-button" onClick={deny}>Decline</button><button className="approve-button" onClick={approve}><Check size={15} /> Approve</button></div></div>}
 
-          <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" value={providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{Array.from(new Set([providerModel, "gpt-5-nano", "gpt-5-mini", "gpt-5-codex"])).filter(Boolean).map((model) => <option key={model} value={model}>{model}</option>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onClick={() => setCatalogOpen((value) => !value)}><Plus size={17} /></button><textarea value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${draft.trim() ? "send-ready" : ""}`} aria-label="Send message" onClick={sendMessage}><Send size={16} /></button></div>{catalogOpen && <div className="catalog-menu"><strong>Insert into composer</strong><small>Built-in tools</small>{catalogItems.map((item) => <button key={item.id} onClick={() => insertCatalog(item.insert_text)}><span>{item.id}</span><em>{item.description}</em></button>)}{skills.length > 0 && <small>Skills</small>}{skills.map((skill) => <button key={skill.name} onClick={() => insertCatalog(`Use the skill tool with name ${skill.name}: `)}><span>skill/{skill.name}</span><em>{skill.description}</em></button>)}{mcpServers.length > 0 && <small>MCP servers</small>}{mcpServers.map((server) => <button key={server.name} onClick={() => insertCatalog(`Use MCP server ${server.name}: `)}><span>mcp/{server.name}</span><em>{server.command}</em></button>)}</div>}<div className="composer-footer"><span><kbd>Enter</kbd> send · <kbd>Shift Enter</kbd> newline · <kbd>↑↓</kbd> history</span><span>RIGA Kernel · local</span></div></div>
+          <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" value={providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{Array.from(new Set([providerModel, "gpt-5-nano", "gpt-5-mini", "gpt-5-codex"])).filter(Boolean).map((model) => <option key={model} value={model}>{model}</option>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setCatalogOpen((value) => !value); setCatalogLayer("root"); setCatalogQuery(""); }}><Plus size={17} /></button><textarea value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${draft.trim() ? "send-ready" : ""}`} aria-label="Send message" onClick={sendMessage}><Send size={16} /></button></div>{catalogOpen && <div className="catalog-menu" ref={catalogRef} role="listbox">
+              <div className="catalog-menu-header">{catalogLayer === "connectors" && <button className="catalog-back" aria-label="Back to insert menu" onClick={() => setCatalogLayer("root")}><ChevronLeft size={14} /></button>}<strong>{triggerMatch ? `${triggerMatch.char === "@" ? "Mention" : "Command"} suggestions` : catalogLayer === "root" ? "Insert into composer" : "Connectors"}</strong><button className="catalog-close" aria-label="Close insert menu" onClick={() => setCatalogOpen(false)}><X size={14} /></button></div>
+              <input className="catalog-search" autoFocus={catalogOpen} value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder={triggerMatch ? `Filter ${triggerMatch.char === "@" ? "files or agents" : "tools and skills"}…` : "Search tools, skills, connectors…"} aria-label="Search composer insert menu" />
+              {editingConnector ? <div className="connector-form"><label>Name<input value={connectorDraft.name} onChange={(event) => setConnectorDraft({ ...connectorDraft, name: event.target.value })} placeholder="my-server" /></label><label>Transport<select value={connectorDraft.transport} onChange={(event) => setConnectorDraft({ ...connectorDraft, transport: event.target.value as "stdio" | "http" })}><option value="stdio">stdio process</option><option value="http">HTTP stream</option></select></label>{connectorDraft.transport === "stdio" ? <><label>Command<input value={connectorDraft.command} onChange={(event) => setConnectorDraft({ ...connectorDraft, command: event.target.value })} placeholder="npx -y @modelcontextprotocol/server-filesystem" /></label><label>Arguments<input value={connectorDraft.args} onChange={(event) => setConnectorDraft({ ...connectorDraft, args: event.target.value })} placeholder="/workspace" /></label></> : <label>HTTP stream URL<input value={connectorDraft.url} onChange={(event) => setConnectorDraft({ ...connectorDraft, url: event.target.value })} placeholder="https://example.com/mcp" /></label>}<div className="connector-form-actions"><button className="outline-button" onClick={() => setEditingConnector(null)}>Cancel</button><button className="approve-button" onClick={saveConnector}><Check size={14} /> Save connector</button></div></div> : <>{catalogLayer === "root" && !triggerMatch && !catalogQuery && <><small>Connectors</small><button className="catalog-category" onClick={() => setCatalogLayer("connectors")}><span><FolderOpen size={14} /> MCP connectors</span><em>{allConnectors.length} registered <ChevronDown size={13} /></em></button><small>Built-in tools</small></>}{(catalogLayer === "connectors" || catalogQuery || triggerMatch?.char === "/" || triggerMatch?.char === "@") && <>{catalogLayer === "connectors" && <div className="catalog-inline-actions"><button className="catalog-category" onClick={() => openConnectorEditor()}><span><Plus size={14} /> Add connector</span><em>stdio or HTTP stream</em></button></div>}{searchableItems.connectors.map((server) => <button className="catalog-item" key={`connector-${server.name}`} onClick={() => insertCatalog(`Use MCP server ${server.name}: `)}><span>mcp/{server.name}</span><em>{server.transport === "http" ? server.url : server.command}<button type="button" className="catalog-edit" aria-label={`Edit ${server.name}`} onClick={(event) => { event.stopPropagation(); openConnectorEditor(server); }}><Pencil size={12} /></button></em></button>)}</>}{(catalogLayer === "root" || catalogQuery || triggerMatch) && <>{searchableItems.tools.length > 0 && <small>Built-in tools</small>}{searchableItems.tools.map((item) => <button className="catalog-item" key={item.id} onClick={() => insertCatalog(triggerMatch?.char === "@" ? `@${item.id} ` : triggerMatch?.char === "/" ? `/${item.id} ` : item.insert_text)}><span>{triggerMatch?.char === "/" ? `/${item.id}` : item.id}</span><em>{item.description}</em></button>)}{searchableItems.skills.length > 0 && <small>Skills and agents</small>}{searchableItems.skills.map((skill) => <button className="catalog-item" key={skill.name} onClick={() => insertCatalog(triggerMatch?.char === "@" ? `@${skill.name} ` : triggerMatch?.char === "/" ? `/${skill.name} ` : `Use the skill tool with name ${skill.name}: `)}><span>{triggerMatch?.char === "@" ? `@${skill.name}` : triggerMatch?.char === "/" ? `/${skill.name}` : `skill/${skill.name}`}</span><em>{skill.description}</em></button>)}{triggerMatch?.char === "@" && searchableItems.files.length > 0 && <><small>Attached files</small>{searchableItems.files.map((file) => <button className="catalog-item" key={file.path} onClick={() => insertCatalog(`@${file.name} `)}><span>@{file.name}</span><em>{file.path}</em></button>)}</>}</>}</>}
+              {catalogQuery && searchableItems.tools.length + searchableItems.skills.length + searchableItems.connectors.length + searchableItems.files.length === 0 && <div className="catalog-empty">No matching tools, skills, or connectors.</div>}
+            </div>}<div className="composer-footer"><span><kbd>Enter</kbd> send · <kbd>Shift Enter</kbd> newline · <kbd>↑↓</kbd> history</span><span>RIGA Kernel · local</span></div></div>
         </section>
       </main>
       {toast && <button className="toast" onClick={() => setToast(null)}><Check size={15} /> {toast}</button>}
