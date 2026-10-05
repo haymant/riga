@@ -228,6 +228,9 @@ where
 }
 
 async fn call_openai_compatible(config: &ProviderConfig, prompt: &str) -> Result<String, String> {
+    if config.model.to_ascii_lowercase().starts_with("gpt-5") {
+        return call_responses_api(config, prompt).await;
+    }
     let endpoint = if config
         .endpoint
         .trim_end_matches('/')
@@ -273,6 +276,72 @@ async fn call_openai_compatible(config: &ProviderConfig, prompt: &str) -> Result
         .first()
         .and_then(|choice| content_text(&choice.message.content))
         .ok_or_else(|| "provider returned no choices".into())
+}
+
+async fn call_responses_api(config: &ProviderConfig, prompt: &str) -> Result<String, String> {
+    let endpoint = if config
+        .endpoint
+        .trim_end_matches('/')
+        .ends_with("/responses")
+    {
+        config.endpoint.trim_end_matches('/').to_string()
+    } else {
+        format!("{}/responses", config.endpoint.trim_end_matches('/'))
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut request = client.post(endpoint).json(&serde_json::json!({
+        "model": config.model,
+        "input": prompt,
+        "max_output_tokens": 1024,
+        "reasoning": { "effort": "minimal" },
+    }));
+    if !config.api_key.trim().is_empty() {
+        request = request.bearer_auth(&config.api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("provider connection failed: {e}"))?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "provider Responses API returned HTTP {status}: {}",
+            redact_body(&body)
+        ));
+    }
+    let response: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("invalid provider Responses API response: {e}"))?;
+    let output = response
+        .get("output")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(|part| {
+            if part.get("type").and_then(serde_json::Value::as_str) == Some("output_text") {
+                part.get("text").and_then(serde_json::Value::as_str)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    if output.is_empty() {
+        return Err(format!(
+            "provider Responses API returned no output text (status: {})",
+            response
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        ));
+    }
+    Ok(output)
 }
 
 fn completion_request_body(model: &str, prompt: &str) -> serde_json::Value {
