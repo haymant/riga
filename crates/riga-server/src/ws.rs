@@ -429,8 +429,14 @@ struct ToolTrace {
 #[derive(Debug)]
 enum ToolTraceEvent {
     Started(serde_json::Value),
-    Output { call_id: String, delta: String },
+    Output {
+        call_id: String,
+        delta: String,
+    },
     Completed(ToolTrace),
+    /// A server-internal tool (plan/todo/task) produced a UI frame rather than
+    /// ordinary text output. Forwarded verbatim as its own event.
+    Ui(riga_kernel::events::RigaEvent),
 }
 
 #[derive(Clone)]
@@ -521,6 +527,43 @@ async fn execute_tool(
             .await
         }
         "task" => crate::catalog::execute_task(&input),
+        // Plan and todo are server-internal: the model writes the current state
+        // and the UI renders it as a pinned element. Nothing leaves the process.
+        "update_plan" => {
+            let plan: riga_kernel::task::Plan = serde_json::from_value(input)
+                .map_err(|error| format!("update_plan arguments are invalid: {error}"))?;
+            if let Some(stream) = &output_stream {
+                let _ = stream
+                    .trace_sender
+                    .send(ToolTraceEvent::Ui(
+                        riga_kernel::events::RigaEvent::PlanUpdated {
+                            plan: Box::new(plan.clone()),
+                        },
+                    ))
+                    .await;
+            }
+            Ok(format!(
+                "Plan updated: {} step(s), currently on step {}.",
+                plan.steps.len(),
+                plan.active_index + 1
+            ))
+        }
+        "update_todos" => {
+            let list: riga_kernel::task::TodoList = serde_json::from_value(input)
+                .map_err(|error| format!("update_todos arguments are invalid: {error}"))?;
+            if let Some(stream) = &output_stream {
+                let _ = stream
+                    .trace_sender
+                    .send(ToolTraceEvent::Ui(
+                        riga_kernel::events::RigaEvent::TodoUpdated {
+                            list: Box::new(list.clone()),
+                        },
+                    ))
+                    .await;
+            }
+            let (done, total) = list.progress();
+            Ok(format!("Todo list updated: {done}/{total} complete."))
+        }
         "skill" => {
             if let Some(name) = input
                 .get("name")
@@ -727,6 +770,7 @@ where
                 }),
             }
         }
+        ToolTraceEvent::Ui(event) => event,
     };
     send(
         sender,
@@ -1406,7 +1450,7 @@ fn tool_schemas() -> Vec<serde_json::Value> {
         ),
         function_schema(
             "glob",
-            "Find workspace files by suffix pattern",
+            "Find workspace files by glob pattern (for example `src/**/*.ts`). Dependency and build directories are ignored.",
             serde_json::json!({"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}),
         ),
         function_schema(
@@ -1433,6 +1477,16 @@ fn tool_schemas() -> Vec<serde_json::Value> {
             "skill",
             "Load a named repository skill document, or list all available skills when name is omitted",
             serde_json::json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+        ),
+        function_schema(
+            "update_plan",
+            "Record or revise the plan you are working through. Call it once after exploring, then again whenever you move to a new step.",
+            serde_json::json!({"type":"object","properties":{"title":{"type":"string"},"steps":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"label":{"type":"string"},"description":{"type":"string"}},"required":["id","label"]}},"active_index":{"type":"integer"}},"required":["title","steps","active_index"]}),
+        ),
+        function_schema(
+            "update_todos",
+            "Replace your visible working list with the current items. Call it when work is discovered, started, finished, fails, or is dropped.",
+            serde_json::json!({"type":"object","properties":{"title":{"type":"string"},"revision":{"type":"integer"},"items":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"description":{"type":"string"},"status":{"type":"string","enum":["pending","active","done","failed","cancelled"]},"reason":{"type":"string"}},"required":["id","text","status"]}}},"required":["items"]}),
         ),
     ]
 }
@@ -1487,6 +1541,8 @@ Tools:\n\
 - `grep` searches file contents; `read` reads one file. Read a file before editing it.\n\
 - `task` dispatches a specialized subagent. Its `action: \"agents\"` form lists them. \
 When the user addresses an agent with `@explore`, `@plan`, `@build`, or `@review`, dispatch that agent with the `task` tool and the matching `agent` argument rather than doing the work yourself when the profile's remit fits.\n\
+- `update_plan` records the checklist you are working through and `update_todos` keeps your working list current. \
+Call `update_plan` once right after exploring, then `update_todos` as work is discovered, started, finished, fails, or is dropped, instead of narrating progress in prose.\n\
 - When the user names a specific MCP server, prefer its qualified tool alias beginning with `mcp_` (for example `mcp_riga_health_stdio_health`) over a built-in.\n\n",
     );
     prompt.push_str(&format!("Workspace root: {}\n", workspace.display()));
@@ -1542,6 +1598,7 @@ mod tests {
         parse_local_tool_calls, resolve_run_provider,
     };
     use riga_kernel::events::RigaEvent;
+    use tokio::sync::mpsc;
 
     #[test]
     fn protocol_accepts_provider_configuration_without_persisting_it() {
@@ -1906,5 +1963,81 @@ mod tests {
         assert!(calls.is_empty());
         let (_, calls) = parse_local_tool_calls("<tool_call>{\"name\":\"  \"}</tool_call>");
         assert!(calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_plan_emits_a_plan_frame_and_confirms() {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let stream = super::ToolOutputStream {
+            call_id: "call-1".into(),
+            trace_sender: sender,
+        };
+        let result = super::execute_tool(
+            std::path::Path::new("."),
+            &crate::mcp::McpRuntime::new(),
+            "update_plan",
+            serde_json::json!({
+                "title": "Build a service",
+                "steps": [{"id": "probe", "label": "add /probe"}],
+                "active_index": 0
+            }),
+            Some(stream),
+        )
+        .await
+        .expect("update_plan executes");
+        assert!(result.contains("Plan updated"), "{result}");
+        match receiver.recv().await.expect("a frame was emitted") {
+            super::ToolTraceEvent::Ui(RigaEvent::PlanUpdated { plan }) => {
+                assert_eq!(plan.steps.len(), 1);
+                assert_eq!(plan.title, "Build a service");
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_todos_reports_the_element_ratio() {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let stream = super::ToolOutputStream {
+            call_id: "call-1".into(),
+            trace_sender: sender,
+        };
+        let result = super::execute_tool(
+            std::path::Path::new("."),
+            &crate::mcp::McpRuntime::new(),
+            "update_todos",
+            serde_json::json!({
+                "items": [
+                    {"id": "1", "text": "done", "status": "done"},
+                    {"id": "2", "text": "failed", "status": "failed"},
+                    {"id": "3", "text": "dropped", "status": "cancelled"}
+                ]
+            }),
+            Some(stream),
+        )
+        .await
+        .expect("update_todos executes");
+        assert!(result.contains("1/2"), "{result}");
+        assert!(matches!(
+            receiver.recv().await.expect("a frame was emitted"),
+            super::ToolTraceEvent::Ui(RigaEvent::TodoUpdated { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn malformed_plan_arguments_are_reported_not_ignored() {
+        let error = super::execute_tool(
+            std::path::Path::new("."),
+            &crate::mcp::McpRuntime::new(),
+            "update_plan",
+            serde_json::json!({"title": "x"}),
+            None,
+        )
+        .await
+        .expect_err("missing steps must fail");
+        assert!(
+            error.contains("update_plan arguments are invalid"),
+            "{error}"
+        );
     }
 }

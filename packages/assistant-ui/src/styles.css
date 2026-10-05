@@ -499,3 +499,31 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 /* Body cells use full-strength text, not the muted token: muted-on-surface-soft
    lands at 4.36:1 in the light theme, just under the 4.5:1 floor for body copy. */
 .message-body .markdown td { color: var(--text); }
+
+/* Agent plan and todo list, pinned above the composer. Driven by PlanUpdated
+   and TodoUpdated frames. Every colour is a token, so both themes are correct. */
+.agent-work { display: grid; gap: 8px; margin: 14px 0 0 39px; }
+.agent-plan, .agent-todos { border: 1px solid var(--border); border-radius: 12px; background: var(--surface-raised); padding: 11px 13px; }
+.agent-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.agent-card-head strong { color: var(--text); font-size: 11px; font-weight: 700; }
+.agent-card-head span { color: var(--text-muted); font: 10px 'DM Mono', monospace; }
+.agent-progress { height: 3px; margin: 8px 0 6px; border-radius: 999px; background: var(--surface-soft); overflow: hidden; }
+.agent-progress span { display: block; height: 100%; border-radius: 999px; background: var(--accent); transition: width .2s ease; }
+.agent-steps { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 2px; }
+.agent-step { display: flex; gap: 8px; align-items: flex-start; padding: 3px 0; }
+.agent-step-icon { flex: 0 0 auto; width: 14px; text-align: center; color: var(--text-muted); font: 11px 'DM Mono', monospace; }
+.agent-step-label { color: var(--text-muted); font-size: 11px; line-height: 1.5; }
+.agent-step-desc { display: block; color: var(--text-muted); opacity: .75; font-size: 10px; line-height: 1.4; margin-top: 1px; }
+.agent-step.active .agent-step-icon { color: var(--accent); }
+.agent-step.active .agent-step-label { color: var(--text); font-weight: 600; }
+.agent-step.done .agent-step-icon { color: var(--green); }
+.agent-step.done .agent-step-label { color: var(--text-muted); }
+.agent-step.todo-done .agent-step-icon { color: var(--green); }
+.agent-step.todo-done .agent-step-label { color: var(--text-muted); text-decoration: line-through; }
+.agent-step.todo-active .agent-step-icon { color: var(--accent); }
+.agent-step.todo-active .agent-step-label { color: var(--text); font-weight: 600; }
+.agent-step.todo-failed .agent-step-icon { color: var(--amber); }
+.agent-step.todo-failed .agent-step-label { color: var(--amber); }
+.agent-step.todo-cancelled { opacity: .5; }
+.agent-step.todo-cancelled .agent-step-label { text-decoration: line-through; }
+@media (max-width: 760px) { .agent-work { margin-left: 0; } }

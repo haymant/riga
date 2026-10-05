@@ -236,6 +236,7 @@ pub struct TodoItem {
 pub struct TodoList {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default)]
     pub revision: u64,
     pub items: Vec<TodoItem>,
 }
