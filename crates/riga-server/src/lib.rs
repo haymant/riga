@@ -248,7 +248,11 @@ async fn local_model_action(
     };
     match request.action.as_str() {
         "download" => {
-            let Some(model_id) = request.model_id.as_deref().map(str::trim).filter(|id| !id.is_empty())
+            let Some(model_id) = request
+                .model_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
             else {
                 return bad("model_id is required to download a model");
             };
@@ -276,7 +280,11 @@ async fn local_model_action(
                 .into_response()
         }
         "cancel" => {
-            let Some(model_id) = request.model_id.as_deref().map(str::trim).filter(|id| !id.is_empty())
+            let Some(model_id) = request
+                .model_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
             else {
                 return bad("model_id is required to cancel a download");
             };
@@ -286,13 +294,19 @@ async fn local_model_action(
             }
         }
         "load" => {
-            let Some(path) = request.path.as_deref().map(str::trim).filter(|path| !path.is_empty())
+            let Some(path) = request
+                .path
+                .as_deref()
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
             else {
                 return bad("path is required to load a model");
             };
             match state.local_models.load_model(path).await {
-                Ok(()) => Json(serde_json::json!({ "loaded": state.local_models.loaded_file_name() }))
-                    .into_response(),
+                Ok(()) => {
+                    Json(serde_json::json!({ "loaded": state.local_models.loaded_file_name() }))
+                        .into_response()
+                }
                 Err(error) => (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(serde_json::json!({ "error": error })),

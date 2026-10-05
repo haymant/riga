@@ -18,10 +18,10 @@ use std::{
 
 use encoding_rs::UTF_8;
 use llama_cpp_2::{
-    context::{params::LlamaContextParams, LlamaContext},
+    context::{LlamaContext, params::LlamaContextParams},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, LlamaChatMessage, LlamaModel},
+    model::{LlamaChatMessage, LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
 };
 use serde::{Deserialize, Serialize};
@@ -174,7 +174,11 @@ fn resolve_context(trained: u32, wanted: u32) -> u32 {
 /// fix was about: whatever we return still fits the context, so generation can
 /// never run off the end of the KV cache. Only a prompt that fills the context
 /// outright is an error, because there is no valid completion left to make.
-fn resolve_max_tokens(requested: u32, prompt_tokens: u32, context_size: u32) -> Result<u32, String> {
+fn resolve_max_tokens(
+    requested: u32,
+    prompt_tokens: u32,
+    context_size: u32,
+) -> Result<u32, String> {
     let room = context_size.saturating_sub(prompt_tokens);
     if room == 0 {
         return Err(format!(
@@ -252,7 +256,7 @@ impl LocalModelRuntime {
                 recommended_context: resolve_context(model.max_context, model.max_context),
                 max_context: model.max_context,
                 quant: "Q4_K_M",
-                license_url: model.license_url.into(),
+                license_url: model.license_url,
             })
             .collect()
     }
@@ -260,8 +264,8 @@ impl LocalModelRuntime {
     pub fn list_installed(&self) -> Result<Vec<InstalledModel>, String> {
         let directory = self.models_dir();
         let mut models = Vec::new();
-        let entries =
-            fs::read_dir(&directory).map_err(|error| format!("Could not scan models folder: {error}"))?;
+        let entries = fs::read_dir(&directory)
+            .map_err(|error| format!("Could not scan models folder: {error}"))?;
         for entry in entries {
             let entry = entry.map_err(|error| error.to_string())?;
             let path = entry.path();
@@ -286,7 +290,8 @@ impl LocalModelRuntime {
                 path: path.to_string_lossy().into_owned(),
                 size_bytes: metadata.len(),
                 curated: curated.is_some(),
-                recommended_context: curated.map(|model| resolve_context(model.max_context, model.max_context)),
+                recommended_context: curated
+                    .map(|model| resolve_context(model.max_context, model.max_context)),
                 license_url: curated.map(|model| model.license_url.to_string()),
             });
         }
@@ -353,7 +358,9 @@ impl LocalModelRuntime {
         {
             Ok(client) => client,
             Err(error) => {
-                return Err(self.fail_download(model_id, format!("Could not start download: {error}")));
+                return Err(
+                    self.fail_download(model_id, format!("Could not start download: {error}"))
+                );
             }
         };
         let mut response = match client.get(model.download_url).send().await {
@@ -367,10 +374,9 @@ impl LocalModelRuntime {
                 }
             },
             Err(error) => {
-                return Err(self.fail_download(
-                    model_id,
-                    format!("Download request failed: {error}"),
-                ));
+                return Err(
+                    self.fail_download(model_id, format!("Download request failed: {error}"))
+                );
             }
         };
         let mut file = match tokio::fs::File::create(&partial_path).await {
@@ -541,10 +547,10 @@ impl LocalModelRuntime {
         let backend = match self.backend.get() {
             Some(backend) => backend.clone(),
             None => {
-                let candidate =
-                    Arc::new(LlamaBackend::init().map_err(|error| {
-                        format!("Could not initialize llama.cpp: {error}")
-                    })?);
+                let candidate = Arc::new(
+                    LlamaBackend::init()
+                        .map_err(|error| format!("Could not initialize llama.cpp: {error}"))?,
+                );
                 let _ = self.backend.set(candidate);
                 self.backend
                     .get()
@@ -661,10 +667,9 @@ impl LocalModelRuntime {
         if llama_messages.is_empty() {
             return Err("Enter a message to start a conversation".into());
         }
-        let template = loaded
-            .model
-            .chat_template(None)
-            .map_err(|error| format!("The model does not provide a supported chat template: {error}"))?;
+        let template = loaded.model.chat_template(None).map_err(|error| {
+            format!("The model does not provide a supported chat template: {error}")
+        })?;
         let prompt = loaded
             .model
             .apply_chat_template(&template, &llama_messages, true)
@@ -686,10 +691,11 @@ impl LocalModelRuntime {
             .with_n_ctx(std::num::NonZeroU32::new(context_size))
             .with_n_batch(batch_size)
             .with_n_ubatch(batch_size);
-        let mut context: LlamaContext = loaded
-            .model
-            .new_context(&loaded.backend, context_params)
-            .map_err(|error| format!("Could not create inference context: {error}"))?;
+        let mut context: LlamaContext =
+            loaded
+                .model
+                .new_context(&loaded.backend, context_params)
+                .map_err(|error| format!("Could not create inference context: {error}"))?;
         let mut batch = LlamaBatch::new(batch_size as usize, 1);
         // Evaluate the prompt in chunks that each fit the decode batch. Only the
         // very last token needs logits, because that is the one generation
@@ -815,9 +821,18 @@ pub struct InstalledModel {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LocalModelEvent {
     DownloadProgress(DownloadProgress),
-    DownloadFinished { model_id: String, path: String },
-    DownloadFailed { model_id: String, message: String },
-    Token { generation_id: String, delta: String },
+    DownloadFinished {
+        model_id: String,
+        path: String,
+    },
+    DownloadFailed {
+        model_id: String,
+        message: String,
+    },
+    Token {
+        generation_id: String,
+        delta: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -933,7 +948,10 @@ mod tests {
         assert_eq!(resolve_max_tokens(0, 10, 8_192).unwrap(), 1);
         // Only a prompt that fills the context outright is an error.
         let err = resolve_max_tokens(512, 8_192, 8_192).unwrap_err();
-        assert!(err.contains("8192-token context"), "unhelpful message: {err}");
+        assert!(
+            err.contains("8192-token context"),
+            "unhelpful message: {err}"
+        );
         assert!(resolve_max_tokens(512, 9_000, 8_192).is_err());
     }
 
@@ -945,14 +963,20 @@ mod tests {
             let context = resolve_context(trained, MAX_CONTEXT);
             let batch_size = context.min(MAX_DECODE_BATCH);
             assert!(batch_size >= 1, "context {context} leaves no decode room");
-            assert!(batch_size <= context, "batch {batch_size} exceeds {context}");
+            assert!(
+                batch_size <= context,
+                "batch {batch_size} exceeds {context}"
+            );
         }
     }
 
     #[test]
     fn accelerator_label_names_the_built_in_backend() {
         let label = accelerator_label();
-        assert!(label == "CPU (OpenMP)" || label == "CUDA", "unexpected: {label}");
+        assert!(
+            label == "CPU (OpenMP)" || label == "CUDA",
+            "unexpected: {label}"
+        );
     }
 
     #[test]
@@ -961,7 +985,12 @@ mod tests {
         // only fails inside the task would be answered "started" and the picker
         // would wait on a progress bar that never moves.
         let runtime = LocalModelRuntime::default();
-        for bad in ["not-a-real-id", "", "PHI-4-MINI-INSTRUCT", "../../etc/passwd"] {
+        for bad in [
+            "not-a-real-id",
+            "",
+            "PHI-4-MINI-INSTRUCT",
+            "../../etc/passwd",
+        ] {
             let blocker = runtime
                 .download_blocker(bad)
                 .unwrap_or_else(|| panic!("{bad:?} was accepted for download"));

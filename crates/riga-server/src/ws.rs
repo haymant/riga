@@ -126,53 +126,71 @@ pub async fn upgrade(
         };
     while let Some(Ok(message)) = receiver.next().await {
         match message {
-            Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
-                Ok(ClientMessage::Hello { .. }) => {
-                    if send(
-                        &mut sender,
-                        ServerMessage::Ready {
-                            protocol_version: riga_kernel::PROTOCOL_VERSION,
-                            server_version: "0.1.0",
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
-                    }
-                    if let Some(config) = &provider
-                        && send(
+            Message::Text(text) => {
+                match serde_json::from_str::<ClientMessage>(&text) {
+                    Ok(ClientMessage::Hello { .. }) => {
+                        if send(
                             &mut sender,
-                            ServerMessage::ProviderConfigured {
-                                endpoint: config.endpoint.clone(),
-                                model: config.model.clone(),
-                                reasoning_effort: config.reasoning_effort.clone(),
+                            ServerMessage::Ready {
+                                protocol_version: riga_kernel::PROTOCOL_VERSION,
+                                server_version: "0.1.0",
                             },
                         )
                         .await
                         .is_err()
-                    {
-                        return;
+                        {
+                            return;
+                        }
+                        if let Some(config) = &provider
+                            && send(
+                                &mut sender,
+                                ServerMessage::ProviderConfigured {
+                                    endpoint: config.endpoint.clone(),
+                                    model: config.model.clone(),
+                                    reasoning_effort: config.reasoning_effort.clone(),
+                                },
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
-                }
-                Ok(ClientMessage::ConfigureProvider(mut config)) => {
-                    if config.api_key.trim().is_empty()
-                        && let Some(existing) = &provider
-                    {
-                        config.api_key = existing.api_key.clone();
-                    }
-                    let model = config.model.clone();
-                    let endpoint = config.endpoint.clone();
-                    let reasoning_effort = config.reasoning_effort.clone();
-                    if let Err(error) = crate::secure_store::save_json("provider", &config).await {
-                        tracing::error!(%error, "provider settings could not be persisted");
+                    Ok(ClientMessage::ConfigureProvider(mut config)) => {
+                        if config.api_key.trim().is_empty()
+                            && let Some(existing) = &provider
+                        {
+                            config.api_key = existing.api_key.clone();
+                        }
+                        let model = config.model.clone();
+                        let endpoint = config.endpoint.clone();
+                        let reasoning_effort = config.reasoning_effort.clone();
+                        if let Err(error) =
+                            crate::secure_store::save_json("provider", &config).await
+                        {
+                            tracing::error!(%error, "provider settings could not be persisted");
+                            if send(
+                                &mut sender,
+                                ServerMessage::Error {
+                                    code: "provider_persist_failed".into(),
+                                    message: format!(
+                                        "Provider settings could not be persisted: {error}"
+                                    ),
+                                },
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        provider = Some(config);
                         if send(
                             &mut sender,
-                            ServerMessage::Error {
-                                code: "provider_persist_failed".into(),
-                                message: format!(
-                                    "Provider settings could not be persisted: {error}"
-                                ),
+                            ServerMessage::ProviderConfigured {
+                                endpoint,
+                                model,
+                                reasoning_effort,
                             },
                         )
                         .await
@@ -181,113 +199,106 @@ pub async fn upgrade(
                             return;
                         }
                     }
-                    provider = Some(config);
-                    if send(
-                        &mut sender,
-                        ServerMessage::ProviderConfigured {
-                            endpoint,
-                            model,
-                            reasoning_effort,
-                        },
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
+                    Ok(ClientMessage::Ping { nonce }) => {
+                        let _ = send(&mut sender, ServerMessage::Pong { nonce }).await;
                     }
-                }
-                Ok(ClientMessage::Ping { nonce }) => {
-                    let _ = send(&mut sender, ServerMessage::Pong { nonce }).await;
-                }
-                Ok(ClientMessage::Approval {
-                    run_id,
-                    approval_id,
-                    approved,
-                }) => {
-                    let _ = send(
-                        &mut sender,
-                        ServerMessage::ApprovalRecorded {
-                            run_id,
-                            approval_id,
-                            approved,
-                        },
-                    )
-                    .await;
-                }
-                Ok(ClientMessage::CancelRun { run_id }) => {
-                    let _ = send(&mut sender, ServerMessage::RunCancelled { run_id }).await;
-                }
-                Ok(ClientMessage::ToolCall {
-                    call_id,
-                    name,
-                    input,
-                }) => {
-                    let result =
-                        execute_tool(&workspace_root, &mcp_runtime, &name, input, None).await;
-                    let (ok, output) = match result {
-                        Ok(output) => (true, output),
-                        Err(error) => (false, error),
-                    };
-                    let _ = send(
-                        &mut sender,
-                        ServerMessage::ToolResult {
-                            call_id,
-                            name,
-                            ok,
-                            output,
-                        },
-                    )
-                    .await;
-                }
-                Ok(ClientMessage::StartRun {
-                    run_id,
-                    session_id,
-                    prompt,
-                }) => {
-                    let config = match resolve_run_provider(
-                        provider.as_ref(),
-                        local_models.loaded_file_name().is_some(),
-                    ) {
-                        Ok(config) => config,
-                        Err((code, message)) => {
-                            let _ = send(&mut sender, ServerMessage::Error { code: code.into(), message: message.into() }).await;
+                    Ok(ClientMessage::Approval {
+                        run_id,
+                        approval_id,
+                        approved,
+                    }) => {
+                        let _ = send(
+                            &mut sender,
+                            ServerMessage::ApprovalRecorded {
+                                run_id,
+                                approval_id,
+                                approved,
+                            },
+                        )
+                        .await;
+                    }
+                    Ok(ClientMessage::CancelRun { run_id }) => {
+                        let _ = send(&mut sender, ServerMessage::RunCancelled { run_id }).await;
+                    }
+                    Ok(ClientMessage::ToolCall {
+                        call_id,
+                        name,
+                        input,
+                    }) => {
+                        let result =
+                            execute_tool(&workspace_root, &mcp_runtime, &name, input, None).await;
+                        let (ok, output) = match result {
+                            Ok(output) => (true, output),
+                            Err(error) => (false, error),
+                        };
+                        let _ = send(
+                            &mut sender,
+                            ServerMessage::ToolResult {
+                                call_id,
+                                name,
+                                ok,
+                                output,
+                            },
+                        )
+                        .await;
+                    }
+                    Ok(ClientMessage::StartRun {
+                        run_id,
+                        session_id,
+                        prompt,
+                    }) => {
+                        let config = match resolve_run_provider(
+                            provider.as_ref(),
+                            local_models.loaded_file_name().is_some(),
+                        ) {
+                            Ok(config) => config,
+                            Err((code, message)) => {
+                                let _ = send(
+                                    &mut sender,
+                                    ServerMessage::Error {
+                                        code: code.into(),
+                                        message: message.into(),
+                                    },
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+                        // Fail before opening a run when a local provider is selected
+                        // but nothing is loaded, so the user gets an actionable
+                        // message instead of an inference error mid-stream.
+                        if config.is_local() && local_models.loaded_file_name().is_none() {
+                            let _ = send(&mut sender, ServerMessage::Error { code: "local_model_not_loaded".into(), message: "Load a local model in the model manager before starting a run.".into() }).await;
                             continue;
                         }
-                    };
-                    // Fail before opening a run when a local provider is selected
-                    // but nothing is loaded, so the user gets an actionable
-                    // message instead of an inference error mid-stream.
-                    if config.is_local() && local_models.loaded_file_name().is_none() {
-                        let _ = send(&mut sender, ServerMessage::Error { code: "local_model_not_loaded".into(), message: "Load a local model in the model manager before starting a run.".into() }).await;
-                        continue;
+                        if send_provider_events(
+                            &mut sender,
+                            &config,
+                            &workspace_root,
+                            &run_id,
+                            &session_id,
+                            &prompt,
+                            &mcp_runtime,
+                            &local_models,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
                     }
-                    if send_provider_events(
-                        &mut sender,
-                        &config,
-                        &workspace_root,
-                        &run_id,
-                        &session_id,
-                        &prompt,
-                        &mcp_runtime,
-                        &local_models,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        return;
+                    Err(error) => {
+                        let _ = send(
+                            &mut sender,
+                            ServerMessage::Error {
+                                code: "invalid_message".into(),
+                                message: error.to_string(),
+                            },
+                        )
+                        .await;
                     }
                 }
-                Err(error) => {
-                    let _ = send(
-                        &mut sender,
-                        ServerMessage::Error {
-                            code: "invalid_message".into(),
-                            message: error.to_string(),
-                        },
-                    )
-                    .await;
-                }
-            },
+            }
             Message::Close(_) => return,
             Message::Ping(payload) => {
                 if sender.send(Message::Pong(payload)).await.is_err() {
@@ -453,6 +464,10 @@ struct AgentResult {
     output: String,
 }
 
+/// The per-run entrypoint for the provider loop. It threads the connection, the
+/// resolved provider, the workspace and the two runtimes together; bundling them
+/// into a struct would only move the same fields behind one more name.
+#[allow(clippy::too_many_arguments)]
 async fn send_provider_events<S>(
     sender: &mut S,
     config: &ProviderConfig,
@@ -629,7 +644,15 @@ async fn call_openai_compatible(
     // A local model short-circuits every HTTP path: there is no endpoint to
     // call and no Responses API, so the gpt-5 branch must not be reached.
     if config.is_local() {
-        return call_local_model(config, workspace_root, prompt, mcp_runtime, trace_sender, local_models).await;
+        return call_local_model(
+            config,
+            workspace_root,
+            prompt,
+            mcp_runtime,
+            trace_sender,
+            local_models,
+        )
+        .await;
     }
     if config.model.to_ascii_lowercase().starts_with("gpt-5") {
         return call_responses_api(config, workspace_root, prompt, mcp_runtime, trace_sender).await;
@@ -830,9 +853,7 @@ fn parse_one_local_tool_call(raw: &str) -> Option<ParsedToolCall> {
     // Small models often emit the arguments as a JSON *string* containing the
     // object. Unwrap that instead of failing the run over a quoting slip.
     let arguments = match arguments {
-        serde_json::Value::String(ref inner) => {
-            serde_json::from_str(inner).unwrap_or(arguments)
-        }
+        serde_json::Value::String(ref inner) => serde_json::from_str(inner).unwrap_or(arguments),
         other => other,
     };
     Some(ParsedToolCall { name, arguments })
@@ -851,9 +872,11 @@ fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition])
     for definition in definitions {
         let name = definition.name.clone();
         let description = definition.description.clone();
-        let parameters = serde_json::to_string(&definition.parameters)
-            .unwrap_or_else(|_| "{}".to_owned());
-        text.push_str(&format!("- {name}: {description}\n  arguments: {parameters}\n"));
+        let parameters =
+            serde_json::to_string(&definition.parameters).unwrap_or_else(|_| "{}".to_owned());
+        text.push_str(&format!(
+            "- {name}: {description}\n  arguments: {parameters}\n"
+        ));
     }
     text.push_str(
         "\nCall one tool per reply and wait for its result. When you have the final \
@@ -1458,17 +1481,18 @@ mod tests {
 
     #[test]
     fn provider_kind_round_trips_local() {
-        let config: ProviderConfig = serde_json::from_str(
-            r#"{"endpoint":"","api_key":"","model":"local","kind":"local"}"#,
-        )
-        .unwrap();
+        let config: ProviderConfig =
+            serde_json::from_str(r#"{"endpoint":"","api_key":"","model":"local","kind":"local"}"#)
+                .unwrap();
         assert!(config.is_local());
         // It must survive the round trip the secure store performs, since that
         // JSON is what a reconnecting client reads back.
         let stored = serde_json::to_string(&config).unwrap();
         assert!(stored.contains("\"kind\":\"local\""), "got {stored}");
         assert_eq!(
-            serde_json::from_str::<ProviderConfig>(&stored).unwrap().kind,
+            serde_json::from_str::<ProviderConfig>(&stored)
+                .unwrap()
+                .kind,
             ProviderKind::Local
         );
     }
@@ -1490,8 +1514,9 @@ mod tests {
 
     #[test]
     fn a_pure_tool_call_leaves_no_empty_prose() {
-        let (prose, calls) =
-            parse_local_tool_calls("<tool_call>{\"name\":\"list_files\",\"arguments\":{}}</tool_call>");
+        let (prose, calls) = parse_local_tool_calls(
+            "<tool_call>{\"name\":\"list_files\",\"arguments\":{}}</tool_call>",
+        );
         assert_eq!(prose, "", "the protocol block must not leak into the reply");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "list_files");
@@ -1520,15 +1545,11 @@ mod tests {
             (r#"{"name":"t","arguments":{"x":1}}"#, one.clone()),
             (r#"{"name":"t","parameters":{"x":1}}"#, one.clone()),
             (r#"{"name":"t","input":{"x":1}}"#, one.clone()),
-            (
-                r#"{"name":"t","arguments":"{\"x\":1}"}"#,
-                one.clone(),
-            ),
+            (r#"{"name":"t","arguments":"{\"x\":1}"}"#, one.clone()),
             (r#"{"name":"t"}"#, serde_json::json!({})),
         ];
         for (raw, expected) in cases {
-            let (prose, calls) =
-                parse_local_tool_calls(&format!("<tool_call>{raw}</tool_call>"));
+            let (prose, calls) = parse_local_tool_calls(&format!("<tool_call>{raw}</tool_call>"));
             assert_eq!(calls.len(), 1, "no call parsed from {raw}");
             assert_eq!(calls[0].name, "t", "for {raw}");
             assert_eq!(calls[0].arguments, expected, "for {raw}");
@@ -1557,8 +1578,7 @@ mod tests {
     fn a_block_with_no_name_is_rejected_rather_than_executed() {
         // An unnamed call cannot be dispatched, and guessing a tool would be
         // worse than ignoring it.
-        let (_, calls) =
-            parse_local_tool_calls("<tool_call>{\"arguments\":{}}</tool_call>");
+        let (_, calls) = parse_local_tool_calls("<tool_call>{\"arguments\":{}}</tool_call>");
         assert!(calls.is_empty());
         let (_, calls) = parse_local_tool_calls("<tool_call>{\"name\":\"  \"}</tool_call>");
         assert!(calls.is_empty());
