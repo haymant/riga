@@ -1,0 +1,14 @@
+{
+  "phase": 0,
+  "status": "PASS",
+  "checks": [
+    { "name": "rustfmt", "status": "PASS" },
+    { "name": "clippy", "status": "PASS" },
+    { "name": "cargo_test_workspace", "status": "PASS" },
+    { "name": "npm_check", "status": "PASS" },
+    { "name": "dependency_boundary", "status": "PASS" },
+    { "name": "public_api_scaffold", "status": "PASS" },
+    { "name": "e2e_harness_scaffold", "status": "PASS" }
+  ],
+  "next_phase_allowed": true
+}

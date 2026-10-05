@@ -1,0 +1,14 @@
+[package]
+name = "riga-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+description = "RIGA command-line adapter"
+
+[dependencies]
+riga-kernel = { path = "../riga-kernel" }
+
+[lints]
+workspace = true

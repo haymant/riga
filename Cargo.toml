@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/riga-kernel",
+  "crates/riga-server",
+  "crates/riga-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/riga-platform/riga"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "deny"
+correctness = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

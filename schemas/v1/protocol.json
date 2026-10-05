@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://riga.dev/schema/v1/protocol.json",
+  "title": "RIGA protocol v1 scaffold",
+  "type": "object",
+  "required": ["protocol_version"],
+  "properties": {
+    "protocol_version": { "const": 1 }
+  },
+  "additionalProperties": true
+}

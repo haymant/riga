@@ -1,0 +1,19 @@
+{
+  "name": "riga",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "npm@10.9.2",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "lint": "node scripts/lint.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check": "npm run lint && npm run typecheck",
+    "test:e2e": "node scripts/test-e2e.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}
