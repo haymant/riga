@@ -1,0 +1,13 @@
+{
+  "phase": 6,
+  "status": "PASS",
+  "checks": [
+    { "name": "tool_risk_taxonomy", "status": "PASS" },
+    { "name": "default_read_only_allow", "status": "PASS" },
+    { "name": "approval_required_for_workspace_write", "status": "PASS" },
+    { "name": "destructive_denial", "status": "PASS" },
+    { "name": "typed_authorization_errors", "status": "PASS" },
+    { "name": "workspace_validation", "status": "PASS" }
+  ],
+  "next_phase_allowed": true
+}

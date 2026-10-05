@@ -5,6 +5,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 pub mod events;
 pub mod persistence;
+pub mod policy;
 pub mod rig_compat;
 pub mod state;
 
