@@ -1,0 +1,14 @@
+{
+  "phase": 1,
+  "status": "PASS",
+  "checks": [
+    { "name": "rig_api_compatibility", "status": "PASS", "rig_version": "0.43.0" },
+    { "name": "scripted_text_stream", "status": "PASS" },
+    { "name": "scripted_tool_loop", "status": "PASS" },
+    { "name": "tool_failure", "status": "PASS" },
+    { "name": "invalid_tool_call", "status": "PASS" },
+    { "name": "max_turn_termination", "status": "PASS" },
+    { "name": "workspace_validation", "status": "PASS" }
+  ],
+  "next_phase_allowed": true
+}
