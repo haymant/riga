@@ -77,7 +77,7 @@ struct Choice {
 
 #[derive(Debug, Deserialize)]
 struct ChoiceMessage {
-    content: String,
+    content: serde_json::Value,
 }
 
 pub async fn upgrade(socket: WebSocket) {
@@ -262,8 +262,24 @@ async fn call_openai_compatible(config: &ProviderConfig, prompt: &str) -> Result
     completion
         .choices
         .first()
-        .map(|choice| choice.message.content.clone())
+        .and_then(|choice| content_text(&choice.message.content))
         .ok_or_else(|| "provider returned no choices".into())
+}
+
+fn content_text(content: &serde_json::Value) -> Option<String> {
+    if let Some(text) = content.as_str() {
+        return Some(text.to_owned());
+    }
+    content
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .filter(|text| !text.is_empty())
 }
 
 fn redact_body(body: &str) -> String {

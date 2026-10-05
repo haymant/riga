@@ -53,7 +53,7 @@ function App() {
   const [transcript, setTranscript] = useState(initialTranscript);
   const [draft, setDraft] = useState("");
   const [isRunning, setIsRunning] = useState(false);
-  const [approval, setApproval] = useState(true);
+  const [approval, setApproval] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
@@ -80,6 +80,9 @@ function App() {
           setTranscript((current) => [...current, { id: envelope.event_id, role: "assistant", text: delta, time: "now" }]);
         } else if (typeof event === "object" && event !== null && "RunCompleted" in event) {
           setIsRunning(false);
+        } else if (typeof event === "object" && event !== null && "RunFailed" in event) {
+          setIsRunning(false);
+          setTranscript((current) => [...current, { id: envelope.event_id, role: "system", text: `Agent run failed: ${(event as { RunFailed: { message: string } }).RunFailed.message}`, time: "now" }]);
         } else if (event === "RunStarted") {
           setIsRunning(true);
         }
@@ -109,6 +112,7 @@ function App() {
     setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "user", text, time: "now" }]);
     setDraft("");
     setIsRunning(true);
+    setApproval(false);
     if (transportRef.current && transportStatus === "connected") {
       void transportRef.current.startRun(crypto.randomUUID(), activeSession.id, text).catch(() => {
         setTransportStatus("error");
@@ -116,30 +120,14 @@ function App() {
       });
       return;
     }
-    window.setTimeout(() => {
-      setTranscript((current) => [
-        ...current,
-        { id: crypto.randomUUID(), role: "assistant", text: "I’ve queued that request in the active run. I’ll keep the next filesystem action behind an approval checkpoint.", time: "now" },
-      ]);
-      setIsRunning(false);
-      setApproval(true);
-    }, 650);
+    setIsRunning(false);
+    setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "system", text: "WebSocket is not connected. Configure a provider and wait for the connection before sending.", time: "now" }]);
   }
 
   function approve() {
     setApproval(false);
     void transportRef.current?.respondToApproval("active-run", "transport-write", true);
-    setIsRunning(true);
-    setTranscript((current) => [
-      ...current,
-      { id: crypto.randomUUID(), role: "system", text: "Approval granted · transport adapter implementation may proceed.", time: "now" },
-      { id: crypto.randomUUID(), role: "tool", name: "workspace.write", command: "riga workspace apply --approved", status: "running", output: "Writing adapter boundary…", time: "now" },
-    ]);
-    window.setTimeout(() => {
-      setTranscript((current) => current.map((item) => item.role === "tool" && item.status === "running" ? { ...item, status: "done", output: "Adapter boundary written · checks pending" } : item));
-      setIsRunning(false);
-      setToast("Approval applied");
-    }, 900);
+    setToast("Approval recorded; no workspace mutation is attached to this run");
   }
 
   function deny() {
@@ -203,7 +191,7 @@ function App() {
 
         {settingsOpen && <section className="settings-panel"><div className="settings-panel-header"><div><p className="eyebrow">RUNTIME / PROVIDER</p><h2>Connect your model.</h2><p>Credentials stay in browser memory and are sent only over the current WebSocket session.</p></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><div className="provider-tabs"><button className={providerMode === "remote" ? "selected" : ""} onClick={() => setProviderMode("remote")}>OpenAI-compatible / OpenCode Go</button><button className={providerMode === "local" ? "selected" : ""} onClick={() => setProviderMode("local")}>Local GGUF model</button></div>{providerMode === "remote" ? <div className="provider-form"><label>API endpoint<input value={providerEndpoint} onChange={(event) => setProviderEndpoint(event.target.value)} placeholder="https://api.example.com/v1" /></label><label>API key <span>ephemeral</span><input type="password" value={providerApiKey} onChange={(event) => setProviderApiKey(event.target.value)} placeholder="sk-…" autoComplete="off" /></label><label>Model<input value={providerModel} onChange={(event) => setProviderModel(event.target.value)} placeholder="opencode-go / gpt-4o-mini" /></label><button className="approve-button settings-save" onClick={() => void saveProvider()}><Check size={15} /> Save in memory</button></div> : <div className="local-model-card"><div className="tool-symbol"><Bot size={17} /></div><div><strong>Download and run a GGUF model locally</strong><p>Inspired by Fina Builder: model downloads, SHA-256 verification, CPU/OpenMP, and optional CUDA builds belong to the Tauri desktop runtime. This browser session cannot access the host filesystem or GPU.</p><button className="outline-button" onClick={() => setToast("Use the Tauri desktop build to download and run local GGUF models.")}>Open desktop model manager</button></div></div>}</section>}
 
-        <section className="run-strip"><div className="run-strip-main"><div className="run-icon"><Sparkles size={16} /></div><div><strong>Agent run</strong><span>{isRunning ? "Executing with approval policy" : "Paused at approval checkpoint"}</span></div></div><div className="run-strip-meta"><span><GitBranch size={14} /> main</span><span><Clock3 size={14} /> 00:42</span>{isRunning && <button className="stop-run" onClick={() => { void transportRef.current?.cancelRun("active-run"); setIsRunning(false); setToast("Run cancelled safely"); }}><CircleStop size={14} /> Stop</button>}</div></section>
+        <section className="run-strip"><div className="run-strip-main"><div className="run-icon"><Sparkles size={16} /></div><div><strong>Agent run</strong><span>{isRunning ? "Executing with configured provider" : approval ? "Awaiting approval" : "Ready for your next instruction"}</span></div></div><div className="run-strip-meta"><span><GitBranch size={14} /> main</span><span><Clock3 size={14} /> 00:42</span>{isRunning && <button className="stop-run" onClick={() => { void transportRef.current?.cancelRun("active-run"); setIsRunning(false); setToast("Run cancelled safely"); }}><CircleStop size={14} /> Stop</button>}</div></section>
 
         <section className="content-column">
           <div className="conversation-header"><div><p className="eyebrow">SESSION / {activeSession.id.toUpperCase()}</p><h1>Build with confidence.</h1><p className="subtitle">A durable, inspectable coding-agent workspace.</p></div><button className="outline-button"><TerminalSquare size={15} /> Open terminal</button></div>
