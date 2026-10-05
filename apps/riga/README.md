@@ -22,8 +22,7 @@ WebSocket, so the same surface works in a browser and in a Tauri window.
 ```text
 apps/riga
 ├── src/main.tsx              # mounts the React surface            (4 lines)
-├── src-tauri/src/main.rs     # starts the shell                    (3 lines)
-├── src-tauri/src/lib.rs      # embeds the kernel agent             (~20 lines)
+├── src-tauri/src/main.rs     # the whole embedding                 (~35 lines)
 ├── src-tauri/Cargo.toml
 ├── vite.config.ts            # proxies the surface to riga-server
 └── src-tauri/tauri.conf.json # window, dev URL, dev CSP
@@ -55,17 +54,13 @@ fn main() {
 }
 ```
 
-`src-tauri/src/main.rs` — the whole entry point:
+`src-tauri/src/main.rs` — the whole embedding:
 
 ```rust
-fn main() {
-    riga_desktop::run();
-}
-```
+// Hide the console window on Windows release builds; debug builds keep it so
+// `tauri dev` output stays visible. Only means anything on Windows.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-`src-tauri/src/lib.rs` — the whole embedding:
-
-```rust
 use riga_kernel::{Agent, Health};
 use tauri::State;
 
@@ -75,8 +70,7 @@ fn health(agent: State<'_, Agent>) -> Health {
     agent.health()
 }
 
-/// Start the desktop shell around one embedded RIGA agent.
-pub fn run() {
+fn main() {
     tauri::Builder::<tauri::Wry>::default()
         .manage(Agent::new())
         .invoke_handler(tauri::generate_handler![health])
@@ -90,6 +84,11 @@ pub fn run() {
 cannot drift into returning different shapes for the same probe. The frontend
 would call it with `invoke("health")` from `@tauri-apps/api/core`; this app does
 not, because it drives the agent over WebSocket instead.
+
+A single file is enough for desktop. Tauri's own template splits `run()` into
+`lib.rs` because mobile targets link the library; add that back, plus
+`[lib] crate-type = ["lib", "cdylib", "staticlib"]` in `Cargo.toml`, only if you
+need iOS or Android.
 
 ## 2. React — mount the surface
 
