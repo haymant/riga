@@ -1,5 +1,7 @@
 #![doc = "RIGA HTTP/SSE transport adapter."]
 
+use std::path::PathBuf;
+
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -23,6 +25,8 @@ use riga_kernel::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
+pub mod catalog;
+pub mod secure_store;
 pub mod ws;
 
 pub const ADAPTER_NAME: &str = "riga-server";
@@ -31,13 +35,22 @@ pub const ADAPTER_NAME: &str = "riga-server";
 pub struct ServerState {
     sessions: Arc<RwLock<Vec<Session>>>,
     next_id: Arc<AtomicU64>,
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) secure_store: Option<Arc<secure_store::SecureStore>>,
 }
 
 impl Default for ServerState {
     fn default() -> Self {
+        let secure_store = secure_store::SecureStore::from_env().map(Arc::new);
+        let sessions = secure_store
+            .as_ref()
+            .and_then(|store| store.load::<Vec<Session>>("sessions").ok().flatten())
+            .unwrap_or_default();
         Self {
-            sessions: Arc::new(RwLock::new(Vec::new())),
+            sessions: Arc::new(RwLock::new(sessions)),
             next_id: Arc::new(AtomicU64::new(1)),
+            workspace_root: catalog::workspace_root(),
+            secure_store,
         }
     }
 }
@@ -52,26 +65,38 @@ pub struct CreateSessionRequest {
 pub struct HealthResponse {
     pub protocol_version: u16,
     pub adapter: &'static str,
+    pub persistence_backend: &'static str,
 }
 
 pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/catalog", get(tool_catalog))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/runs/{run_id}/events", get(stream_events))
         .route("/ws", get(ws_upgrade))
         .with_state(state)
 }
 
-async fn ws_upgrade(upgrade: axum::extract::ws::WebSocketUpgrade) -> impl IntoResponse {
-    upgrade.on_upgrade(ws::upgrade)
+async fn ws_upgrade(
+    State(state): State<ServerState>,
+    upgrade: axum::extract::ws::WebSocketUpgrade,
+) -> impl IntoResponse {
+    upgrade.on_upgrade(move |socket| ws::upgrade(socket, state.workspace_root.clone()))
 }
 
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         protocol_version: riga_kernel::PROTOCOL_VERSION,
         adapter: ADAPTER_NAME,
+        persistence_backend: secure_store::database_backend(),
     })
+}
+
+async fn tool_catalog(
+    State(state): State<ServerState>,
+) -> Json<std::collections::BTreeMap<String, serde_json::Value>> {
+    Json(catalog::catalog(&state.workspace_root))
 }
 
 async fn list_sessions(State(state): State<ServerState>) -> Json<Vec<Session>> {
@@ -98,6 +123,10 @@ async fn create_session(
         updated_at: "now".into(),
     };
     state.sessions.write().await.push(session.clone());
+    if let Some(store) = &state.secure_store {
+        let sessions = state.sessions.read().await.clone();
+        let _ = store.save("sessions", &sessions);
+    }
     (StatusCode::CREATED, Json(session)).into_response()
 }
 

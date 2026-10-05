@@ -33,6 +33,9 @@ type Session = { id: string; title: string; meta: string; active?: boolean };
 type TranscriptItem =
   | { id: string; role: Role; text: string; time: string }
   | { id: string; role: "tool"; name: string; command: string; status: "running" | "done"; output: string; time: string };
+type CatalogItem = { id: string; kind: string; description: string; insert_text: string; requires_approval: boolean };
+type SkillSummary = { name: string; description: string; path: string };
+type McpServerSummary = { name: string; command: string; tools: string[] };
 
 const initialSessions: Session[] = [
   { id: "riga", title: "RIGA desktop shell", meta: "Today · 14 messages", active: true },
@@ -81,6 +84,10 @@ function App() {
   const [providerModel, setProviderModel] = useState("");
   const [providerMode, setProviderMode] = useState<"remote" | "local">("remote");
   const [transportStatus, setTransportStatus] = useState<"connecting" | "connected" | "closed" | "error">("connecting");
+  const [catalogOpen, setCatalogOpen] = useState(false);
+  const [catalogItems, setCatalogItems] = useState<CatalogItem[]>([]);
+  const [skills, setSkills] = useState<SkillSummary[]>([]);
+  const [mcpServers, setMcpServers] = useState<McpServerSummary[]>([]);
   const transportRef = useRef<RigaWebSocketClient | null>(null);
 
   const activeSession = useMemo(() => sessions.find((session) => session.active) ?? sessions[0], [sessions]);
@@ -94,6 +101,11 @@ function App() {
   };
 
   useEffect(() => {
+    void fetch("/catalog").then((response) => response.json()).then((value: { tools?: CatalogItem[]; skills?: SkillSummary[]; mcp_servers?: McpServerSummary[] }) => {
+      setCatalogItems(value.tools ?? []);
+      setSkills(value.skills ?? []);
+      setMcpServers(value.mcp_servers ?? []);
+    }).catch(() => undefined);
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const client = new RigaWebSocketClient({
       url: `${protocol}//${window.location.host}/ws`,
@@ -160,6 +172,11 @@ function App() {
     setApproval(false);
     void transportRef.current?.respondToApproval("active-run", "transport-write", false);
     setToast("Approval declined; no workspace mutation was made");
+  }
+
+  function insertCatalog(text: string) {
+    setDraft((current) => `${current}${current ? "\n" : ""}${text}`);
+    setCatalogOpen(false);
   }
 
   async function saveProvider() {
@@ -229,7 +246,7 @@ function App() {
 
           {approval && <div className="approval-card"><div className="approval-icon"><ShieldCheck size={19} /></div><div className="approval-copy"><div className="approval-title"><strong>Approval required</strong><span>workspace mutation</span></div><p>Allow RIGA to write the transport adapter boundary in <code>crates/</code> and update the event journal contract?</p><div className="approval-details"><span><FolderOpen size={13} /> 3 files</span><span><GitBranch size={13} /> reversible change</span><span><Clock3 size={13} /> requested now</span></div></div><div className="approval-actions"><button className="deny-button" onClick={deny}>Decline</button><button className="approve-button" onClick={approve}><Check size={15} /> Approve</button></div></div>}
 
-          <div className="composer-wrap"><div className="composer"><button className="icon-button composer-icon" aria-label="Attach file"><Paperclip size={17} /></button><textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${draft.trim() ? "send-ready" : ""}`} aria-label="Send message" onClick={sendMessage}><Send size={16} /></button></div><div className="composer-footer"><span><kbd>Enter</kbd> send · <kbd>Shift Enter</kbd> newline</span><span>RIGA Kernel · local</span></div></div>
+          <div className="composer-wrap"><div className="composer"><button className="icon-button composer-icon" aria-label="Attach file"><Paperclip size={17} /></button><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onClick={() => setCatalogOpen((value) => !value)}><Plus size={17} /></button><textarea value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${draft.trim() ? "send-ready" : ""}`} aria-label="Send message" onClick={sendMessage}><Send size={16} /></button></div>{catalogOpen && <div className="catalog-menu"><strong>Insert into composer</strong><small>Built-in tools</small>{catalogItems.map((item) => <button key={item.id} onClick={() => insertCatalog(item.insert_text)}><span>{item.id}</span><em>{item.description}</em></button>)}{skills.length > 0 && <small>Skills</small>}{skills.map((skill) => <button key={skill.name} onClick={() => insertCatalog(`Load the ${skill.name} skill: `)}><span>skill/{skill.name}</span><em>{skill.description}</em></button>)}{mcpServers.length > 0 && <small>MCP servers</small>}{mcpServers.map((server) => <button key={server.name} onClick={() => insertCatalog(`Use MCP server ${server.name}: `)}><span>mcp/{server.name}</span><em>{server.command}</em></button>)}</div>}<div className="composer-footer"><span><kbd>Enter</kbd> send · <kbd>Shift Enter</kbd> newline</span><span>RIGA Kernel · local</span></div></div>
         </section>
       </main>
       {toast && <button className="toast" onClick={() => setToast(null)}><Check size={15} /> {toast}</button>}

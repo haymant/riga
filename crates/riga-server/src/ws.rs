@@ -2,8 +2,9 @@ use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use riga_kernel::events::{RigaEvent, RigaEventEnvelope};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub endpoint: String,
     pub api_key: String,
@@ -32,6 +33,11 @@ pub enum ClientMessage {
     },
     Ping {
         nonce: String,
+    },
+    ToolCall {
+        call_id: String,
+        name: String,
+        input: serde_json::Value,
     },
 }
 
@@ -63,6 +69,12 @@ pub enum ServerMessage {
         code: String,
         message: String,
     },
+    ToolResult {
+        call_id: String,
+        name: String,
+        ok: bool,
+        output: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,9 +92,12 @@ struct ChoiceMessage {
     content: serde_json::Value,
 }
 
-pub async fn upgrade(socket: WebSocket) {
+pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf) {
     let (mut sender, mut receiver) = socket.split();
-    let mut provider: Option<ProviderConfig> = None;
+    let secure_store = crate::secure_store::SecureStore::from_env();
+    let mut provider: Option<ProviderConfig> = secure_store
+        .as_ref()
+        .and_then(|store| store.load::<ProviderConfig>("provider").ok().flatten());
     while let Some(Ok(message)) = receiver.next().await {
         match message {
             Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
@@ -102,6 +117,9 @@ pub async fn upgrade(socket: WebSocket) {
                 }
                 Ok(ClientMessage::ConfigureProvider(config)) => {
                     let model = config.model.clone();
+                    if let Some(store) = &secure_store {
+                        let _ = store.save("provider", &config);
+                    }
                     provider = Some(config);
                     if send(&mut sender, ServerMessage::ProviderConfigured { model })
                         .await
@@ -130,6 +148,27 @@ pub async fn upgrade(socket: WebSocket) {
                 }
                 Ok(ClientMessage::CancelRun { run_id }) => {
                     let _ = send(&mut sender, ServerMessage::RunCancelled { run_id }).await;
+                }
+                Ok(ClientMessage::ToolCall {
+                    call_id,
+                    name,
+                    input,
+                }) => {
+                    let result = execute_tool(&workspace_root, &name, input).await;
+                    let (ok, output) = match result {
+                        Ok(output) => (true, output),
+                        Err(error) => (false, error),
+                    };
+                    let _ = send(
+                        &mut sender,
+                        ServerMessage::ToolResult {
+                            call_id,
+                            name,
+                            ok,
+                            output,
+                        },
+                    )
+                    .await;
                 }
                 Ok(ClientMessage::StartRun {
                     run_id,
@@ -166,6 +205,84 @@ pub async fn upgrade(socket: WebSocket) {
             }
             _ => {}
         }
+    }
+}
+
+async fn execute_tool(
+    workspace_root: &std::path::Path,
+    name: &str,
+    input: serde_json::Value,
+) -> Result<String, String> {
+    match name {
+        "read" => {
+            crate::catalog::execute_read(
+                workspace_root,
+                input
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("read requires path")?,
+            )
+            .await
+        }
+        "write" => {
+            crate::catalog::execute_write(
+                workspace_root,
+                input
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("write requires path")?,
+                input
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("write requires content")?,
+            )
+            .await
+        }
+        "bash" | "shell" => {
+            crate::catalog::execute_bash(
+                workspace_root,
+                input
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("bash requires command")?,
+            )
+            .await
+        }
+        "glob" => crate::catalog::execute_glob(
+            workspace_root,
+            input
+                .get("pattern")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("glob requires pattern")?,
+        ),
+        "grep" => {
+            crate::catalog::execute_grep(
+                workspace_root,
+                input
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("grep requires query")?,
+            )
+            .await
+        }
+        "web" => {
+            crate::catalog::execute_web(
+                input
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("web requires url")?,
+            )
+            .await
+        }
+        "task" => Ok("task tool is available through the RIGA task adapter".into()),
+        "skill" => {
+            let name = input
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("skill requires name")?;
+            crate::catalog::execute_read(workspace_root, &format!("skills/{name}/SKILL.md")).await
+        }
+        _ => Err(format!("unknown or unavailable tool: {name}")),
     }
 }
 

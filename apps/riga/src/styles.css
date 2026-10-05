@@ -101,6 +101,14 @@ h1 { margin: 0; color: #f4f4f6; font-size: clamp(28px, 4vw, 42px); letter-spacin
 .deny-button { color: #bbaea0; background: transparent; border: 1px solid #4b4034; }
 .approve-button { color: #161a18; background: #8cddb6; border: 1px solid #abf3d0; display: flex; gap: 5px; align-items: center; }
 .composer-wrap { margin: 30px 0 0 39px; }
+.composer-plus { color: #a78bfa; }
+.catalog-menu { position: relative; z-index: 5; display: grid; gap: 4px; margin-top: 7px; padding: 10px; max-height: 320px; overflow-y: auto; background: #151922; border: 1px solid #353d4d; border-radius: 9px; box-shadow: 0 16px 34px rgba(0,0,0,.3); }
+.catalog-menu > strong { color: #e8eaf0; font-size: 11px; padding: 2px 4px 5px; }
+.catalog-menu > small { color: #7e8798; text-transform: uppercase; letter-spacing: .1em; font: 9px 'DM Mono', monospace; padding: 7px 4px 2px; }
+.catalog-menu > button { display: grid; grid-template-columns: 115px 1fr; gap: 10px; text-align: left; color: #bfc6d2; background: transparent; border: 0; border-radius: 6px; padding: 7px 6px; }
+.catalog-menu > button:hover { background: #242a37; }
+.catalog-menu > button span { color: #cdbfff; font: 10px 'DM Mono', monospace; }
+.catalog-menu > button em { color: #7f899a; font-size: 10px; font-style: normal; }
 .composer { min-height: 53px; display: flex; align-items: center; gap: 8px; background: #151922; border: 1px solid #333b4b; border-radius: 9px; padding: 8px 9px; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
 .composer:focus-within { border-color: #65519d; box-shadow: 0 0 0 3px rgba(120,92,206,.11); }
 .composer textarea { resize: none; flex: 1; min-height: 32px; max-height: 110px; color: #dfe3e9; background: transparent; border: 0; outline: 0; padding: 7px 4px; line-height: 1.4; font-size: 12px; }
