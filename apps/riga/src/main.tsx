@@ -375,10 +375,10 @@ function groupTranscript(items: TranscriptItem[]): TranscriptBlock[] {
 function ToolTimeline({ items }: { items: Extract<TranscriptItem, { role: "tool" }>[] }) {
   const running = items.some((item) => item.status === "running");
   const failed = items.some((item) => item.status === "error");
-  return <section className="tool-timeline" aria-label="Agent tool timeline">
-    <div className="timeline-header"><div className="timeline-title"><Clock3 size={14} /><strong>{running ? "Working through tools" : failed ? "Tool run failed" : "Tool timeline"}</strong><span>{items.length} {items.length === 1 ? "step" : "steps"}</span></div><span className={`timeline-status ${running ? "running" : failed ? "error" : "complete"}`}>{running ? "Running" : failed ? "Needs attention" : "Completed"}</span></div>
+  return <details className="tool-timeline" aria-label="Agent tool timeline" open>
+    <summary className="timeline-header"><div className="timeline-title"><Clock3 size={14} /><strong>{running ? "Working through tools" : failed ? "Tool run failed" : "Tool timeline"}</strong><span>{items.length} {items.length === 1 ? "step" : "steps"}</span></div><span className={`timeline-status ${running ? "running" : failed ? "error" : "complete"}`}>{running ? "Running" : failed ? "Needs attention" : "Completed"}</span></summary>
     <div className="timeline-rail">{items.map((item) => <ToolCallView key={item.id} item={item} />)}</div>
-  </section>;
+  </details>;
 }
 
 function ToolCallView({ item }: { item: Extract<TranscriptItem, { role: "tool" }> }) {

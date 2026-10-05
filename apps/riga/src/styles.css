@@ -207,6 +207,11 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 .tool-timeline { margin-left: 39px; max-width: 700px; min-height: max-content; height: max-content; align-self: start; border: 1px solid #303949; background: linear-gradient(145deg, #111722, #0e131b); border-radius: 12px; overflow: hidden; box-shadow: 0 12px 30px rgba(0,0,0,.14); }
 .tool-timeline { margin-top: 4px; margin-bottom: 4px; }
 .timeline-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 11px 13px; border-bottom: 1px solid #27303d; background: rgba(33,39,52,.52); }
+.tool-timeline > summary { list-style: none; cursor: pointer; }
+.tool-timeline > summary::-webkit-details-marker { display: none; }
+.tool-timeline > summary::after { content: "⌄"; margin-left: 10px; color: #778294; font: 13px 'DM Mono', monospace; transform: rotate(0deg); transition: transform .15s ease; }
+.tool-timeline:not([open]) > summary { border-bottom: 0; }
+.tool-timeline:not([open]) > summary::after { transform: rotate(-90deg); }
 .timeline-title { display: flex; align-items: center; gap: 8px; color: #c8d0dc; }
 .timeline-title svg { color: #a78bfa; }
 .timeline-title strong { font-size: 11px; }
