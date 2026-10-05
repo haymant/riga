@@ -3689,8 +3689,6 @@ name = "riga-desktop"
 version = "0.1.0"
 dependencies = [
  "riga-kernel",
- "serde",
- "serde_json",
  "tauri",
  "tauri-build",
 ]

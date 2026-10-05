@@ -11,8 +11,6 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 riga-kernel = { path = "../../../crates/riga-kernel" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 tauri = { version = "2.0", default-features = false, features = ["wry"] }
 
 [build-dependencies]

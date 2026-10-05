@@ -1,38 +1,24 @@
-use std::sync::Arc;
+use riga_kernel::{Agent, Health};
+use tauri::State;
 
-use riga_kernel::KernelVersion;
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone)]
-pub struct RigaState {
-    pub kernel_version: Arc<KernelVersion>,
+/// The one command this shell exposes: prove the embedded agent is alive.
+///
+/// `Agent` comes from the kernel, so the command is pure glue — it holds no
+/// state and no logic of its own. Add a command by writing another function
+/// that forwards to another `Agent` method.
+#[tauri::command]
+fn health(agent: State<'_, Agent>) -> Health {
+    agent.health()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealthResponse {
-    pub protocol_version: u16,
-}
-
-pub fn build_state() -> RigaState {
-    RigaState {
-        kernel_version: Arc::new(KernelVersion::default()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{HealthResponse, build_state};
-
-    #[test]
-    fn desktop_state_exposes_the_kernel_protocol_version() {
-        let state = build_state();
-        let response = HealthResponse {
-            protocol_version: state.kernel_version.protocol_version,
-        };
-        assert_eq!(response.protocol_version, 1);
-        assert_eq!(
-            serde_json::to_string(&response).unwrap(),
-            r#"{"protocol_version":1}"#
-        );
-    }
+/// Start the desktop shell around one embedded RIGA agent.
+///
+/// This is the whole embedding: manage the kernel agent as shared state, expose
+/// the commands the webview may call, then run. `main.rs` only calls this.
+pub fn run() {
+    tauri::Builder::<tauri::Wry>::default()
+        .manage(Agent::new())
+        .invoke_handler(tauri::generate_handler![health])
+        .run(tauri::generate_context!())
+        .expect("error while running RIGA desktop application");
 }
