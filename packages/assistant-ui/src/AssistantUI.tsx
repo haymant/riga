@@ -42,7 +42,7 @@ type Role = "user" | "assistant" | "system";
 type Session = { id: string; title: string; meta: string; active?: boolean };
 type TranscriptItem =
   | { id: string; role: Role; text: string; time: string }
-  | { id: string; role: "tool"; callId?: string; name: string; command: string; status: "running" | "done" | "error"; output: string; time: string };
+  | { id: string; role: "tool"; callId?: string; taskId?: string; name: string; command: string; status: "running" | "done" | "error"; output: string; time: string };
 type TranscriptBlock = TranscriptItem | { id: string; role: "timeline"; items: Extract<TranscriptItem, { role: "tool" }>[] };
 type CatalogItem = { id: string; kind: string; description: string; insert_text: string; requires_approval: boolean };
 type SkillSummary = { name: string; description: string; path: string };
@@ -170,6 +170,13 @@ export function AssistantUI({
 
   const activeSession = useMemo(() => sessions.find((session) => session.active) ?? sessions[0], [sessions]);
   const transcript = sessionTranscripts[activeSession.id] ?? [];
+  const taskTools = useMemo(() => {
+    const map: Record<string, Extract<TranscriptItem, { role: "tool" }>[]> = {};
+    for (const item of transcript) {
+      if (item.role === "tool" && item.taskId) (map[item.taskId] ??= []).push(item);
+    }
+    return map;
+  }, [transcript]);
   const setTranscript = (updater: SetStateAction<TranscriptItem[]>) => {
     setSessionTranscripts((current) => {
       const previous = current[activeSession.id] ?? [];
@@ -293,8 +300,10 @@ export function AssistantUI({
       onEvent: (envelope: RigaEventEnvelope) => {
         const event = envelope.event;
         if (typeof event === "object" && event !== null && "ToolCallStarted" in event) {
-          const call = (event as { ToolCallStarted: { call: { call_id?: string; name?: string; arguments?: unknown } } }).ToolCallStarted.call;
-          setTranscript((current) => [...current, { id: envelope.event_id, role: "tool", callId: call.call_id, name: call.name ?? "tool", command: typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments ?? {}), status: "running", output: "Waiting for result…", time: "now" }]);
+          const call = (event as { ToolCallStarted: { call: { call_id?: string; task_id?: string; name?: string; arguments?: unknown } } }).ToolCallStarted.call;
+          // A tool call tagged with a task id belongs to a subagent, so the UI
+          // nests it inside that task's card rather than the main timeline.
+          setTranscript((current) => [...current, { id: envelope.event_id, role: "tool", callId: call.call_id, taskId: typeof call.task_id === "string" ? call.task_id : undefined, name: call.name ?? "tool", command: typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments ?? {}), status: "running", output: "Waiting for result…", time: "now" }]);
         } else if (typeof event === "object" && event !== null && "ToolOutputDelta" in event) {
           const output = (event as { ToolOutputDelta: { call_id?: string; delta?: string } }).ToolOutputDelta;
           setTranscript((current) => current.map((item) => item.role === "tool" && item.callId === output.call_id
@@ -324,6 +333,7 @@ export function AssistantUI({
           setIsRunning(false);
           setTranscript((current) => [...current, { id: envelope.event_id, role: "system", text: `Agent run failed: ${(event as { RunFailed: { message: string } }).RunFailed.message}`, time: "now" }]);
         } else if (typeof event === "object" && event !== null && "RunStarted" in event) {
+          setAgentTasks([]);
           setIsRunning(true);
         } else if (typeof event === "object" && event !== null && "PlanUpdated" in event) {
           setAgentPlan((event as { PlanUpdated: { plan: AgentPlanState } }).PlanUpdated.plan);
@@ -605,13 +615,13 @@ export function AssistantUI({
           </header>
           <div ref={transcriptRef} className="transcript" aria-live="polite">
             {transcript.length === 0 && <div className="empty-state"><div className="empty-icon"><Bot size={26} /></div><h2>Start a coding run</h2><p>Describe the change, then review every tool action before it touches your workspace.</p></div>}
-            {groupTranscript(transcript).map((block) => block.role === "timeline" ? <ToolTimeline key={block.id} items={block.items} /> : <TranscriptItemView key={block.id} item={block} />)}
+            {groupTranscript(transcript.filter((item) => !(item.role === "tool" && item.taskId))).map((block) => block.role === "timeline" ? <ToolTimeline key={block.id} items={block.items} /> : <TranscriptItemView key={block.id} item={block} />)}
             {isRunning && <div className="typing-row"><div className="assistant-badge"><Bot size={15} /></div><div className="typing-bubble"><span /><span /><span /></div><small>RIGA is thinking</small></div>}
           </div>
 
           {pendingApproval && <div className="approval-card"><div className="approval-icon"><ShieldCheck size={19} /></div><div className="approval-copy"><div className="approval-title"><strong>Approval required</strong><span>{pendingApproval.tool}</span></div><p>The agent wants to run <code>{pendingApproval.summary}</code>.</p></div><div className="approval-actions"><button className="deny-button" onClick={() => answerApproval(false, "once")}>Decline</button><button className="outline-button" onClick={() => answerApproval(true, "always")}>Always allow</button><button className="approve-button" onClick={() => answerApproval(true, "once")}><Check size={15} /> Allow once</button></div></div>}
 
-          {(agentPlan || agentTodos || agentTasks.length > 0) && <div className="agent-work"><AgentPlanCard plan={agentPlan} /><AgentTodoList list={agentTodos} /><AgentTaskList tasks={agentTasks} /></div>}
+          {(agentPlan || agentTodos || agentTasks.length > 0) && <div className="agent-work"><AgentPlanCard plan={agentPlan} /><AgentTodoList list={agentTodos} /><AgentTaskList tasks={agentTasks} toolRuns={taskTools} /></div>}
           <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" value={providerKind === "local" ? LOCAL_MODEL_VALUE : providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{localModels?.loaded && <option value={LOCAL_MODEL_VALUE}>Local · {localModels.loaded}</option>}{Array.from(new Set([providerModel, "gpt-5-nano", "gpt-5-mini", "gpt-5-codex"])).filter(Boolean).map((model) => <option key={model} value={model}>{model}</option>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setCatalogOpen((value) => !value); setManualCatalog(true); setCatalogLayer("root"); setCatalogQuery(""); }}><Plus size={17} /></button><textarea value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${isRunning ? "stop-ready" : draft.trim() ? "send-ready" : ""}`} aria-label={isRunning ? "Stop run" : "Send message"} onClick={isRunning ? stopRun : sendMessage}>{isRunning ? <CircleStop size={16} /> : <Send size={16} />}</button></div>{catalogOpen && <div className="catalog-menu" ref={catalogRef} role="listbox">
               <div className="catalog-menu-header">{catalogLayer === "connectors" && <button className="catalog-back" aria-label="Back to insert menu" onClick={() => setCatalogLayer("root")}><ChevronLeft size={14} /></button>}<strong>{activeTrigger ? `${activeTrigger.char === "@" ? "Mention" : "Command"} suggestions` : catalogLayer === "root" ? "Insert into composer" : "Connectors"}</strong><button className="catalog-close" aria-label="Close insert menu" onClick={() => setCatalogOpen(false)}><X size={14} /></button></div>
               <input className="catalog-search" autoFocus={catalogOpen} value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder={activeTrigger ? `Filter ${activeTrigger.char === "@" ? "files or agents" : "tools and skills"}…` : "Search tools, skills, connectors…"} aria-label="Search composer insert menu" />
@@ -751,7 +761,7 @@ function todoIcon(status: TodoStatus): string {
 /** The subagents dispatched during this run. Mirrors the assistant-ui
  * SubagentList: one row per worker with its state, plus the summary it
  * returned. */
-function AgentTaskList({ tasks }: { tasks: AgentTaskView[] }) {
+function AgentTaskList({ tasks, toolRuns }: { tasks: AgentTaskView[]; toolRuns: Record<string, Extract<TranscriptItem, { role: "tool" }>[]> }) {
   if (tasks.length === 0) return null;
   const done = tasks.filter((task) => task.state !== "running").length;
   const failed = tasks.filter((task) => task.state === "failed").length;
@@ -762,15 +772,33 @@ function AgentTaskList({ tasks }: { tasks: AgentTaskView[] }) {
         <span>{done}/{tasks.length}{failed ? ` · ${failed} failed` : ""}</span>
       </div>
       <ul className="agent-steps">
-        {tasks.map((task) => (
-          <li key={task.id} className={`agent-step todo-${task.state === "running" ? "active" : task.state === "done" ? "done" : "failed"}`}>
-            <span className="agent-step-icon" aria-hidden>{task.state === "running" ? "•" : task.state === "done" ? "✓" : "✕"}</span>
-            <span>
-              <span className="agent-step-label">{task.agent} · {task.description}</span>
-              {task.result ? <span className="agent-step-desc">{task.result.split("\n")[0]}</span> : null}
-            </span>
-          </li>
-        ))}
+        {tasks.map((task) => {
+          const runs = toolRuns[task.id] ?? [];
+          const state = task.state === "running" ? "active" : task.state === "done" ? "done" : "failed";
+          return (
+            <li key={task.id} className={`agent-step todo-${state}`}>
+              <span className="agent-step-icon" aria-hidden>{task.state === "running" ? "•" : task.state === "done" ? "✓" : "✕"}</span>
+              <span className="agent-task-body">
+                {runs.length === 0 ? (
+                  <span className="agent-step-label">{task.agent} · {task.description}</span>
+                ) : (
+                  <details className="agent-task">
+                    <summary className="agent-step-label">{task.agent} · {task.description} <span className="agent-step-count">{runs.length} step{runs.length === 1 ? "" : "s"}</span></summary>
+                    <ul className="agent-task-tools">
+                      {runs.map((run) => (
+                        <li key={run.id} className={`agent-task-tool ${run.status}`}>
+                          <code>{run.name}</code>
+                          <span>{run.command.length > 80 ? `${run.command.slice(0, 80)}…` : run.command}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+                {task.result ? <span className="agent-step-desc">{task.result.split("\n")[0]}</span> : null}
+              </span>
+            </li>
+          );
+        })}
       </ul>
     </section>
   );

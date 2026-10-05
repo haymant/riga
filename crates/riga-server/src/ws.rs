@@ -1069,7 +1069,8 @@ where
                     "call_id": call_id,
                     "name": trace.name,
                     "output": trace.output,
-                    "ok": trace.ok
+                    "ok": trace.ok,
+                    "task_id": trace.call.get("task_id").cloned(),
                 }),
             }
         }
@@ -1193,6 +1194,7 @@ async fn call_chat_with_tools(
         history,
         0,
         broker,
+        None,
     )
     .await
 }
@@ -1212,6 +1214,7 @@ async fn run_chat_loop(
     history: &[ConversationTurn],
     depth: usize,
     broker: &ApprovalBroker,
+    task_id: Option<&str>,
 ) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
@@ -1330,6 +1333,9 @@ async fn run_chat_loop(
                     "call_id": call_id,
                     "name": name,
                     "arguments": input,
+                    // Which subagent this call belongs to; null for the
+                    // orchestrator. The UI nests task-scoped tools.
+                    "task_id": task_id,
                 });
                 Ok(ParsedCall {
                     call_id,
@@ -1581,7 +1587,8 @@ async fn dispatch_subagent(
     let allowed = allowed_tools_for(&profile);
     let system_prompt = subagent_system_prompt(&profile);
     // A local run dispatches local children; a remote run dispatches remote
-    // children, so a subagent never crosses the provider boundary.
+    // children, so a subagent never crosses the provider boundary. The child's
+    // loop is tagged with its task id so its tool calls nest in the UI.
     let outcome = match (config.is_local(), local_models) {
         (true, Some(local_models)) => {
             Box::pin(run_local_loop(
@@ -1596,6 +1603,7 @@ async fn dispatch_subagent(
                 &[],
                 depth + 1,
                 broker,
+                Some(&task_id),
             ))
             .await
         }
@@ -1611,6 +1619,7 @@ async fn dispatch_subagent(
                 &[],
                 depth + 1,
                 broker,
+                Some(&task_id),
             ))
             .await
         }
@@ -1805,6 +1814,7 @@ async fn call_local_model(
         history,
         0,
         broker,
+        None,
     )
     .await
 }
@@ -1824,6 +1834,7 @@ async fn run_local_loop(
     history: &[ConversationTurn],
     depth: usize,
     broker: &ApprovalBroker,
+    task_id: Option<&str>,
 ) -> Result<AgentResult, String> {
     let mut definitions = mcp_runtime.tool_definitions().await;
     if let Some(allowed) = allowed_tools {
@@ -1882,6 +1893,7 @@ async fn run_local_loop(
                 "call_id": call_id,
                 "name": call.name,
                 "arguments": call.arguments,
+                "task_id": task_id,
             });
             trace_sender
                 .send(ToolTraceEvent::Started(payload.clone()))
