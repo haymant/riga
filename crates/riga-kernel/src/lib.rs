@@ -9,5 +9,6 @@ pub mod persistence;
 pub mod policy;
 pub mod rig_compat;
 pub mod state;
+pub mod task;
 
 pub use agent::{Agent, Health};
