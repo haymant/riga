@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
 import { createRoot } from "react-dom/client";
 import { RIGA_ASSISTANT_UI_VERSION } from "@riga/assistant-ui";
 import { RigaWebSocketClient, type RigaEventEnvelope } from "@riga/transport-http";
@@ -48,9 +48,27 @@ const initialTranscript: TranscriptItem[] = [
   { id: "m3", role: "assistant", text: "The session is healthy. I’m ready to create the transport adapter, but this changes the workspace boundary and needs your approval.", time: "10:43" },
 ];
 
+const sessionHistories: Record<string, TranscriptItem[]> = {
+  riga: initialTranscript,
+  transport: [
+    { id: "transport-1", role: "user", text: "Compare SSE and WebSocket transport for the desktop shell.", time: "Yesterday" },
+    { id: "transport-2", role: "assistant", text: "WebSocket is the active bidirectional control channel; SSE remains useful for one-way event delivery and reconnect replay.", time: "Yesterday" },
+    { id: "transport-tool", role: "tool", name: "transport.inspect", command: "riga transport inspect --protocol websocket", status: "done", output: "WebSocket ready · protocol v1 · reconnect-safe", time: "Yesterday" },
+  ],
+  recovery: [
+    { id: "recovery-1", role: "user", text: "Add corruption and out-of-order journal recovery tests.", time: "Mon" },
+    { id: "recovery-2", role: "assistant", text: "The persistence boundary now fails closed on corrupted records and rejects out-of-order event sequences.", time: "Mon" },
+    { id: "recovery-tool", role: "tool", name: "cargo.test", command: "cargo test -p riga-kernel persistence", status: "done", output: "Recovery tests passed", time: "Mon" },
+  ],
+  ui: [
+    { id: "ui-1", role: "user", text: "Audit the assistant surface for responsive behavior.", time: "Sun" },
+    { id: "ui-2", role: "assistant", text: "The desktop workspace uses a compact transcript layout, mobile navigation, and explicit provider settings.", time: "Sun" },
+  ],
+};
+
 function App() {
   const [sessions, setSessions] = useState(initialSessions);
-  const [transcript, setTranscript] = useState(initialTranscript);
+  const [sessionTranscripts, setSessionTranscripts] = useState(sessionHistories);
   const [draft, setDraft] = useState("");
   const [isRunning, setIsRunning] = useState(false);
   const [approval, setApproval] = useState(false);
@@ -66,6 +84,14 @@ function App() {
   const transportRef = useRef<RigaWebSocketClient | null>(null);
 
   const activeSession = useMemo(() => sessions.find((session) => session.active) ?? sessions[0], [sessions]);
+  const transcript = sessionTranscripts[activeSession.id] ?? [];
+  const setTranscript = (updater: SetStateAction<TranscriptItem[]>) => {
+    setSessionTranscripts((current) => {
+      const previous = current[activeSession.id] ?? [];
+      const next = typeof updater === "function" ? updater(previous) : updater;
+      return { ...current, [activeSession.id]: next };
+    });
+  };
 
   useEffect(() => {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -101,7 +127,7 @@ function App() {
   function createSession() {
     const next = { id: `session-${sessions.length + 1}`, title: "New coding session", meta: "Just now · 0 messages", active: true };
     setSessions((current) => [next, ...current.map((session) => ({ ...session, active: false }))]);
-    setTranscript([]);
+    setSessionTranscripts((current) => ({ ...current, [next.id]: [] }));
     setApproval(false);
     setToast("New session created");
   }
