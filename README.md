@@ -62,6 +62,19 @@ Set `RIGA_TOKEN` to the encryption secret used by the server-side store. Use a d
 
 Built-in tools include read, write, glob, grep, web, bash, task, and skill. Tool calls are rendered as collapsible call/result cards; bash and shell output use terminal-style blocks.
 
+### Specialized agents
+
+The `task` tool exposes four transport-neutral agent profiles:
+
+| Agent | Aliases | Boundary | Purpose |
+|---|---|---|---|
+| `explore` | `scout`, `explorer` | Read-only | Reconnaissance and compressed codebase handoff |
+| `plan` | `planner` | Read-only | Actionable implementation planning |
+| `build` | `executor`, `worker` | Mutating, capability-gated | Implementation and repository validation |
+| `review` | `reviewer` | Read-only | Independent correctness, security, and test review |
+
+Use `task` with `action: "agents"` to discover profiles or `action: "dispatch"` with an `agent` and `prompt` to request a structured handoff. The parent RIGA run remains responsible for tool execution and approvals, so the profiles do not bypass workspace policy gates.
+
 Attachments are uploaded through `POST /attachments` and stored under `tmp/riga-attachments/`. The generated workspace-relative path is included in the agent prompt so the read tool can inspect the file. Runtime attachments are ignored by Git.
 
 ## Validation

@@ -52,7 +52,11 @@ pub fn builtins() -> Vec<CatalogItem> {
             true,
         ),
         ("shell", "Alias for bash", true),
-        ("task", "Create or inspect a RIGA task", false),
+        (
+            "task",
+            "Create or inspect tasks, or dispatch a specialized RIGA agent",
+            false,
+        ),
         ("skill", "Load a repository skill document", false),
     ]
     .into_iter()
@@ -144,14 +148,133 @@ pub struct RigaTask {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentProfile {
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub purpose: String,
+    pub tools: Vec<String>,
+    pub model_preference: String,
+    pub read_only: bool,
+    pub system_rules: Vec<String>,
+    pub output_format: Vec<String>,
+}
+
+pub fn agent_profiles() -> Vec<AgentProfile> {
+    vec![
+        agent_profile(
+            "explore",
+            &["scout", "explorer"],
+            true,
+            "Fast, read-only codebase reconnaissance with compressed hand-off context.",
+            &["read", "glob", "grep", "bash(read-only)"],
+            "cheapest/fastest capable model",
+            &[
+                "Never ask questions; make reasonable assumptions and document them.",
+                "Never create, modify, delete files, install packages, or change system state.",
+                "Use workspace-relative paths and line numbers whenever possible.",
+            ],
+            &[
+                "Summary",
+                "Answer",
+                "Files Retrieved",
+                "Key Code",
+                "Architecture",
+                "Start Here",
+            ],
+        ),
+        agent_profile(
+            "plan",
+            &["planner"],
+            true,
+            "Turn requirements and exploration findings into a concrete implementation plan.",
+            &["read", "glob", "grep", "bash(read-only)"],
+            "strong reasoning model",
+            &[
+                "Never ask questions and never edit files.",
+                "Keep steps actionable at file and function level.",
+                "State risks and assumptions explicitly.",
+            ],
+            &[
+                "Goal",
+                "Plan",
+                "Files to Modify",
+                "New Files",
+                "Risks / Assumptions",
+            ],
+        ),
+        agent_profile(
+            "build",
+            &["executor", "worker"],
+            false,
+            "Implement a well-scoped task completely and validate it with repository checks.",
+            &["read", "write", "glob", "grep", "bash", "task", "skill"],
+            "capable coding model",
+            &[
+                "Never ask questions; complete the task or document a blocker.",
+                "Respect RIGA write and shell capability gates and approval requirements.",
+                "After changes, run the project's own validation scripts.",
+            ],
+            &["Completed", "Files Changed", "Notes"],
+        ),
+        agent_profile(
+            "review",
+            &["reviewer"],
+            true,
+            "Independently review a build result for correctness, security, tests, and maintainability.",
+            &["read", "glob", "grep", "bash(read-only)"],
+            "strong reasoning model",
+            &[
+                "Never modify files or change system state.",
+                "Inspect git diff, tests, security boundaries, and failure modes.",
+                "Report actionable findings with severity and file references.",
+            ],
+            &["Summary", "Findings", "Validation", "Recommendation"],
+        ),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_profile(
+    name: &str,
+    aliases: &[&str],
+    read_only: bool,
+    purpose: &str,
+    tools: &[&str],
+    model_preference: &str,
+    system_rules: &[&str],
+    output_format: &[&str],
+) -> AgentProfile {
+    AgentProfile {
+        name: name.into(),
+        aliases: aliases.iter().map(|alias| (*alias).into()).collect(),
+        purpose: purpose.into(),
+        tools: tools.iter().map(|tool| (*tool).into()).collect(),
+        model_preference: model_preference.into(),
+        read_only,
+        system_rules: system_rules.iter().map(|rule| (*rule).into()).collect(),
+        output_format: output_format.iter().map(|item| (*item).into()).collect(),
+    }
+}
+
+fn find_agent_profile(name: &str) -> Option<AgentProfile> {
+    let normalized = name.trim().to_ascii_lowercase();
+    agent_profiles().into_iter().find(|profile| {
+        profile.name == normalized || profile.aliases.iter().any(|alias| alias == &normalized)
+    })
+}
+
 pub fn execute_task(input: &serde_json::Value) -> Result<String, String> {
-    let store = crate::secure_store::SecureStore::from_env()
-        .ok_or("task persistence requires RIGA_TOKEN")?;
-    let mut tasks = store.load::<Vec<RigaTask>>("tasks")?.unwrap_or_default();
     let action = input
         .get("action")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("list");
+    if matches!(action, "agents" | "agent_list" | "dispatch" | "agent") {
+        return execute_agent_action(input, action);
+    }
+    let store = crate::secure_store::SecureStore::from_env()
+        .ok_or("task persistence requires RIGA_TOKEN")?;
+    let mut tasks = store.load::<Vec<RigaTask>>("tasks")?.unwrap_or_default();
     match action {
         "list" => serde_json::to_string_pretty(&tasks).map_err(|error| error.to_string()),
         "inspect" => {
@@ -218,6 +341,30 @@ pub fn execute_task(input: &serde_json::Value) -> Result<String, String> {
         }
         _ => Err("task action must be list, inspect, create, or update".into()),
     }
+}
+
+fn execute_agent_action(input: &serde_json::Value, action: &str) -> Result<String, String> {
+    if matches!(action, "agents" | "agent_list") {
+        return serde_json::to_string_pretty(&agent_profiles()).map_err(|error| error.to_string());
+    }
+    let name = input
+        .get("agent")
+        .or_else(|| input.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("task dispatch requires agent")?;
+    let profile =
+        find_agent_profile(name).ok_or_else(|| format!("unknown agent profile: {name}"))?;
+    let request = input
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "dispatch": "accepted",
+        "agent": profile,
+        "prompt": request,
+        "handoff": "The parent RIGA run remains responsible for tool execution and approvals."
+    }))
+    .map_err(|error| error.to_string())
 }
 
 fn unix_timestamp() -> u128 {
@@ -370,6 +517,10 @@ pub async fn execute_web(url: &str) -> Result<String, String> {
 pub fn catalog(root: &Path) -> BTreeMap<String, serde_json::Value> {
     let mut result = BTreeMap::new();
     result.insert("tools".into(), serde_json::to_value(builtins()).unwrap());
+    result.insert(
+        "agents".into(),
+        serde_json::to_value(agent_profiles()).unwrap(),
+    );
     result.insert(
         "skills".into(),
         serde_json::to_value(load_skills(root)).unwrap(),

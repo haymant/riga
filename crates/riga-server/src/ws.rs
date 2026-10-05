@@ -453,7 +453,7 @@ async fn call_chat_with_tools(
         .map_err(|e| e.to_string())?;
     let mut messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
     let mut traces = Vec::new();
-    for _ in 0..6 {
+    for _ in 0..24 {
         let mut request = client
             .post(&endpoint)
             .json(&completion_request_body_with_messages(
@@ -561,7 +561,7 @@ async fn call_responses_api(
     let mut input = serde_json::json!(prompt);
     let mut previous_response_id: Option<String> = None;
     let mut traces = Vec::new();
-    for _ in 0..6 {
+    for _ in 0..24 {
         let mut body = serde_json::json!({
             "model": config.model,
             "input": input,
@@ -748,8 +748,8 @@ fn tool_schemas() -> Vec<serde_json::Value> {
         ),
         function_schema(
             "task",
-            "List, inspect, create, or update durable RIGA tasks",
-            serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list","inspect","create","update"]},"title":{"type":"string"},"description":{"type":"string"},"status":{"type":"string"},"task_id":{"type":"string"}},"required":[]}),
+            "List, inspect, create, or update durable tasks; list or dispatch explore, plan, build, and review agents",
+            serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list","inspect","create","update","agents","agent_list","dispatch","agent"]},"agent":{"type":"string","enum":["explore","plan","build","review","scout","planner","executor","worker","reviewer"]},"name":{"type":"string"},"prompt":{"type":"string"},"title":{"type":"string"},"description":{"type":"string"},"status":{"type":"string"},"task_id":{"type":"string"}},"required":[]}),
         ),
         function_schema(
             "skill",
@@ -880,5 +880,33 @@ mod tests {
         }))
         .unwrap_err();
         assert!(refusal.contains("provider refused the request: not allowed"));
+    }
+
+    #[test]
+    fn task_agent_profiles_support_aliases_and_read_only_rules() {
+        let profiles = crate::catalog::agent_profiles();
+        assert_eq!(profiles.len(), 4);
+        assert!(
+            profiles
+                .iter()
+                .find(|profile| profile.name == "explore")
+                .unwrap()
+                .read_only
+        );
+        assert!(
+            !profiles
+                .iter()
+                .find(|profile| profile.name == "build")
+                .unwrap()
+                .read_only
+        );
+        let dispatch = crate::catalog::execute_task(&serde_json::json!({
+            "action": "dispatch",
+            "agent": "executor",
+            "prompt": "Create an Express health server"
+        }))
+        .unwrap();
+        assert!(dispatch.contains("\"name\": \"build\""));
+        assert!(dispatch.contains("Create an Express health server"));
     }
 }
