@@ -98,17 +98,25 @@ impl RunEvidence {
     /// write or a denied approval is not evidence of work.
     fn record(&self, tool: &str, ok: bool) {
         if ok && is_mutating_tool(tool) {
+            // SeqCst: the run's task can migrate between worker threads at await
+            // points, and a missed store would make the verification guard fire
+            // on work the run really did.
             self.mutated
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
     fn has_work(&self) -> bool {
-        self.mutated.load(std::sync::atomic::Ordering::Relaxed)
+        self.mutated.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn streamed(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         self.streamed.clone()
+    }
+
+    fn mark_streamed(&self) {
+        self.streamed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn was_streamed(&self) -> bool {
@@ -1706,22 +1714,36 @@ async fn run_chat_loop(
             .await
             .map_err(|e| format!("provider connection failed: {e}"))?;
         let status = response.status();
-        let body = response.text().await.map_err(|e| e.to_string())?;
         if !status.is_success() {
+            let body = response.text().await.map_err(|e| e.to_string())?;
             return Err(format!(
                 "provider returned HTTP {status}: {}",
                 redact_body(&body)
             ));
         }
-        let value: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| format!("invalid provider response: {e}"))?;
-        let message = value
-            .get("choices")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .cloned()
-            .ok_or_else(|| "provider returned no choices".to_owned())?;
+        // A streaming provider (the normal OpenAI-compatible shape) answers with
+        // server-sent events; forward the text as it arrives so a remote model
+        // streams like a local one. A gateway that ignores `stream` and returns
+        // one JSON body is parsed the old way.
+        let streaming = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/event-stream"));
+        let message = if streaming {
+            read_streamed_message(response, &trace_sender, evidence).await?
+        } else {
+            let body = response.text().await.map_err(|e| e.to_string())?;
+            let value: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| format!("invalid provider response: {e}"))?;
+            value
+                .get("choices")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("message"))
+                .cloned()
+                .ok_or_else(|| "provider returned no choices".to_owned())?
+        };
         let tool_calls = message
             .get("tool_calls")
             .and_then(serde_json::Value::as_array)
@@ -1735,7 +1757,7 @@ async fn run_chat_loop(
             // Nudge a claim the run cannot back before accepting the answer.
             if claims_work(&text) && !evidence.has_work() && nudges < MAX_CLAIM_NUDGES {
                 nudges += 1;
-                messages.push(message);
+                messages.push(serde_json::json!({ "role": "assistant", "content": text }));
                 messages.push(serde_json::json!({ "role": "user", "content": CLAIM_NUDGE }));
                 continue;
             }
@@ -2697,6 +2719,135 @@ fn responses_tool_schemas(mcp: &[rig_core::completion::ToolDefinition]) -> Vec<s
 
 /// Build a chat request from an already-resolved tool list, so a subagent can
 /// run with a restricted subset.
+/// One streaming tool call, assembled from the fragments a provider spreads
+/// across several `delta` frames.
+#[derive(Default)]
+struct StreamedToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Read an SSE completion stream to its end, forwarding assistant text as it
+/// arrives and reassembling streamed tool calls into a single message.
+async fn read_streamed_message(
+    response: reqwest::Response,
+    trace_sender: &mpsc::Sender<ToolTraceEvent>,
+    evidence: &RunEvidence,
+) -> Result<serde_json::Value, String> {
+    let mut chunks = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut text = String::new();
+    let mut fragments: std::collections::BTreeMap<usize, StreamedToolCall> =
+        std::collections::BTreeMap::new();
+    'stream: while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|e| format!("provider stream failed: {e}"))?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(newline) = buffer.find('\n') {
+            let line = buffer[..newline].trim_end_matches('\r').to_owned();
+            buffer.drain(..=newline);
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                break 'stream;
+            }
+            let value: serde_json::Value = serde_json::from_str(data)
+                .map_err(|e| format!("invalid provider stream frame: {e}"))?;
+            let Some(delta) = value.pointer("/choices/0/delta") else {
+                continue;
+            };
+            if let Some(part) = absorb_stream_delta(delta, &mut text, &mut fragments) {
+                // Mark the run as streamed so the final answer is not also sent
+                // as one whole delta on top of what already reached the client.
+                evidence.mark_streamed();
+                let _ = trace_sender
+                    .send(ToolTraceEvent::Ui(RigaEvent::TextDelta { delta: part }))
+                    .await;
+            }
+        }
+    }
+    Ok(streamed_message(text, fragments))
+}
+
+/// Fold one streamed `delta` into the reply being assembled, returning the text
+/// to forward onward when the frame carried assistant text.
+fn absorb_stream_delta(
+    delta: &serde_json::Value,
+    text: &mut String,
+    fragments: &mut std::collections::BTreeMap<usize, StreamedToolCall>,
+) -> Option<String> {
+    let mut emitted = None;
+    if let Some(part) = delta.get("content").and_then(content_text)
+        && !part.is_empty()
+    {
+        text.push_str(&part);
+        emitted = Some(part);
+    }
+    if let Some(calls) = delta
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+    {
+        for call in calls {
+            let index = call
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as usize;
+            let entry = fragments.entry(index).or_default();
+            if let Some(id) = call.get("id").and_then(serde_json::Value::as_str) {
+                entry.id = id.to_owned();
+            }
+            if let Some(function) = call.get("function") {
+                if let Some(name) = function.get("name").and_then(serde_json::Value::as_str) {
+                    entry.name.push_str(name);
+                }
+                if let Some(args) = function
+                    .get("arguments")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    entry.arguments.push_str(args);
+                }
+            }
+        }
+    }
+    emitted
+}
+
+/// Build the assistant message a streamed turn describes. Tool-call fragments
+/// are keyed by their provider index so several concurrent calls stay separate.
+fn streamed_message(
+    text: String,
+    fragments: std::collections::BTreeMap<usize, StreamedToolCall>,
+) -> serde_json::Value {
+    let tool_calls: Vec<serde_json::Value> = fragments
+        .values()
+        .map(|fragment| {
+            serde_json::json!({
+                "id": fragment.id,
+                "type": "function",
+                "function": {
+                    "name": fragment.name,
+                    "arguments": fragment.arguments,
+                },
+            })
+        })
+        .collect();
+    let content = if text.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(text)
+    };
+    serde_json::json!({
+        "role": "assistant",
+        "content": content,
+        "tool_calls": tool_calls,
+    })
+}
+
 fn completion_request_body_with_tools(
     model: &str,
     messages: &[serde_json::Value],
@@ -2705,7 +2856,7 @@ fn completion_request_body_with_tools(
     serde_json::json!({
         "model": model,
         "messages": messages,
-        "stream": false,
+        "stream": true,
         "max_completion_tokens": 2048,
         "tools": tools,
         "tool_choice": "auto",
@@ -2966,6 +3117,51 @@ mod tests {
         assert_eq!(body["max_completion_tokens"], 2048);
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["model"], "gpt-5-nano");
+        // Streaming is on so a remote provider streams like a local one.
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn streamed_tool_call_fragments_reassemble_in_order() {
+        let first: serde_json::Value = serde_json::from_str(
+            r#"{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write","arguments":"{\"path\":\"a.txt\","}}]}"#,
+        )
+        .unwrap();
+        let second: serde_json::Value = serde_json::from_str(
+            r#"{"tool_calls":[{"index":0,"function":{"arguments":"\"content\":\"hi\"}"}}]}"#,
+        )
+        .unwrap();
+        let mut text = String::new();
+        let mut fragments = std::collections::BTreeMap::new();
+        assert!(super::absorb_stream_delta(&first, &mut text, &mut fragments).is_none());
+        assert!(super::absorb_stream_delta(&second, &mut text, &mut fragments).is_none());
+        let message = super::streamed_message(text, fragments);
+        assert_eq!(message["tool_calls"][0]["id"], "call_1");
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "write");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            r#"{"path":"a.txt","content":"hi"}"#
+        );
+        // A tool-call-only turn has no text.
+        assert!(message["content"].is_null());
+    }
+
+    #[test]
+    fn streamed_text_fragments_accumulate_and_forward() {
+        let mut text = String::new();
+        let mut fragments = std::collections::BTreeMap::new();
+        let first = serde_json::json!({"content": "Hel"});
+        let second = serde_json::json!({"content": "lo"});
+        assert_eq!(
+            super::absorb_stream_delta(&first, &mut text, &mut fragments),
+            Some("Hel".to_owned())
+        );
+        assert_eq!(
+            super::absorb_stream_delta(&second, &mut text, &mut fragments),
+            Some("lo".to_owned())
+        );
+        assert_eq!(text, "Hello");
+        assert_eq!(super::streamed_message(text, fragments)["content"], "Hello");
     }
 
     #[test]
