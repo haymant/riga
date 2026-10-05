@@ -539,12 +539,9 @@ pub async fn execute_read(root: &Path, path: &str) -> Result<String, String> {
 }
 
 pub async fn execute_write(root: &Path, path: &str, content: &str) -> Result<String, String> {
+    // Authorization is the caller's job: the run loop asks the user before
+    // reaching here, so this only performs the write it was authorized to do.
     let path = safe_path(root, path)?;
-    if std::env::var("RIGA_ENABLE_WRITES").ok().as_deref() != Some("1") {
-        return Err(
-            "workspace writes are disabled; set RIGA_ENABLE_WRITES=1 and require approval".into(),
-        );
-    }
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -557,9 +554,7 @@ pub async fn execute_write(root: &Path, path: &str, content: &str) -> Result<Str
 }
 
 pub async fn execute_bash(root: &Path, command: &str) -> Result<String, String> {
-    if std::env::var("RIGA_ENABLE_SHELL").ok().as_deref() != Some("1") {
-        return Err("shell execution is disabled; set RIGA_ENABLE_SHELL=1 for an explicitly trusted local server".into());
-    }
+    // Authorization is the caller's job; see `execute_write`.
     execute_bash_inner(root, command, None).await
 }
 
@@ -568,9 +563,6 @@ pub async fn execute_bash_streaming(
     command: &str,
     output_sender: mpsc::Sender<String>,
 ) -> Result<String, String> {
-    if std::env::var("RIGA_ENABLE_SHELL").ok().as_deref() != Some("1") {
-        return Err("shell execution is disabled; set RIGA_ENABLE_SHELL=1 for an explicitly trusted local server".into());
-    }
     execute_bash_inner(root, command, Some(output_sender)).await
 }
 

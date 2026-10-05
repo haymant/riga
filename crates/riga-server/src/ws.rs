@@ -59,6 +59,163 @@ fn default_reasoning_effort() -> String {
     "low".into()
 }
 
+/// How a pending approval was answered.
+#[derive(Debug, Clone, Copy)]
+struct ApprovalReply {
+    approved: bool,
+    /// Approve this tool for the rest of the session, not just this call.
+    always: bool,
+}
+
+/// Resolves tool approvals for one WebSocket session.
+///
+/// A run suspends inside `request_approval`; the socket's read loop resolves it
+/// when the `Approval` frame arrives. `always_allowed` persists across runs in
+/// the same session so "always allow" means exactly that.
+#[derive(Clone, Default)]
+struct ApprovalBroker {
+    waiters: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<String, tokio::sync::oneshot::Sender<ApprovalReply>>,
+        >,
+    >,
+    always_allowed: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl ApprovalBroker {
+    /// Deliver a decision to the run waiting on `approval_id`. Returns whether
+    /// a waiter was found, so a stray or duplicate decision is a no-op.
+    async fn resolve(&self, approval_id: &str, reply: ApprovalReply) -> bool {
+        let mut waiters = self.waiters.lock().await;
+        if let Some(sender) = waiters.remove(approval_id) {
+            let _ = sender.send(reply);
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn is_always_allowed(&self, tool: &str) -> bool {
+        self.always_allowed.lock().await.contains(tool)
+    }
+
+    async fn always_allow(&self, tool: &str) {
+        self.always_allowed.lock().await.insert(tool.to_owned());
+    }
+}
+
+/// Ask the user to approve a gated tool call, suspending the run until they
+/// answer or the socket closes. Returns a denial on timeout so a run can never
+/// hang forever on a client that went away.
+async fn request_approval(
+    broker: &ApprovalBroker,
+    trace_sender: &mpsc::Sender<ToolTraceEvent>,
+    call_id: &str,
+    tool: &str,
+    summary: &str,
+) -> ApprovalReply {
+    static APPROVAL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let approval_id = format!(
+        "approval-{}",
+        APPROVAL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    broker
+        .waiters
+        .lock()
+        .await
+        .insert(approval_id.clone(), sender);
+    let _ = trace_sender
+        .send(ToolTraceEvent::Ui(
+            riga_kernel::events::RigaEvent::ApprovalRequested {
+                approval_id: approval_id.clone(),
+                task_id: call_id.to_owned(),
+                tool: tool.to_owned(),
+                summary: summary.to_owned(),
+            },
+        ))
+        .await;
+    let reply = match tokio::time::timeout(std::time::Duration::from_secs(900), receiver).await {
+        Ok(Ok(reply)) => reply,
+        // Dropped sender (socket closed) or timed out: treat as denied.
+        _ => ApprovalReply {
+            approved: false,
+            always: false,
+        },
+    };
+    broker.waiters.lock().await.remove(&approval_id);
+    let _ = trace_sender
+        .send(ToolTraceEvent::Ui(
+            riga_kernel::events::RigaEvent::ApprovalResolved {
+                approval_id,
+                approved: reply.approved,
+                reason: None,
+            },
+        ))
+        .await;
+    reply
+}
+
+/// A short, human-readable description of a gated call for the approval card.
+fn approval_summary(tool: &str, input: &serde_json::Value) -> String {
+    match tool {
+        "write" | "edit" => input
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(|path| format!("write {path}"))
+            .unwrap_or_else(|| "write a file".to_owned()),
+        "bash" | "shell" => input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(|command| command.to_owned())
+            .unwrap_or_else(|| "run a shell command".to_owned()),
+        other => format!("call {other}"),
+    }
+}
+
+/// Decide whether a tool call may proceed, asking the user when policy requires
+/// it. This replaces the old environment-variable write/shell gates.
+async fn authorize_tool(
+    broker: &ApprovalBroker,
+    trace_sender: &mpsc::Sender<ToolTraceEvent>,
+    call_id: &str,
+    name: &str,
+    input: &serde_json::Value,
+) -> Result<(), String> {
+    let decision =
+        riga_kernel::policy::ToolPolicy::default().evaluate(&riga_kernel::policy::ToolRequest {
+            tool_name: name.to_owned(),
+            risk: riga_kernel::policy::ToolRisk::for_tool(name),
+            target: approval_summary(name, input),
+            explanation: String::new(),
+        });
+    match decision {
+        riga_kernel::policy::ApprovalDecision::Allow => Ok(()),
+        riga_kernel::policy::ApprovalDecision::Deny => Err(format!("`{name}` is not permitted")),
+        riga_kernel::policy::ApprovalDecision::RequireApproval => {
+            if broker.is_always_allowed(name).await {
+                return Ok(());
+            }
+            let reply = request_approval(
+                broker,
+                trace_sender,
+                call_id,
+                name,
+                &approval_summary(name, input),
+            )
+            .await;
+            if reply.approved {
+                if reply.always {
+                    broker.always_allow(name).await;
+                }
+                Ok(())
+            } else {
+                Err(format!("the user denied `{name}`"))
+            }
+        }
+    }
+}
+
 /// One completed exchange kept for context.
 ///
 /// Persisted per session so a follow-up like "go ahead" arrives with the plan
@@ -114,6 +271,10 @@ pub enum ClientMessage {
         run_id: String,
         approval_id: String,
         approved: bool,
+        /// Optional scope from the UI, e.g. `always` to allow this tool for the
+        /// rest of the session. `once` (or absent) allows just this call.
+        #[serde(default)]
+        option: Option<String>,
     },
     Ping {
         nonce: String,
@@ -181,6 +342,7 @@ pub async fn upgrade(
     secure_store: Option<std::sync::Arc<crate::secure_store::SecureStore>>,
 ) {
     let (mut sender, mut receiver) = socket.split();
+    let broker = ApprovalBroker::default();
     let mut provider: Option<ProviderConfig> =
         match crate::secure_store::load_json("provider").await {
             Ok(value) => value,
@@ -277,7 +439,13 @@ pub async fn upgrade(
                         run_id,
                         approval_id,
                         approved,
+                        option,
                     }) => {
+                        let reply = ApprovalReply {
+                            approved,
+                            always: option.as_deref() == Some("always"),
+                        };
+                        broker.resolve(&approval_id, reply).await;
                         let _ = send(
                             &mut sender,
                             ServerMessage::ApprovalRecorded {
@@ -348,6 +516,8 @@ pub async fn upgrade(
                         };
                         match send_provider_events(
                             &mut sender,
+                            &mut receiver,
+                            &broker,
                             &config,
                             &workspace_root,
                             &run_id,
@@ -621,6 +791,8 @@ struct AgentResult {
 #[allow(clippy::too_many_arguments)]
 async fn send_provider_events<S>(
     sender: &mut S,
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    broker: &ApprovalBroker,
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
     run_id: &str,
@@ -649,6 +821,7 @@ where
         trace_sender,
         local_models,
         history,
+        broker,
     ));
     let mut sequence = 2;
     let result = loop {
@@ -656,6 +829,38 @@ where
             trace = trace_receiver.recv() => {
                 if let Some(trace) = trace {
                     send_tool_event(sender, run_id, session_id, &mut sequence, trace).await?;
+                }
+            }
+            // While the run is suspended on an approval, keep reading so the
+            // decision (or a cancellation or ping) is handled promptly instead
+            // of sitting in the socket buffer until the run finishes.
+            message = receiver.next() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<ClientMessage>(&text) {
+                            Ok(ClientMessage::Approval { approval_id, approved, option, .. }) => {
+                                let reply = ApprovalReply {
+                                    approved,
+                                    always: option.as_deref() == Some("always"),
+                                };
+                                broker.resolve(&approval_id, reply).await;
+                            }
+                            Ok(ClientMessage::Ping { nonce }) => {
+                                let _ = send(sender, ServerMessage::Pong { nonce }).await;
+                            }
+                            Ok(ClientMessage::CancelRun { .. }) => {
+                                // Cancellation is wired in a later step; the
+                                // message is consumed here so it cannot be
+                                // mistaken for a protocol error mid-run.
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = sender.send(Message::Pong(payload)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => return Ok(None),
+                    _ => {}
                 }
             }
             result = &mut provider_call => break result,
@@ -818,6 +1023,7 @@ fn resolve_run_provider(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_openai_compatible(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
@@ -826,6 +1032,7 @@ async fn call_openai_compatible(
     trace_sender: mpsc::Sender<ToolTraceEvent>,
     local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
     history: &[ConversationTurn],
+    broker: &ApprovalBroker,
 ) -> Result<AgentResult, String> {
     // A local model short-circuits every HTTP path: there is no endpoint to
     // call and no Responses API, so the API shape must not be consulted.
@@ -838,6 +1045,7 @@ async fn call_openai_compatible(
             trace_sender,
             local_models,
             history,
+            broker,
         )
         .await;
     }
@@ -861,6 +1069,7 @@ async fn call_openai_compatible(
                 mcp_runtime,
                 trace_sender,
                 history,
+                broker,
             )
             .await
         }
@@ -873,6 +1082,7 @@ async fn call_chat_with_tools(
     mcp_runtime: &McpRuntime,
     trace_sender: mpsc::Sender<ToolTraceEvent>,
     history: &[ConversationTurn],
+    broker: &ApprovalBroker,
 ) -> Result<AgentResult, String> {
     run_chat_loop(
         config,
@@ -884,6 +1094,7 @@ async fn call_chat_with_tools(
         trace_sender,
         history,
         0,
+        broker,
     )
     .await
 }
@@ -902,6 +1113,7 @@ async fn run_chat_loop(
     trace_sender: mpsc::Sender<ToolTraceEvent>,
     history: &[ConversationTurn],
     depth: usize,
+    broker: &ApprovalBroker,
 ) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
@@ -1009,28 +1221,36 @@ async fn run_chat_loop(
                 .send(ToolTraceEvent::Started(call.clone()))
                 .await
                 .map_err(|_| "tool lifecycle stream closed")?;
-            let result = if name == "task" && is_subagent_dispatch(&input) {
-                Box::pin(dispatch_subagent(
-                    config,
-                    workspace_root,
-                    &input,
-                    mcp_runtime,
-                    &trace_sender,
-                    depth,
-                ))
-                .await
-            } else {
-                execute_tool(
-                    workspace_root,
-                    mcp_runtime,
-                    name,
-                    input.clone(),
-                    Some(ToolOutputStream {
-                        call_id: call_id.to_owned(),
-                        trace_sender: trace_sender.clone(),
-                    }),
-                )
-                .await
+            let permitted = authorize_tool(broker, &trace_sender, call_id, name, &input).await;
+            let result = match permitted {
+                // A denied gated call never reaches the tool; the model gets a
+                // clear refusal it can adapt to.
+                Err(message) => Err(message),
+                Ok(()) if name == "task" && is_subagent_dispatch(&input) => {
+                    Box::pin(dispatch_subagent(
+                        config,
+                        workspace_root,
+                        &input,
+                        mcp_runtime,
+                        &trace_sender,
+                        depth,
+                        broker,
+                    ))
+                    .await
+                }
+                Ok(()) => {
+                    execute_tool(
+                        workspace_root,
+                        mcp_runtime,
+                        name,
+                        input.clone(),
+                        Some(ToolOutputStream {
+                            call_id: call_id.to_owned(),
+                            trace_sender: trace_sender.clone(),
+                        }),
+                    )
+                    .await
+                }
             };
             let (ok, output) = match result {
                 Ok(output) => (true, output),
@@ -1087,6 +1307,7 @@ async fn dispatch_subagent(
     mcp_runtime: &McpRuntime,
     trace_sender: &mpsc::Sender<ToolTraceEvent>,
     depth: usize,
+    broker: &ApprovalBroker,
 ) -> Result<String, String> {
     if depth + 1 > riga_kernel::task::MAX_TASK_DEPTH {
         return Err(format!(
@@ -1148,6 +1369,7 @@ async fn dispatch_subagent(
         trace_sender.clone(),
         &[],
         depth + 1,
+        broker,
     ))
     .await;
 
@@ -1310,6 +1532,7 @@ fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition])
     text
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_local_model(
     // Kept for symmetry with the other `call_*` backends; a local run uses the
     // loaded GGUF rather than anything in the provider config.
@@ -1320,6 +1543,7 @@ async fn call_local_model(
     trace_sender: mpsc::Sender<ToolTraceEvent>,
     local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
     history: &[ConversationTurn],
+    broker: &ApprovalBroker,
 ) -> Result<AgentResult, String> {
     let definitions = mcp_runtime.tool_definitions().await;
     let system = format!(
@@ -1384,17 +1608,24 @@ async fn call_local_model(
                 .send(ToolTraceEvent::Started(payload.clone()))
                 .await
                 .map_err(|_| "tool lifecycle stream closed")?;
-            let result = execute_tool(
-                workspace_root,
-                mcp_runtime,
-                &call.name,
-                call.arguments.clone(),
-                Some(ToolOutputStream {
-                    call_id: call_id.clone(),
-                    trace_sender: trace_sender.clone(),
-                }),
-            )
-            .await;
+            let permitted =
+                authorize_tool(broker, &trace_sender, &call_id, &call.name, &call.arguments).await;
+            let result = match permitted {
+                Err(message) => Err(message),
+                Ok(()) => {
+                    execute_tool(
+                        workspace_root,
+                        mcp_runtime,
+                        &call.name,
+                        call.arguments.clone(),
+                        Some(ToolOutputStream {
+                            call_id: call_id.clone(),
+                            trace_sender: trace_sender.clone(),
+                        }),
+                    )
+                    .await
+                }
+            };
             let (ok, output) = match result {
                 Ok(output) => (true, output),
                 Err(error) => (false, format!("tool error: {error}")),
@@ -1731,13 +1962,8 @@ fn content_text(content: &serde_json::Value) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-/// The system prompt, built per run so it can describe the capabilities that
-/// are actually enabled. A model told to write files when writes are disabled
-/// will plan work it cannot do and then stall asking for a goal; stating the
-/// real capability set turns that into an immediate, actionable blocker.
+/// The system prompt, built per run.
 fn coding_agent_system_prompt() -> String {
-    let writes = std::env::var("RIGA_ENABLE_WRITES").ok().as_deref() == Some("1");
-    let shell = std::env::var("RIGA_ENABLE_SHELL").ok().as_deref() == Some("1");
     let workspace = crate::catalog::workspace_root();
     let mut prompt = String::from(
         "You are RIGA, a coding agent operating inside the configured workspace. \
@@ -1754,21 +1980,12 @@ Call `update_plan` once right after exploring, then `update_todos` as work is di
 - When the user names a specific MCP server, prefer its qualified tool alias beginning with `mcp_` (for example `mcp_riga_health_stdio_health`) over a built-in.\n\n",
     );
     prompt.push_str(&format!("Workspace root: {}\n", workspace.display()));
-    prompt.push_str(&format!(
-        "Workspace writes are {}.\n",
-        if writes { "ENABLED" } else { "DISABLED" }
-    ));
-    prompt.push_str(&format!(
-        "Shell execution is {}.\n",
-        if shell { "ENABLED" } else { "DISABLED" }
-    ));
-    if !writes || !shell {
-        prompt.push_str(
-            "If a task needs a capability that is disabled, do not retry it and do not ask the user to approve it in chat: \
-stop and state the exact blocker once, naming the capability (for example, \"workspace writes are disabled\"), \
-then summarize what you completed. Do not describe commands you cannot run as if you ran them.\n",
-        );
-    }
+    prompt.push_str(
+        "Writing files and running shell commands pause for the user's approval before they execute. \
+That is expected: just call the tool and wait for the result. Never ask the user to approve in chat, \
+and never claim a write or command succeeded before its tool result confirms it. \
+If an approval is denied, adapt or summarize what you completed rather than retrying the same call.\n",
+    );
     prompt.push_str(
         "Keep the final response concise and summarize the actual files and validation results.",
     );
@@ -1891,11 +2108,10 @@ mod tests {
 
     #[test]
     fn coding_agent_prompt_states_capabilities_and_agent_mentions() {
-        // The model plans against the sandbox it is actually in, and knows that
-        // `@agent` addresses a dispatchable subagent.
+        // The model knows writes/shell pause for approval and that `@agent`
+        // addresses a dispatchable subagent.
         let prompt = super::coding_agent_system_prompt();
-        assert!(prompt.contains("Workspace writes are"), "{prompt}");
-        assert!(prompt.contains("Shell execution is"), "{prompt}");
+        assert!(prompt.contains("pause for the user's approval"), "{prompt}");
         assert!(prompt.contains("@explore"), "{prompt}");
         assert!(prompt.contains("task"), "{prompt}");
     }
@@ -2300,5 +2516,113 @@ mod tests {
         assert!(prompt.contains("Never modify files"), "{prompt}");
         assert!(prompt.contains("Findings"), "{prompt}");
         assert!(prompt.contains("do not ask the user"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn a_gated_tool_waits_for_approval_then_honours_always() {
+        let broker = super::ApprovalBroker::default();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let broker_for_task = broker.clone();
+        let sender_for_task = sender.clone();
+        let handle = tokio::spawn(async move {
+            super::authorize_tool(
+                &broker_for_task,
+                &sender_for_task,
+                "call-1",
+                "write",
+                &serde_json::json!({"path": "a.txt", "content": "x"}),
+            )
+            .await
+        });
+
+        let approval_id = match receiver.recv().await.expect("approval requested") {
+            super::ToolTraceEvent::Ui(RigaEvent::ApprovalRequested {
+                approval_id, tool, ..
+            }) => {
+                assert_eq!(tool, "write");
+                approval_id
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        };
+        broker
+            .resolve(
+                &approval_id,
+                super::ApprovalReply {
+                    approved: true,
+                    always: true,
+                },
+            )
+            .await;
+        let _ = receiver.recv().await; // ApprovalResolved
+        handle.await.unwrap().expect("authorized once");
+
+        // "Always" means the next call of the same tool does not ask again.
+        super::authorize_tool(
+            &broker,
+            &sender,
+            "call-2",
+            "write",
+            &serde_json::json!({"path": "b.txt", "content": "y"}),
+        )
+        .await
+        .expect("always allowed");
+        assert!(
+            receiver.try_recv().is_err(),
+            "no second approval should be requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_gated_tool_reports_the_denial() {
+        let broker = super::ApprovalBroker::default();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let broker_for_task = broker.clone();
+        let sender_for_task = sender.clone();
+        let handle = tokio::spawn(async move {
+            super::authorize_tool(
+                &broker_for_task,
+                &sender_for_task,
+                "call-1",
+                "bash",
+                &serde_json::json!({"command": "rm -rf /"}),
+            )
+            .await
+        });
+        let approval_id = match receiver.recv().await.expect("approval requested") {
+            super::ToolTraceEvent::Ui(RigaEvent::ApprovalRequested { approval_id, .. }) => {
+                approval_id
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        };
+        broker
+            .resolve(
+                &approval_id,
+                super::ApprovalReply {
+                    approved: false,
+                    always: false,
+                },
+            )
+            .await;
+        let error = handle.await.unwrap().expect_err("denied");
+        assert!(error.contains("denied"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_read_only_tool_is_allowed_without_asking() {
+        let broker = super::ApprovalBroker::default();
+        let (sender, mut receiver) = mpsc::channel(4);
+        super::authorize_tool(
+            &broker,
+            &sender,
+            "call-1",
+            "read",
+            &serde_json::json!({"path": "a.txt"}),
+        )
+        .await
+        .expect("read is allowed");
+        assert!(
+            receiver.try_recv().is_err(),
+            "read must not request approval"
+        );
     }
 }

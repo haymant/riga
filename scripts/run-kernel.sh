@@ -2,9 +2,8 @@
 set -euo pipefail
 source "$HOME/.cargo/env"
 
-# Load local capability flags. README documents RIGA_ENABLE_WRITES and
-# RIGA_ENABLE_SHELL in .env.local, but nothing read that file, so the flags had
-# no effect and writes/shell were always disabled under `npm run dev`.
+# Load local settings (provider keys, RIGA_TOKEN, overrides). Writes and shell
+# are gated by the approval flow, not by environment variables.
 if [[ -f .env.local ]]; then
   set -a
   # shellcheck disable=SC1091

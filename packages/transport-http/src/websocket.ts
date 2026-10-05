@@ -13,7 +13,7 @@ export type RigaWebSocketClientMessage =
   | { type: "configure_provider"; endpoint: string; api_key: string; model: string; reasoning_effort: "low" | "medium" | "high"; kind?: ProviderKind; api?: ProviderApi }
   | { type: "start_run"; run_id: string; session_id: string; prompt: string }
   | { type: "cancel_run"; run_id: string }
-  | { type: "approval"; run_id: string; approval_id: string; approved: boolean }
+  | { type: "approval"; run_id: string; approval_id: string; approved: boolean; option?: "once" | "always" }
   | { type: "ping"; nonce: string };
 
 export type RigaWebSocketServerMessage =
@@ -127,9 +127,9 @@ export class RigaWebSocketClient {
     this.send({ type: "cancel_run", run_id: runId });
   }
 
-  async respondToApproval(runId: string, approvalId: string, approved: boolean): Promise<void> {
+  async respondToApproval(runId: string, approvalId: string, approved: boolean, option?: "once" | "always"): Promise<void> {
     await this.connect();
-    this.send({ type: "approval", run_id: runId, approval_id: approvalId, approved });
+    this.send({ type: "approval", run_id: runId, approval_id: approvalId, approved, option });
   }
 
   close(): void {

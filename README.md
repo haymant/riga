@@ -43,14 +43,9 @@ npm run start
 
 The preview is served on port `1420`. The kernel adapter listens on `8787` and the Vite server proxies `/health`, `/catalog`, `/sessions`, `/attachments`, and `/ws`.
 
-For a trusted local workspace, set these flags in `.env.local`:
+Writes and shell commands are **approval-gated by the kernel's tool policy**, not by environment variables. The first time a run wants to write a file or run a shell command, it pauses and the UI shows an approval card with **Allow once**, **Always allow**, and **Decline**. "Always allow" is scoped to the session. Read-only tools run without asking; destructive tools are denied outright.
 
-```text
-RIGA_ENABLE_WRITES=1
-RIGA_ENABLE_SHELL=1
-```
-
-Keep shell and write execution disabled or approval-gated in production. Never commit `.env.local`, provider keys, `RIGA_TOKEN`, or uploaded files.
+Never commit `.env.local`, provider keys, `RIGA_TOKEN`, or uploaded files. The API key is encrypted at rest by the server store and is write-only from the browser.
 
 ### Desktop shell
 

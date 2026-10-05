@@ -59,6 +59,7 @@ type TodoStatus = "pending" | "active" | "done" | "failed" | "cancelled";
 type TodoItemState = { id: string; text: string; description?: string; status: TodoStatus; reason?: string };
 type TodoListState = { title?: string; revision?: number; items: TodoItemState[] };
 type AgentTaskView = { id: string; agent: string; description: string; state: "running" | "done" | "failed"; result?: string };
+type PendingApproval = { approvalId: string; tool: string; summary: string };
 
 const initialSessions: Session[] = [
   { id: "riga", title: "RIGA desktop shell", meta: "Today · 14 messages", active: true },
@@ -115,7 +116,7 @@ export function AssistantUI({
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isRunning, setIsRunning] = useState(false);
-  const [approval, setApproval] = useState(false);
+  const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -331,6 +332,12 @@ export function AssistantUI({
         } else if (typeof event === "object" && event !== null && "TaskCompleted" in event) {
           const done = (event as { TaskCompleted: { task_id: string; ok: boolean; result: string } }).TaskCompleted;
           setAgentTasks((current) => current.map((item) => item.id === done.task_id ? { ...item, state: done.ok ? "done" : "failed", result: done.result } : item));
+        } else if (typeof event === "object" && event !== null && "ApprovalRequested" in event) {
+          const request = (event as { ApprovalRequested: { approval_id: string; tool: string; summary: string } }).ApprovalRequested;
+          setPendingApproval({ approvalId: request.approval_id, tool: request.tool, summary: request.summary });
+        } else if (typeof event === "object" && event !== null && "ApprovalResolved" in event) {
+          const resolved = (event as { ApprovalResolved: { approval_id: string } }).ApprovalResolved;
+          setPendingApproval((current) => current && current.approvalId === resolved.approval_id ? null : current);
         }
       },
     });
@@ -399,7 +406,7 @@ export function AssistantUI({
     const next = { id: `session-${sessions.length + 1}`, title: "New coding session", meta: "Just now · 0 messages", active: true };
     setSessions((current) => [next, ...current.map((session) => ({ ...session, active: false }))]);
     setSessionTranscripts((current) => ({ ...current, [next.id]: [] }));
-    setApproval(false);
+    setPendingApproval(null);
     setHistoryOpen(false);
     setToast("New session created");
   }
@@ -417,7 +424,7 @@ export function AssistantUI({
     setDraft("");
     setAttachments([]);
     setIsRunning(true);
-    setApproval(false);
+    setPendingApproval(null);
     if (transportRef.current && transportStatus === "connected") {
       const runId = crypto.randomUUID();
       activeRunIdRef.current = runId;
@@ -477,16 +484,11 @@ export function AssistantUI({
     }
   }
 
-  function approve() {
-    setApproval(false);
-    void transportRef.current?.respondToApproval("active-run", "transport-write", true);
-    setToast("Approval recorded; no workspace mutation is attached to this run");
-  }
-
-  function deny() {
-    setApproval(false);
-    void transportRef.current?.respondToApproval("active-run", "transport-write", false);
-    setToast("Approval declined; no workspace mutation was made");
+  function answerApproval(approved: boolean, option: "once" | "always") {
+    const pending = pendingApproval;
+    if (!pending) return;
+    setPendingApproval(null);
+    void transportRef.current?.respondToApproval(activeRunIdRef.current ?? "", pending.approvalId, approved, option);
   }
 
   function selectComposerModel(model: string) {
@@ -604,7 +606,7 @@ export function AssistantUI({
             {isRunning && <div className="typing-row"><div className="assistant-badge"><Bot size={15} /></div><div className="typing-bubble"><span /><span /><span /></div><small>RIGA is thinking</small></div>}
           </div>
 
-          {approval && <div className="approval-card"><div className="approval-icon"><ShieldCheck size={19} /></div><div className="approval-copy"><div className="approval-title"><strong>Approval required</strong><span>workspace mutation</span></div><p>Allow RIGA to write the transport adapter boundary in <code>crates/</code> and update the event journal contract?</p><div className="approval-details"><span><FolderOpen size={13} /> 3 files</span><span><GitBranch size={13} /> reversible change</span><span><Clock3 size={13} /> requested now</span></div></div><div className="approval-actions"><button className="deny-button" onClick={deny}>Decline</button><button className="approve-button" onClick={approve}><Check size={15} /> Approve</button></div></div>}
+          {pendingApproval && <div className="approval-card"><div className="approval-icon"><ShieldCheck size={19} /></div><div className="approval-copy"><div className="approval-title"><strong>Approval required</strong><span>{pendingApproval.tool}</span></div><p>The agent wants to run <code>{pendingApproval.summary}</code>.</p></div><div className="approval-actions"><button className="deny-button" onClick={() => answerApproval(false, "once")}>Decline</button><button className="outline-button" onClick={() => answerApproval(true, "always")}>Always allow</button><button className="approve-button" onClick={() => answerApproval(true, "once")}><Check size={15} /> Allow once</button></div></div>}
 
           {(agentPlan || agentTodos || agentTasks.length > 0) && <div className="agent-work"><AgentPlanCard plan={agentPlan} /><AgentTodoList list={agentTodos} /><AgentTaskList tasks={agentTasks} /></div>}
           <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" value={providerKind === "local" ? LOCAL_MODEL_VALUE : providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{localModels?.loaded && <option value={LOCAL_MODEL_VALUE}>Local · {localModels.loaded}</option>}{Array.from(new Set([providerModel, "gpt-5-nano", "gpt-5-mini", "gpt-5-codex"])).filter(Boolean).map((model) => <option key={model} value={model}>{model}</option>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setCatalogOpen((value) => !value); setManualCatalog(true); setCatalogLayer("root"); setCatalogQuery(""); }}><Plus size={17} /></button><textarea value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${isRunning ? "stop-ready" : draft.trim() ? "send-ready" : ""}`} aria-label={isRunning ? "Stop run" : "Send message"} onClick={isRunning ? stopRun : sendMessage}>{isRunning ? <CircleStop size={16} /> : <Send size={16} />}</button></div>{catalogOpen && <div className="catalog-menu" ref={catalogRef} role="listbox">

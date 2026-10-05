@@ -205,18 +205,17 @@ claim it.
 }
 ```
 
-### Capability flags
+### Approvals
 
-Writes and shell execution are off unless you opt in. In `.env.local`:
+Writes and shell commands are gated by the kernel's tool policy, not by
+environment variables. The first time a run wants to write a file or run a
+shell command it pauses, and the surface shows an approval card with **Allow
+once**, **Always allow**, and **Decline**. "Always allow" is scoped to the
+session; read-only tools never prompt, and destructive tools are denied.
 
-```text
-RIGA_ENABLE_WRITES=1
-RIGA_ENABLE_SHELL=1
-```
-
-Keep these off outside a trusted local workspace. Never commit `.env.local`, the
-provider key, or `RIGA_TOKEN`; provider credentials are encrypted at rest by the
-server store and are write-only from the browser.
+Never commit `.env.local`, the provider key, or `RIGA_TOKEN`; provider
+credentials are encrypted at rest by the server store and are write-only from
+the browser.
 
 ## Extending
 

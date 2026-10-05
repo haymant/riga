@@ -11,6 +11,20 @@ pub enum ToolRisk {
     Destructive,
 }
 
+impl ToolRisk {
+    /// Classify a built-in tool by the risk it carries. Unknown tools (MCP and
+    /// future tools) are treated as read-only: they are not workspace
+    /// mutations, and the transport is local.
+    pub fn for_tool(name: &str) -> Self {
+        match name {
+            "write" | "edit" | "apply_patch" => Self::WorkspaceWrite,
+            "bash" | "shell" => Self::ProcessExecution,
+            "web" | "webfetch" | "websearch" => Self::NetworkAccess,
+            _ => Self::ReadOnly,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequest {
     pub tool_name: String,
@@ -132,5 +146,16 @@ mod tests {
                 .authorize(&request(ToolRisk::Destructive), true)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn built_in_tools_are_classified_by_risk() {
+        assert_eq!(ToolRisk::for_tool("read"), ToolRisk::ReadOnly);
+        assert_eq!(ToolRisk::for_tool("glob"), ToolRisk::ReadOnly);
+        assert_eq!(ToolRisk::for_tool("write"), ToolRisk::WorkspaceWrite);
+        assert_eq!(ToolRisk::for_tool("bash"), ToolRisk::ProcessExecution);
+        assert_eq!(ToolRisk::for_tool("web"), ToolRisk::NetworkAccess);
+        // An unknown/MCP tool is not a workspace mutation.
+        assert_eq!(ToolRisk::for_tool("mcp_x_y"), ToolRisk::ReadOnly);
     }
 }
