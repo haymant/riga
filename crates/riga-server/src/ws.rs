@@ -873,6 +873,7 @@ where
         let mcp_runtime = mcp_runtime.clone();
         let trace = trace_sender.clone();
         let broker = broker.clone();
+        let local_models = config.is_local().then(|| local_models.clone());
         Box::pin(async move {
             let input = serde_json::json!({
                 "action": "dispatch",
@@ -888,6 +889,7 @@ where
                 &trace,
                 0,
                 &broker,
+                local_models.as_ref(),
             )
             .await
             .map(|output| AgentResult { output })
@@ -1376,6 +1378,7 @@ async fn run_chat_loop(
                             &trace,
                             depth,
                             &broker,
+                            None,
                         )
                         .await
                         .map(|output| format!("[{agent} subagent result]\n{output}")),
@@ -1420,6 +1423,7 @@ async fn run_chat_loop(
                             &trace_sender,
                             depth,
                             broker,
+                            None,
                         ))
                         .await
                         .map(|output| format!("[{agent} subagent result]\n{output}"))
@@ -1504,6 +1508,7 @@ static TASK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// and a restricted tool set, so its file reads never enter the orchestrator's
 /// window — only the summary does. `TaskStarted`/`TaskCompleted` frames let the
 /// UI render the delegation.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_subagent(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
@@ -1512,6 +1517,7 @@ async fn dispatch_subagent(
     trace_sender: &mpsc::Sender<ToolTraceEvent>,
     depth: usize,
     broker: &ApprovalBroker,
+    local_models: Option<&std::sync::Arc<crate::local_model::LocalModelRuntime>>,
 ) -> Result<String, String> {
     if depth + 1 > riga_kernel::task::MAX_TASK_DEPTH {
         return Err(format!(
@@ -1573,19 +1579,42 @@ async fn dispatch_subagent(
         .await;
 
     let allowed = allowed_tools_for(&profile);
-    let outcome = Box::pin(run_chat_loop(
-        &child_config,
-        workspace_root,
-        &subagent_system_prompt(&profile),
-        Some(&allowed),
-        prompt,
-        mcp_runtime,
-        trace_sender.clone(),
-        &[],
-        depth + 1,
-        broker,
-    ))
-    .await;
+    let system_prompt = subagent_system_prompt(&profile);
+    // A local run dispatches local children; a remote run dispatches remote
+    // children, so a subagent never crosses the provider boundary.
+    let outcome = match (config.is_local(), local_models) {
+        (true, Some(local_models)) => {
+            Box::pin(run_local_loop(
+                &child_config,
+                workspace_root,
+                &system_prompt,
+                Some(&allowed),
+                prompt,
+                mcp_runtime,
+                trace_sender.clone(),
+                local_models,
+                &[],
+                depth + 1,
+                broker,
+            ))
+            .await
+        }
+        _ => {
+            Box::pin(run_chat_loop(
+                &child_config,
+                workspace_root,
+                &system_prompt,
+                Some(&allowed),
+                prompt,
+                mcp_runtime,
+                trace_sender.clone(),
+                &[],
+                depth + 1,
+                broker,
+            ))
+            .await
+        }
+    };
 
     let (ok, result) = match outcome {
         Ok(result) => (true, result.output),
@@ -1755,9 +1784,7 @@ fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition])
 
 #[allow(clippy::too_many_arguments)]
 async fn call_local_model(
-    // Kept for symmetry with the other `call_*` backends; a local run uses the
-    // loaded GGUF rather than anything in the provider config.
-    _config: &ProviderConfig,
+    config: &ProviderConfig,
     workspace_root: &std::path::Path,
     prompt: &str,
     mcp_runtime: &McpRuntime,
@@ -1766,12 +1793,43 @@ async fn call_local_model(
     history: &[ConversationTurn],
     broker: &ApprovalBroker,
 ) -> Result<AgentResult, String> {
-    let definitions = mcp_runtime.tool_definitions().await;
-    let system = format!(
-        "{}{}",
-        coding_agent_system_prompt(),
-        local_tool_instructions(&definitions)
-    );
+    run_local_loop(
+        config,
+        workspace_root,
+        &coding_agent_system_prompt(),
+        None,
+        prompt,
+        mcp_runtime,
+        trace_sender,
+        local_models,
+        history,
+        0,
+        broker,
+    )
+    .await
+}
+
+/// The local-model tool loop, shaped like `run_chat_loop` so the orchestrator
+/// and a dispatched subagent share it with different prompts and tool sets.
+#[allow(clippy::too_many_arguments)]
+async fn run_local_loop(
+    config: &ProviderConfig,
+    workspace_root: &std::path::Path,
+    system_prompt: &str,
+    allowed_tools: Option<&[String]>,
+    prompt: &str,
+    mcp_runtime: &McpRuntime,
+    trace_sender: mpsc::Sender<ToolTraceEvent>,
+    local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
+    history: &[ConversationTurn],
+    depth: usize,
+    broker: &ApprovalBroker,
+) -> Result<AgentResult, String> {
+    let mut definitions = mcp_runtime.tool_definitions().await;
+    if let Some(allowed) = allowed_tools {
+        definitions.retain(|definition| allowed.iter().any(|name| name == &definition.name));
+    }
+    let system = format!("{}{}", system_prompt, local_tool_instructions(&definitions));
     let mut messages = vec![crate::local_model::ChatMessage {
         role: "system".into(),
         content: system,
@@ -1829,22 +1887,47 @@ async fn call_local_model(
                 .send(ToolTraceEvent::Started(payload.clone()))
                 .await
                 .map_err(|_| "tool lifecycle stream closed")?;
-            let permitted =
-                authorize_tool(broker, &trace_sender, &call_id, &call.name, &call.arguments).await;
-            let result = match permitted {
-                Err(message) => Err(message),
-                Ok(()) => {
-                    execute_tool(
-                        workspace_root,
-                        mcp_runtime,
-                        &call.name,
-                        call.arguments.clone(),
-                        Some(ToolOutputStream {
-                            call_id: call_id.clone(),
-                            trace_sender: trace_sender.clone(),
-                        }),
-                    )
+            let disallowed =
+                allowed_tools.is_some_and(|allowed| !allowed.iter().any(|name| name == &call.name));
+            let result = if disallowed {
+                Err(format!("`{}` is not available to this agent", call.name))
+            } else {
+                match authorize_tool(broker, &trace_sender, &call_id, &call.name, &call.arguments)
                     .await
+                {
+                    Err(message) => Err(message),
+                    Ok(()) if call.name == "task" && is_subagent_dispatch(&call.arguments) => {
+                        let agent = call
+                            .arguments
+                            .get("agent")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("subagent");
+                        Box::pin(dispatch_subagent(
+                            config,
+                            workspace_root,
+                            &call.arguments,
+                            mcp_runtime,
+                            &trace_sender,
+                            depth,
+                            broker,
+                            Some(local_models),
+                        ))
+                        .await
+                        .map(|output| format!("[{agent} subagent result]\n{output}"))
+                    }
+                    Ok(()) => {
+                        execute_tool(
+                            workspace_root,
+                            mcp_runtime,
+                            &call.name,
+                            call.arguments.clone(),
+                            Some(ToolOutputStream {
+                                call_id: call_id.clone(),
+                                trace_sender: trace_sender.clone(),
+                            }),
+                        )
+                        .await
+                    }
                 }
             };
             let (ok, output) = match result {
