@@ -10,7 +10,7 @@ export type ProviderApi = "chat" | "responses";
 
 export type RigaWebSocketClientMessage =
   | { type: "hello"; client_version: string }
-  | { type: "configure_provider"; endpoint: string; api_key: string; model: string; reasoning_effort: "low" | "medium" | "high"; kind?: ProviderKind; api?: ProviderApi }
+  | { type: "configure_provider"; endpoint: string; api_key: string; model: string; reasoning_effort: "low" | "medium" | "high"; kind?: ProviderKind; api?: ProviderApi; subagent_model?: string }
   | { type: "start_run"; run_id: string; session_id: string; prompt: string }
   | { type: "resume_run"; run_id: string; after_sequence: number }
   | { type: "cancel_run"; run_id: string }
@@ -19,7 +19,7 @@ export type RigaWebSocketClientMessage =
 
 export type RigaWebSocketServerMessage =
   | { type: "ready"; protocol_version: number; server_version: string }
-  | { type: "provider_configured"; endpoint: string; model: string; reasoning_effort: "low" | "medium" | "high"; kind?: ProviderKind; api?: ProviderApi }
+  | { type: "provider_configured"; endpoint: string; model: string; reasoning_effort: "low" | "medium" | "high"; kind?: ProviderKind; api?: ProviderApi; subagent_model?: string }
   | { type: "event"; envelope: RigaEventEnvelope }
   | { type: "run_cancelled"; run_id: string }
   | { type: "approval_recorded"; run_id: string; approval_id: string; approved: boolean }
@@ -44,9 +44,9 @@ export class RigaWebSocketClient {
   private readonly onEvent: (envelope: RigaEventEnvelope) => void;
   private readonly onError: (code: string, message: string) => void;
   private readonly onStatus: (status: "connecting" | "connected" | "closed" | "error") => void;
-  private readonly onProviderConfigured: (endpoint: string, model: string, reasoningEffort: "low" | "medium" | "high", kind: ProviderKind, api: ProviderApi) => void;
+  private readonly onProviderConfigured: (endpoint: string, model: string, reasoningEffort: "low" | "medium" | "high", kind: ProviderKind, api: ProviderApi, subagentModel: string) => void;
 
-  constructor(options: { url: string; onEvent: (envelope: RigaEventEnvelope) => void; onError?: (code: string, message: string) => void; onStatus?: (status: "connecting" | "connected" | "closed" | "error") => void; onProviderConfigured?: (endpoint: string, model: string, reasoningEffort: "low" | "medium" | "high", kind: ProviderKind, api: ProviderApi) => void; socketFactory?: RigaWebSocketFactory }) {
+  constructor(options: { url: string; onEvent: (envelope: RigaEventEnvelope) => void; onError?: (code: string, message: string) => void; onStatus?: (status: "connecting" | "connected" | "closed" | "error") => void; onProviderConfigured?: (endpoint: string, model: string, reasoningEffort: "low" | "medium" | "high", kind: ProviderKind, api: ProviderApi, subagentModel: string) => void; socketFactory?: RigaWebSocketFactory }) {
     this.url = options.url;
     this.onEvent = options.onEvent;
     this.onError = options.onError ?? (() => undefined);
@@ -98,7 +98,7 @@ export class RigaWebSocketClient {
         } else if (parsed.type === "provider_configured") {
           // Older servers omit `kind`/`api`; a client written before those
           // existed must still read the frame as remote over chat completions.
-          this.onProviderConfigured(parsed.endpoint, parsed.model, parsed.reasoning_effort, parsed.kind ?? "remote", parsed.api ?? "chat");
+          this.onProviderConfigured(parsed.endpoint, parsed.model, parsed.reasoning_effort, parsed.kind ?? "remote", parsed.api ?? "chat", parsed.subagent_model ?? "");
         } else if (parsed.type === "error") {
           this.onStatus("error");
           this.onError(parsed.code, parsed.message);
@@ -129,9 +129,9 @@ export class RigaWebSocketClient {
     this.send({ type: "resume_run", run_id: runId, after_sequence: afterSequence });
   }
 
-  async configureProvider(endpoint: string, apiKey: string, model: string, reasoningEffort: "low" | "medium" | "high", kind: ProviderKind = "remote", api: ProviderApi = "chat"): Promise<void> {
+  async configureProvider(endpoint: string, apiKey: string, model: string, reasoningEffort: "low" | "medium" | "high", kind: ProviderKind = "remote", api: ProviderApi = "chat", subagentModel = ""): Promise<void> {
     await this.connect();
-    this.send({ type: "configure_provider", endpoint, api_key: apiKey, model, reasoning_effort: reasoningEffort, kind, api });
+    this.send({ type: "configure_provider", endpoint, api_key: apiKey, model, reasoning_effort: reasoningEffort, kind, api, subagent_model: subagentModel || undefined });
   }
 
   async cancelRun(runId: string): Promise<void> {

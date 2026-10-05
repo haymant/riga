@@ -47,6 +47,10 @@ pub struct ProviderConfig {
     /// Which remote API to call. Ignored when `kind` is `Local`.
     #[serde(default)]
     pub api: ProviderApi,
+    /// Optional cheaper model for read-only subagents (`explore`/`plan`/
+    /// `review`). When unset, subagents use the main model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_model: Option<String>,
 }
 
 impl ProviderConfig {
@@ -311,6 +315,9 @@ pub enum ServerMessage {
         /// Which remote API the stored config will call, so the form can show
         /// the current choice after a reload.
         api: ProviderApi,
+        /// Optional cheaper model for read-only subagents, echoed for the form.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        subagent_model: Option<String>,
     },
     Event {
         envelope: RigaEventEnvelope,
@@ -384,6 +391,7 @@ pub async fn upgrade(
                                     reasoning_effort: config.reasoning_effort.clone(),
                                     kind: config.kind,
                                     api: config.api,
+                                    subagent_model: config.subagent_model.clone(),
                                 },
                             )
                             .await
@@ -403,6 +411,7 @@ pub async fn upgrade(
                         let reasoning_effort = config.reasoning_effort.clone();
                         let kind = config.kind;
                         let api = config.api;
+                        let subagent_model = config.subagent_model.clone();
                         if let Err(error) =
                             crate::secure_store::save_json("provider", &config).await
                         {
@@ -431,6 +440,7 @@ pub async fn upgrade(
                                 reasoning_effort,
                                 kind,
                                 api,
+                                subagent_model,
                             },
                         )
                         .await
@@ -1100,6 +1110,7 @@ fn resolve_run_provider(
             kind: ProviderKind::Local,
             // Ignored for a local run; kept explicit so the struct is complete.
             api: ProviderApi::Chat,
+            subagent_model: None,
         });
     }
     Err((
@@ -1533,12 +1544,22 @@ async fn dispatch_subagent(
         .chars()
         .take(120)
         .collect();
+    // Read-only recon can run on a cheaper model when one is configured; a
+    // mutating profile keeps the main model.
+    let child_model = subagent_model_for(config, &profile);
+    let child_config = if child_model == config.model {
+        config.clone()
+    } else {
+        let mut clone = config.clone();
+        clone.model = child_model.clone();
+        clone
+    };
     let started = riga_kernel::task::TaskRecord {
         id: task_id.clone(),
         parent_id: Some(format!("depth-{depth}")),
         agent: profile.name.clone(),
         description: description.clone(),
-        model: config.model.clone(),
+        model: child_model,
         state: riga_kernel::task::TaskState::Running,
         started_at: "now".into(),
         result: None,
@@ -1553,7 +1574,7 @@ async fn dispatch_subagent(
 
     let allowed = allowed_tools_for(&profile);
     let outcome = Box::pin(run_chat_loop(
-        config,
+        &child_config,
         workspace_root,
         &subagent_system_prompt(&profile),
         Some(&allowed),
@@ -1625,8 +1646,15 @@ fn allowed_tools_for(profile: &crate::catalog::AgentProfile) -> Vec<String> {
     allowed
 }
 
-/// Maximum assistant turns in one local run. Each turn is a full re-decode of
-/// the growing conversation, so this bounds latency rather than correctness.
+/// The model a subagent runs on. A configured `subagent_model` applies only to
+/// read-only recon profiles; a mutating profile keeps the main model so writes
+/// are never handed to a model chosen for cheapness.
+fn subagent_model_for(config: &ProviderConfig, profile: &crate::catalog::AgentProfile) -> String {
+    match config.subagent_model.as_deref().map(str::trim) {
+        Some(model) if profile.read_only && !model.is_empty() => model.to_owned(),
+        _ => config.model.clone(),
+    }
+}
 const LOCAL_MAX_TURNS: usize = 8;
 
 /// Tokens requested per local turn before `resolve_max_tokens` shrinks it to the
@@ -2292,6 +2320,7 @@ mod tests {
             reasoning_effort: "low".into(),
             kind: ProviderKind::Local,
             api: ProviderApi::Chat,
+            subagent_model: None,
         })
         .unwrap();
         assert!(local.contains(r#""kind":"local""#), "{local}");
@@ -2478,6 +2507,7 @@ mod tests {
             reasoning_effort: "high".into(),
             kind: ProviderKind::Remote,
             api: ProviderApi::Chat,
+            subagent_model: None,
         };
         let resolved = resolve_run_provider(Some(&stored), true).expect("stored provider must win");
         assert_eq!(resolved.kind, ProviderKind::Remote);
@@ -2496,6 +2526,7 @@ mod tests {
             reasoning_effort: "medium".into(),
             kind: ProviderKind::Local,
             api: ProviderApi::Chat,
+            subagent_model: None,
         };
         let resolved = resolve_run_provider(Some(&stored), false).expect("passed through");
         assert_eq!(resolved.kind, ProviderKind::Local);
@@ -2761,6 +2792,29 @@ mod tests {
                 "build should be allowed `{expected}`: {allowed:?}"
             );
         }
+    }
+
+    #[test]
+    fn read_only_subagents_use_the_subagent_model_when_configured() {
+        let mut config = ProviderConfig {
+            endpoint: "https://api.example/v1".into(),
+            api_key: "k".into(),
+            model: "main-model".into(),
+            reasoning_effort: "low".into(),
+            kind: ProviderKind::Remote,
+            api: ProviderApi::Chat,
+            subagent_model: Some("cheap-model".into()),
+        };
+        let explore = crate::catalog::find_agent_profile("explore").unwrap();
+        let build = crate::catalog::find_agent_profile("build").unwrap();
+        assert_eq!(super::subagent_model_for(&config, &explore), "cheap-model");
+        assert_eq!(super::subagent_model_for(&config, &build), "main-model");
+
+        // Unset or blank falls back to the main model.
+        config.subagent_model = None;
+        assert_eq!(super::subagent_model_for(&config, &explore), "main-model");
+        config.subagent_model = Some("   ".into());
+        assert_eq!(super::subagent_model_for(&config, &explore), "main-model");
     }
 
     #[test]
