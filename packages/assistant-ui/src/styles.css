@@ -1,7 +1,17 @@
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
 
-:root { font-family: 'Manrope', ui-sans-serif, system-ui, sans-serif; color: #e8eaf0; background: #090b0f; font-synthesis: none; --bg: #090b0f; --panel: #0f1218; --panel-2: #131720; --line: #242a36; --muted: #8b93a4; --soft: #b8bfcd; --purple: #a78bfa; --purple-2: #7c5ce5; --green: #7ce3b1; --amber: #f2c879; }
+:root { font-family: 'Manrope', ui-sans-serif, system-ui, sans-serif; color: #e8eaf0; background: #090b0f; font-synthesis: none; color-scheme: dark; --bg: #090b0f; --panel: #0f1218; --panel-2: #131720; --line: #242a36; --muted: #8b93a4; --soft: #b8bfcd; --purple: #a78bfa; --purple-2: #7c5ce5; --green: #7ce3b1; --amber: #f2c879; --scroll-thumb: rgba(233,237,245,.18); --scroll-thumb-hover: rgba(233,237,245,.36); }
 * { box-sizing: border-box; }
+
+/* Theme-aware, modern scrollbars. `color-scheme` on :root already fixes the
+   scheme the browser paints by default; these refine the thumb to match the
+   surfaces instead of the stock light bar. */
+* { scrollbar-width: thin; scrollbar-color: var(--scroll-thumb) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background-color: var(--scroll-thumb); border: 2px solid transparent; border-radius: 999px; background-clip: content-box; }
+*::-webkit-scrollbar-thumb:hover { background-color: var(--scroll-thumb-hover); }
+*::-webkit-scrollbar-corner { background: transparent; }
 html, body, #root { height: 100%; }
 body { margin: 0; min-width: 320px; background: var(--bg); overflow: hidden; }
 button, textarea, input { font: inherit; }
@@ -240,7 +250,7 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 
 /* assistant-ui-inspired tokens: quiet surfaces, clear state, compact composer rail */
 :root { --surface: #11151d; --surface-raised: #171c26; --surface-soft: #1d2430; --text: #e9edf5; --text-muted: #8d98aa; --border: #2b3443; --accent: #9b83f5; --accent-soft: #282040; }
-:root[data-theme="light"] { color-scheme: light; --bg: #f5f7fb; --panel: #ffffff; --panel-2: #eef1f7; --line: #d9deea; --muted: #667085; --soft: #465064; --purple: #6c4dcc; --purple-2: #5840b2; --green: #15835d; --amber: #a66b00; --surface: #ffffff; --surface-raised: #f8f9fc; --surface-soft: #edf0f6; --text: #182033; --text-muted: #667085; --border: #d9deea; --accent: #6950c9; --accent-soft: #eeeafe; }
+:root[data-theme="light"] { color-scheme: light; --bg: #f5f7fb; --panel: #ffffff; --panel-2: #eef1f7; --line: #d9deea; --muted: #667085; --soft: #465064; --purple: #6c4dcc; --purple-2: #5840b2; --green: #15835d; --amber: #a66b00; --surface: #ffffff; --surface-raised: #f8f9fc; --surface-soft: #edf0f6; --text: #182033; --text-muted: #667085; --border: #d9deea; --accent: #6950c9; --accent-soft: #eeeafe; --scroll-thumb: rgba(24,32,51,.20); --scroll-thumb-hover: rgba(24,32,51,.38); }
 [data-theme="light"] body { background: var(--bg); }
 [data-theme="light"] .app-shell { background: radial-gradient(circle at 75% -10%, rgba(108,77,204,.10), transparent 32rem), var(--bg); }
 [data-theme="light"] .sidebar, [data-theme="light"] .topbar, [data-theme="light"] .run-strip { background: rgba(255,255,255,.9); }
