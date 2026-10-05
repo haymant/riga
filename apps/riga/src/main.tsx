@@ -1,9 +1,8 @@
 import { useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
 import { createRoot } from "react-dom/client";
-import { RIGA_ASSISTANT_UI_VERSION } from "@haymant/assistant-ui";
+import { DEFAULT_ASSISTANT_UI_OPTIONS, RIGA_ASSISTANT_UI_VERSION, type AssistantUiOptions } from "@haymant/assistant-ui";
 import { RigaWebSocketClient, type RigaEventEnvelope } from "@haymant/transport-http";
 import {
-  Bell,
   Bot,
   Check,
   ChevronDown,
@@ -13,20 +12,19 @@ import {
   Code2,
   FolderOpen,
   GitBranch,
+  Maximize2,
   Menu,
   MessageSquare,
-  MoreHorizontal,
+  Minimize2,
   Paperclip,
   Pencil,
   Moon,
   Sun,
   Play,
   Plus,
-  Search,
   Send,
   Settings2,
   ShieldCheck,
-  Sparkles,
   TerminalSquare,
   X,
 } from "lucide-react";
@@ -89,7 +87,12 @@ function loadLocal<T>(key: string, fallback: T): T {
   }
 }
 
-function App() {
+export type RigaAppProps = AssistantUiOptions;
+
+function App({
+  showSessionHistoryButton = DEFAULT_ASSISTANT_UI_OPTIONS.showSessionHistoryButton,
+  fullWidth: initialFullWidth = DEFAULT_ASSISTANT_UI_OPTIONS.fullWidth,
+}: RigaAppProps = {}) {
   const [sessions, setSessions] = useState<Session[]>(() => loadLocal("riga.sessions.v1", initialSessions));
   const [sessionTranscripts, setSessionTranscripts] = useState<Record<string, TranscriptItem[]>>(() => loadLocal("riga.transcripts.v1", sessionHistories));
   const [draft, setDraft] = useState("");
@@ -99,8 +102,7 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [approval, setApproval] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [showSearch, setShowSearch] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [providerEndpoint, setProviderEndpoint] = useState("");
@@ -109,6 +111,7 @@ function App() {
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("low");
   const [providerMode, setProviderMode] = useState<"remote" | "local">("remote");
   const [theme, setTheme] = useState<"dark" | "light">(() => loadLocal("riga.theme.v1", "dark"));
+  const [fullWidthEnabled, setFullWidthEnabled] = useState(initialFullWidth);
   const [transportStatus, setTransportStatus] = useState<"connecting" | "connected" | "closed" | "error">("connecting");
   const [catalogOpen, setCatalogOpen] = useState(false);
   const [manualCatalog, setManualCatalog] = useState(false);
@@ -122,7 +125,9 @@ function App() {
   const [workspaceFiles, setWorkspaceFiles] = useState<FileCandidate[]>([]);
   const [mcpServers, setMcpServers] = useState<McpServerSummary[]>([]);
   const transportRef = useRef<RigaWebSocketClient | null>(null);
+  const activeRunIdRef = useRef<string | null>(null);
   const catalogRef = useRef<HTMLDivElement | null>(null);
+  const transcriptRef = useRef<HTMLDivElement | null>(null);
 
   const activeSession = useMemo(() => sessions.find((session) => session.active) ?? sessions[0], [sessions]);
   const transcript = sessionTranscripts[activeSession.id] ?? [];
@@ -146,6 +151,15 @@ function App() {
   useEffect(() => {
     window.localStorage.setItem("riga.transcripts.v1", JSON.stringify(sessionTranscripts));
   }, [sessionTranscripts]);
+
+  useEffect(() => {
+    const transcriptElement = transcriptRef.current;
+    if (!transcriptElement) return;
+    const frame = window.requestAnimationFrame(() => {
+      transcriptElement.scrollTo({ top: transcriptElement.scrollHeight, behavior: "smooth" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [transcript, isRunning]);
 
   const allConnectors = mcpServers;
 
@@ -193,12 +207,22 @@ function App() {
         setProviderModel(model);
         setReasoningEffort(effort);
       },
-      onError: (code, message) => setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "system", text: `${code}: ${message}`, time: "now" }]),
+      onError: (code, message) => {
+        activeRunIdRef.current = null;
+        setIsRunning(false);
+        if (code === "provider_persist_failed") setToast(message);
+        setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "system", text: `${code}: ${message}`, time: "now" }]);
+      },
       onEvent: (envelope: RigaEventEnvelope) => {
         const event = envelope.event;
         if (typeof event === "object" && event !== null && "ToolCallStarted" in event) {
           const call = (event as { ToolCallStarted: { call: { call_id?: string; name?: string; arguments?: unknown } } }).ToolCallStarted.call;
           setTranscript((current) => [...current, { id: envelope.event_id, role: "tool", callId: call.call_id, name: call.name ?? "tool", command: typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments ?? {}), status: "running", output: "Waiting for result…", time: "now" }]);
+        } else if (typeof event === "object" && event !== null && "ToolOutputDelta" in event) {
+          const output = (event as { ToolOutputDelta: { call_id?: string; delta?: string } }).ToolOutputDelta;
+          setTranscript((current) => current.map((item) => item.role === "tool" && item.callId === output.call_id
+            ? { ...item, output: `${item.output === "Waiting for result…" ? "" : item.output}${output.delta ?? ""}` }
+            : item));
         } else if (typeof event === "object" && event !== null && "ToolResult" in event) {
           const result = (event as { ToolResult: { result: { call_id?: string; name?: string; output?: string; ok?: boolean } } }).ToolResult.result;
           setTranscript((current) => current.map((item) => item.role === "tool" && item.callId === result.call_id ? { ...item, status: result.ok ? "done" : "error", output: result.output ?? "" } : item));
@@ -212,8 +236,10 @@ function App() {
             return [...current, { id: `stream-${envelope.run_id}`, role: "assistant", text: delta, time: "now" }];
           });
         } else if (typeof event === "object" && event !== null && "RunCompleted" in event) {
+          activeRunIdRef.current = null;
           setIsRunning(false);
         } else if (typeof event === "object" && event !== null && "RunFailed" in event) {
+          activeRunIdRef.current = null;
           setIsRunning(false);
           setTranscript((current) => [...current, { id: envelope.event_id, role: "system", text: `Agent run failed: ${(event as { RunFailed: { message: string } }).RunFailed.message}`, time: "now" }]);
         } else if (event === "RunStarted") {
@@ -228,7 +254,7 @@ function App() {
 
   function selectSession(id: string) {
     setSessions((current) => current.map((session) => ({ ...session, active: session.id === id })));
-    setSidebarOpen(false);
+    setHistoryOpen(false);
   }
 
   function createSession() {
@@ -236,6 +262,7 @@ function App() {
     setSessions((current) => [next, ...current.map((session) => ({ ...session, active: false }))]);
     setSessionTranscripts((current) => ({ ...current, [next.id]: [] }));
     setApproval(false);
+    setHistoryOpen(false);
     setToast("New session created");
   }
 
@@ -254,7 +281,10 @@ function App() {
     setIsRunning(true);
     setApproval(false);
     if (transportRef.current && transportStatus === "connected") {
-      void transportRef.current.startRun(crypto.randomUUID(), activeSession.id, prompt).catch(() => {
+      const runId = crypto.randomUUID();
+      activeRunIdRef.current = runId;
+      void transportRef.current.startRun(runId, activeSession.id, prompt).catch(() => {
+        activeRunIdRef.current = null;
         setTransportStatus("error");
         setIsRunning(false);
       });
@@ -262,6 +292,14 @@ function App() {
     }
     setIsRunning(false);
     setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "system", text: "WebSocket is not connected. Configure a provider and wait for the connection before sending.", time: "now" }]);
+  }
+
+  function stopRun() {
+    const runId = activeRunIdRef.current;
+    activeRunIdRef.current = null;
+    setIsRunning(false);
+    if (runId) void transportRef.current?.cancelRun(runId);
+    setToast("Run cancellation requested");
   }
 
 
@@ -342,13 +380,17 @@ function App() {
       setToast("Connector name and transport details are required");
       return;
     }
-    const response = await fetch("/mcp/registry", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, transport: connectorDraft.transport, command: connectorDraft.transport === "stdio" ? connectorDraft.command.trim() : undefined, args: connectorDraft.args.trim() ? connectorDraft.args.trim().split(/\s+/) : [], url: connectorDraft.transport === "http" ? connectorDraft.url.trim() : undefined, api_key: connectorDraft.transport === "http" ? connectorDraft.apiKey.trim() || undefined : undefined }) });
-    if (!response.ok) { setToast("Connector could not be persisted"); return; }
-    const next = await response.json() as McpServerSummary;
-    const updated = [...allConnectors.filter((server) => server.name !== name), next];
-    setMcpServers(updated);
-    setEditingConnector(null);
-    setToast(`Connector ${name} saved`);
+    try {
+      const response = await fetch("/mcp/registry", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, transport: connectorDraft.transport, command: connectorDraft.transport === "stdio" ? connectorDraft.command.trim() : undefined, args: connectorDraft.args.trim() ? connectorDraft.args.trim().split(/\s+/) : [], url: connectorDraft.transport === "http" ? connectorDraft.url.trim() : undefined, api_key: connectorDraft.transport === "http" ? connectorDraft.apiKey.trim() || undefined : undefined }) });
+      const payload = await response.json().catch(() => ({})) as McpServerSummary & { error?: string };
+      if (!response.ok) { setToast(payload.error ?? `Connector could not be persisted (${response.status})`); return; }
+      const updated = [...allConnectors.filter((server) => server.name !== name), payload];
+      setMcpServers(updated);
+      setEditingConnector(null);
+      setToast(`Connector ${name} saved`);
+    } catch {
+      setToast("Connector could not be persisted: RIGA server is unavailable");
+    }
   }
 
   const searchableItems = useMemo(() => {
@@ -383,50 +425,23 @@ function App() {
 
   return (
     <div className={`app-shell theme-${theme}`}>
-      <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
-        <div className="brand-row">
-          <div className="brand-mark"><Code2 size={18} strokeWidth={2.6} /></div>
-          <div><strong>RIGA</strong><span>coding agent</span></div>
-          <button className="icon-button mobile-close" aria-label="Close navigation" onClick={() => setSidebarOpen(false)}><X size={17} /></button>
-        </div>
-        <button className="new-session" onClick={createSession}><Plus size={17} /> New session <span>⌘ K</span></button>
-        <div className="sidebar-section-label">Workspace</div>
-        <div className="workspace-card">
-          <div className="workspace-icon"><FolderOpen size={16} /></div>
-          <div><strong>riga</strong><span>~/projects/riga</span></div>
-          <ChevronDown size={15} className="muted-icon" />
-        </div>
-        <div className="sidebar-section-label sessions-label">Sessions <button className="icon-button" aria-label="Search sessions" onClick={() => setShowSearch((value) => !value)}><Search size={15} /></button></div>
-        {showSearch && <input className="session-search" placeholder="Filter sessions" autoFocus />}
-        <nav className="session-list" aria-label="Sessions">
-          {sessions.map((session) => (
-            <button key={session.id} className={`session-item ${session.active ? "active" : ""}`} onClick={() => selectSession(session.id)}>
-              <MessageSquare size={15} /><span><strong>{session.title}</strong><small>{session.meta}</small></span>{session.active && <span className="active-dot" />}
-            </button>
-          ))}
-        </nav>
-        <div className="sidebar-footer">
-          <div className="connection-status"><span className={transportStatus === "connected" ? "online-dot" : "pulse-dot"} /> WebSocket {transportStatus} · UI {RIGA_ASSISTANT_UI_VERSION}</div>
-          <button className="footer-link" onClick={() => setSettingsOpen((value) => !value)}><Settings2 size={15} /> Settings <span>⌘ ,</span></button>
-          <button className="footer-link"><Bell size={15} /> Notifications <span className="notification-count">2</span></button>
-        </div>
-      </aside>
-
-      {sidebarOpen && <button className="mobile-scrim" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
-
       <main className="main-panel">
-        <header className="topbar">
-          <div className="topbar-left"><button className="icon-button menu-button" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}><Menu size={19} /></button><div className="breadcrumbs"><span>Workspace</span><span>/</span><strong>{activeSession.title}</strong></div></div>
-          <div className="topbar-actions"><div className="run-indicator"><span className={isRunning ? "pulse-dot" : "online-dot"} /> {isRunning ? "Run in progress" : "Ready"}</div><button className="icon-button" aria-label="Toggle theme" onClick={() => setTheme((value) => value === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}</button><button className="icon-button" aria-label="More options"><MoreHorizontal size={19} /></button><div className="avatar">AM</div></div>
+        <header className="app-header">
+          <div className="app-brand"><div className="brand-mark"><Code2 size={15} strokeWidth={2.6} /></div><strong>RIGA</strong><span>@riga/assistant-ui embed</span></div>
+          <div className="app-header-actions"><span className={transportStatus === "connected" ? "connection-pill connected" : "connection-pill"}><span /> {transportStatus}</span><button className="icon-button" aria-label="Toggle theme" title="Toggle theme" onClick={() => setTheme((value) => value === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}</button><button className={`icon-button ${fullWidthEnabled ? "selected" : ""}`} aria-label="Toggle full-width chat" title={fullWidthEnabled ? "Use centered chat width" : "Use full-width chat"} onClick={() => setFullWidthEnabled((value) => !value)}>{fullWidthEnabled ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button></div>
         </header>
-
-        {settingsOpen && <section className="settings-panel"><div className="settings-panel-header"><div><p className="eyebrow">RUNTIME / PROVIDER</p><h2>Connect your model.</h2><p>Endpoint and model restore after reload. The API key is sent over WebSocket and retained only in the server's encrypted store.</p></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><div className="provider-tabs"><button className={providerMode === "remote" ? "selected" : ""} onClick={() => setProviderMode("remote")}>OpenAI-compatible / OpenCode Go</button><button className={providerMode === "local" ? "selected" : ""} onClick={() => setProviderMode("local")}>Local GGUF model</button></div>{providerMode === "remote" ? <div className="provider-form"><label>API endpoint<input value={providerEndpoint} onChange={(event) => setProviderEndpoint(event.target.value)} placeholder="https://api.example.com/v1" /></label><label>API key <span>encrypted at rest</span><input type="password" value={providerApiKey} onChange={(event) => setProviderApiKey(event.target.value)} placeholder="sk-…" autoComplete="off" /></label><label>Model<input value={providerModel} onChange={(event) => setProviderModel(event.target.value)} placeholder="opencode-go / gpt-4o-mini" /></label><label>Reasoning effort<select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label><button className="approve-button settings-save" onClick={() => void saveProvider()}><Check size={15} /> Save securely</button></div> : <div className="local-model-card"><div className="tool-symbol"><Bot size={17} /></div><div><strong>Download and run a GGUF model locally</strong><p>Inspired by Fina Builder: model downloads, SHA-256 verification, CPU/OpenMP, and optional CUDA builds belong to the Tauri desktop runtime. This browser session cannot access the host filesystem or GPU.</p><button className="outline-button" onClick={() => setToast("Use the Tauri desktop build to download and run local GGUF models.")}>Open desktop model manager</button></div></div>}</section>}
-
-        <section className="run-strip"><div className="run-strip-main"><div className="run-icon"><Sparkles size={16} /></div><div><strong>Agent run</strong><span>{isRunning ? "Executing with configured provider" : approval ? "Awaiting approval" : "Ready for your next instruction"}</span></div></div><div className="run-strip-meta"><span><GitBranch size={14} /> main</span><span><Clock3 size={14} /> 00:42</span>{isRunning && <button className="stop-run" onClick={() => { void transportRef.current?.cancelRun("active-run"); setIsRunning(false); setToast("Run cancelled safely"); }}><CircleStop size={14} /> Stop</button>}</div></section>
-
-        <section className="content-column">
-          <div className="conversation-header"><div><p className="eyebrow">SESSION / {activeSession.id.toUpperCase()}</p><h1>Build with confidence.</h1><p className="subtitle">A durable, inspectable coding-agent workspace.</p></div><button className="outline-button"><TerminalSquare size={15} /> Open terminal</button></div>
-          <div className="transcript" aria-live="polite">
+        <section className={`content-column${fullWidthEnabled ? " full-width" : ""}`}>
+          <header className="chat-header">
+            <div className="chat-session-label"><div className="chat-session-icon"><MessageSquare size={14} /></div><div><span>Session</span><strong>{activeSession.title}</strong></div></div>
+            <div className="chat-header-actions">
+              {showSessionHistoryButton && <button className={`icon-button chat-header-button ${historyOpen ? "selected" : ""}`} aria-label="Open chat history" title="Open chat history" onClick={() => { setHistoryOpen((value) => !value); setSettingsOpen(false); }}><Menu size={16} /></button>}
+              <button className={`icon-button chat-header-button ${settingsOpen ? "selected" : ""}`} aria-label="Open settings" title="Open settings" onClick={() => { setSettingsOpen((value) => !value); setHistoryOpen(false); }}><Settings2 size={16} /></button>
+              <button className="icon-button chat-header-button" aria-label="New chat" title="New chat" onClick={createSession}><Plus size={16} /></button>
+            </div>
+            {historyOpen && <div className="chat-popover history-popover"><div className="chat-popover-header"><strong>Chat history</strong><button className="outline-button" onClick={createSession}><Plus size={13} /> New chat</button></div><nav className="compact-session-list" aria-label="Chat history">{sessions.map((session) => <button key={session.id} className={`compact-session-item ${session.active ? "active" : ""}`} onClick={() => selectSession(session.id)}><MessageSquare size={14} /><span><strong>{session.title}</strong><small>{session.meta}</small></span></button>)}</nav></div>}
+            {settingsOpen && <section className="chat-popover settings-popover"><div className="settings-panel-header"><div><p className="eyebrow">RUNTIME / PROVIDER</p><h2>Connect your model.</h2><p>Endpoint and model restore after reload. The API key is sent over WebSocket and retained only in the server's encrypted store.</p></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><div className="provider-tabs"><button className={providerMode === "remote" ? "selected" : ""} onClick={() => setProviderMode("remote")}>OpenAI-compatible / OpenCode Go</button><button className={providerMode === "local" ? "selected" : ""} onClick={() => setProviderMode("local")}>Local GGUF model</button></div>{providerMode === "remote" ? <div className="provider-form"><label>API endpoint<input value={providerEndpoint} onChange={(event) => setProviderEndpoint(event.target.value)} placeholder="https://api.example.com/v1" /></label><label>API key <span>encrypted at rest</span><input type="password" value={providerApiKey} onChange={(event) => setProviderApiKey(event.target.value)} placeholder="sk-…" autoComplete="off" /></label><label>Model<input value={providerModel} onChange={(event) => setProviderModel(event.target.value)} placeholder="opencode-go / gpt-4o-mini" /></label><label>Reasoning effort<select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label><button className="approve-button settings-save" onClick={() => void saveProvider()}><Check size={15} /> Save securely</button></div> : <div className="local-model-card"><div className="tool-symbol"><Bot size={17} /></div><div><strong>Download and run a GGUF model locally</strong><p>Inspired by Fina Builder: model downloads, SHA-256 verification, CPU/OpenMP, and optional CUDA builds belong to the Tauri desktop runtime. This browser session cannot access the host filesystem or GPU.</p><button className="outline-button" onClick={() => setToast("Use the Tauri desktop build to download and run local GGUF models.")}>Open desktop model manager</button></div></div>}</section>}
+          </header>
+          <div ref={transcriptRef} className="transcript" aria-live="polite">
             {transcript.length === 0 && <div className="empty-state"><div className="empty-icon"><Bot size={26} /></div><h2>Start a coding run</h2><p>Describe the change, then review every tool action before it touches your workspace.</p></div>}
             {groupTranscript(transcript).map((block) => block.role === "timeline" ? <ToolTimeline key={block.id} items={block.items} /> : <TranscriptItemView key={block.id} item={block} />)}
             {isRunning && <div className="typing-row"><div className="assistant-badge"><Bot size={15} /></div><div className="typing-bubble"><span /><span /><span /></div><small>RIGA is thinking</small></div>}
@@ -434,7 +449,7 @@ function App() {
 
           {approval && <div className="approval-card"><div className="approval-icon"><ShieldCheck size={19} /></div><div className="approval-copy"><div className="approval-title"><strong>Approval required</strong><span>workspace mutation</span></div><p>Allow RIGA to write the transport adapter boundary in <code>crates/</code> and update the event journal contract?</p><div className="approval-details"><span><FolderOpen size={13} /> 3 files</span><span><GitBranch size={13} /> reversible change</span><span><Clock3 size={13} /> requested now</span></div></div><div className="approval-actions"><button className="deny-button" onClick={deny}>Decline</button><button className="approve-button" onClick={approve}><Check size={15} /> Approve</button></div></div>}
 
-          <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" value={providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{Array.from(new Set([providerModel, "gpt-5-nano", "gpt-5-mini", "gpt-5-codex"])).filter(Boolean).map((model) => <option key={model} value={model}>{model}</option>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setCatalogOpen((value) => !value); setManualCatalog(true); setCatalogLayer("root"); setCatalogQuery(""); }}><Plus size={17} /></button><textarea value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${draft.trim() ? "send-ready" : ""}`} aria-label="Send message" onClick={sendMessage}><Send size={16} /></button></div>{catalogOpen && <div className="catalog-menu" ref={catalogRef} role="listbox">
+          <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" value={providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{Array.from(new Set([providerModel, "gpt-5-nano", "gpt-5-mini", "gpt-5-codex"])).filter(Boolean).map((model) => <option key={model} value={model}>{model}</option>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setCatalogOpen((value) => !value); setManualCatalog(true); setCatalogLayer("root"); setCatalogQuery(""); }}><Plus size={17} /></button><textarea value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${isRunning ? "stop-ready" : draft.trim() ? "send-ready" : ""}`} aria-label={isRunning ? "Stop run" : "Send message"} onClick={isRunning ? stopRun : sendMessage}>{isRunning ? <CircleStop size={16} /> : <Send size={16} />}</button></div>{catalogOpen && <div className="catalog-menu" ref={catalogRef} role="listbox">
               <div className="catalog-menu-header">{catalogLayer === "connectors" && <button className="catalog-back" aria-label="Back to insert menu" onClick={() => setCatalogLayer("root")}><ChevronLeft size={14} /></button>}<strong>{activeTrigger ? `${activeTrigger.char === "@" ? "Mention" : "Command"} suggestions` : catalogLayer === "root" ? "Insert into composer" : "Connectors"}</strong><button className="catalog-close" aria-label="Close insert menu" onClick={() => setCatalogOpen(false)}><X size={14} /></button></div>
               <input className="catalog-search" autoFocus={catalogOpen} value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder={activeTrigger ? `Filter ${activeTrigger.char === "@" ? "files or agents" : "tools and skills"}…` : "Search tools, skills, connectors…"} aria-label="Search composer insert menu" />
               {editingConnector ? <div className="connector-form"><label>Name<input value={connectorDraft.name} onChange={(event) => setConnectorDraft({ ...connectorDraft, name: event.target.value })} placeholder="my-server" /></label><label>Transport<select value={connectorDraft.transport} onChange={(event) => setConnectorDraft({ ...connectorDraft, transport: event.target.value as "stdio" | "http" })}><option value="stdio">stdio process</option><option value="http">HTTP stream</option></select></label>{connectorDraft.transport === "stdio" ? <><label>Command<input value={connectorDraft.command} onChange={(event) => setConnectorDraft({ ...connectorDraft, command: event.target.value })} placeholder="riga-server" /></label><label>Arguments<input value={connectorDraft.args} onChange={(event) => setConnectorDraft({ ...connectorDraft, args: event.target.value })} placeholder="mcp-health-stdio" /></label></> : <><label>HTTP stream URL<input value={connectorDraft.url} onChange={(event) => setConnectorDraft({ ...connectorDraft, url: event.target.value })} placeholder="http://127.0.0.1:8787/mcp/health" /></label><label>API key<input type="password" value={connectorDraft.apiKey} onChange={(event) => setConnectorDraft({ ...connectorDraft, apiKey: event.target.value })} placeholder="RIGA_MCP_HEALTH_API_KEY (optional)" autoComplete="off" /></label></>}<div className="connector-form-actions"><button className="outline-button" onClick={() => setEditingConnector(null)}>Cancel</button><button className="approve-button" onClick={saveConnector}><Check size={14} /> Save connector</button></div></div> : <>{catalogLayer === "root" && !activeTrigger && !catalogQuery && <><small>Connectors</small><button className="catalog-category" onClick={() => setCatalogLayer("connectors")}><span><FolderOpen size={14} /> MCP connectors</span><em>{allConnectors.length} registered <ChevronDown size={13} /></em></button><small>Built-in tools</small></>}{(catalogLayer === "connectors" || catalogQuery || activeTrigger?.char === "/" || activeTrigger?.char === "@") && <>{catalogLayer === "connectors" && <div className="catalog-inline-actions"><button className="catalog-category" onClick={() => openConnectorEditor()}><span><Plus size={14} /> Add connector</span><em>stdio or HTTP stream</em></button></div>}{menuConnectors.map((server) => <button className="catalog-item" key={`connector-${server.name}`} onClick={() => insertCatalog(`Use MCP server ${server.name}: `)}><span>mcp/{server.name}</span><em>{server.transport === "http" ? server.url : server.command}<button type="button" className="catalog-edit" aria-label={`Edit ${server.name}`} onClick={(event) => { event.stopPropagation(); openConnectorEditor(server); }}><Pencil size={12} /></button></em></button>)}</>}{(catalogLayer === "root" || catalogLayer === "connectors" || catalogQuery || activeTrigger) && <>{menuTools.length > 0 && <small>Built-in tools</small>}{menuTools.map((item) => <button className="catalog-item" key={item.id} onClick={() => insertCatalog(activeTrigger?.char === "@" ? `@${item.id} ` : activeTrigger?.char === "/" ? `/${item.id} ` : item.insert_text)}><span>{activeTrigger?.char === "/" ? `/${item.id}` : item.id}</span><em>{item.description}</em></button>)}{menuSkills.length > 0 && <small>Skills and agents</small>}{menuSkills.map((skill) => <button className="catalog-item" key={skill.name} onClick={() => insertCatalog(activeTrigger?.char === "@" ? `@${skill.name} ` : activeTrigger?.char === "/" ? `/${skill.name} ` : `Use the skill tool with name ${skill.name}: `)}><span>{activeTrigger?.char === "@" ? `@${skill.name}` : activeTrigger?.char === "/" ? `/${skill.name}` : `skill/${skill.name}`}</span><em>{skill.description}</em></button>)}{activeTrigger?.char === "@" && searchableItems.agents.length > 0 && <><small>Agents</small>{searchableItems.agents.map((agent) => <button className="catalog-item" key={`agent-${agent.name}`} onClick={() => insertCatalog(`@${agent.name} `)}><span>@{agent.name}</span><em>{agent.purpose}</em></button>)}</>}{activeTrigger?.char === "@" && searchableItems.files.length > 0 && <><small>Files</small>{searchableItems.files.map((file) => <button className="catalog-item" key={file.path} onClick={() => insertCatalog(`@${file.path} `)}><span>@{file.name}</span><em>{file.path}</em></button>)}</>}</>}</>}

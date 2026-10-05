@@ -6,6 +6,7 @@ pub enum RigaEvent {
     TextDelta { delta: String },
     ReasoningDelta { delta: String },
     ToolCallStarted { call: serde_json::Value },
+    ToolOutputDelta { call_id: String, delta: String },
     ToolResult { result: serde_json::Value },
     RunCompleted { output: String },
     RunFailed { message: String },

@@ -6,7 +6,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncReadExt, process::Command};
+use tokio::{io::AsyncReadExt, process::Command, sync::mpsc};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogItem {
@@ -524,6 +524,25 @@ pub async fn execute_bash(root: &Path, command: &str) -> Result<String, String> 
     if std::env::var("RIGA_ENABLE_SHELL").ok().as_deref() != Some("1") {
         return Err("shell execution is disabled; set RIGA_ENABLE_SHELL=1 for an explicitly trusted local server".into());
     }
+    execute_bash_inner(root, command, None).await
+}
+
+pub async fn execute_bash_streaming(
+    root: &Path,
+    command: &str,
+    output_sender: mpsc::Sender<String>,
+) -> Result<String, String> {
+    if std::env::var("RIGA_ENABLE_SHELL").ok().as_deref() != Some("1") {
+        return Err("shell execution is disabled; set RIGA_ENABLE_SHELL=1 for an explicitly trusted local server".into());
+    }
+    execute_bash_inner(root, command, Some(output_sender)).await
+}
+
+async fn execute_bash_inner(
+    root: &Path,
+    command: &str,
+    output_sender: Option<mpsc::Sender<String>>,
+) -> Result<String, String> {
     let mut child = Command::new("bash")
         .arg("-lc")
         .arg(command)
@@ -533,23 +552,73 @@ pub async fn execute_bash(root: &Path, command: &str) -> Result<String, String> 
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| e.to_string())?;
-    let mut output = Vec::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        stdout
-            .read_to_end(&mut output)
-            .await
-            .map_err(|e| e.to_string())?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or("failed to capture shell stdout")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or("failed to capture shell stderr")?;
+    let mut stdout_open = true;
+    let mut stderr_open = true;
+    let mut stdout_buffer = [0_u8; 1_024];
+    let mut stderr_buffer = [0_u8; 1_024];
+    let mut output = String::new();
+
+    while stdout_open || stderr_open {
+        tokio::select! {
+            read = stdout.read(&mut stdout_buffer), if stdout_open => {
+                let bytes_read = read.map_err(|e| e.to_string())?;
+                if bytes_read == 0 {
+                    stdout_open = false;
+                } else {
+                    append_shell_output(&mut output, &stdout_buffer[..bytes_read], output_sender.as_ref()).await?;
+                }
+            }
+            read = stderr.read(&mut stderr_buffer), if stderr_open => {
+                let bytes_read = read.map_err(|e| e.to_string())?;
+                if bytes_read == 0 {
+                    stderr_open = false;
+                } else {
+                    append_shell_output(&mut output, &stderr_buffer[..bytes_read], output_sender.as_ref()).await?;
+                }
+            }
+        }
     }
     let status = child.wait().await.map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&output)
-        .chars()
-        .take(20_000)
-        .collect::<String>();
     if status.success() {
-        Ok(text)
+        Ok(output)
     } else {
-        Err(format!("command failed: {text}"))
+        Err(format!("command failed: {output}"))
     }
+}
+
+async fn append_shell_output(
+    output: &mut String,
+    bytes: &[u8],
+    output_sender: Option<&mpsc::Sender<String>>,
+) -> Result<(), String> {
+    const MAX_OUTPUT_CHARS: usize = 20_000;
+    let remaining = MAX_OUTPUT_CHARS.saturating_sub(output.chars().count());
+    if remaining == 0 {
+        return Ok(());
+    }
+    let chunk = String::from_utf8_lossy(bytes)
+        .chars()
+        .take(remaining)
+        .collect::<String>();
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    output.push_str(&chunk);
+    if let Some(sender) = output_sender {
+        sender
+            .send(chunk)
+            .await
+            .map_err(|_| "shell output stream closed".to_owned())?;
+    }
+    Ok(())
 }
 
 pub fn execute_glob(root: &Path, pattern: &str) -> Result<String, String> {
@@ -641,4 +710,44 @@ pub fn catalog(root: &Path) -> BTreeMap<String, serde_json::Value> {
         serde_json::to_value(load_mcp_servers(root)).unwrap(),
     );
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn shell_output_is_emitted_before_the_command_result() {
+        let (sender, mut receiver) = mpsc::channel(4);
+        let result = super::execute_bash_inner(
+            Path::new("."),
+            "printf stdout; printf stderr >&2",
+            Some(sender),
+        )
+        .await
+        .expect("command should succeed");
+        let mut chunks = Vec::new();
+        while let Some(chunk) = receiver.recv().await {
+            chunks.push(chunk);
+        }
+
+        assert!(result.contains("stdout"));
+        assert!(result.contains("stderr"));
+        assert!(chunks.iter().any(|chunk| chunk.contains("stdout")));
+        assert!(chunks.iter().any(|chunk| chunk.contains("stderr")));
+    }
+
+    #[test]
+    fn shell_output_is_capped_at_the_protocol_limit() {
+        let mut output = "x".repeat(19_999);
+        let bytes = b"abcdef";
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should initialize");
+        runtime
+            .block_on(super::append_shell_output(&mut output, bytes, None))
+            .expect("output append should succeed");
+        assert_eq!(output.chars().count(), 20_000);
+        assert!(output.ends_with('a'));
+    }
 }

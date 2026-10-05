@@ -90,10 +90,14 @@ pub enum ServerMessage {
 
 pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf, mcp_runtime: McpRuntime) {
     let (mut sender, mut receiver) = socket.split();
-    let secure_store = crate::secure_store::SecureStore::from_env();
-    let mut provider: Option<ProviderConfig> = secure_store
-        .as_ref()
-        .and_then(|store| store.load::<ProviderConfig>("provider").ok().flatten());
+    let mut provider: Option<ProviderConfig> =
+        match crate::secure_store::load_json("provider").await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "provider settings could not be loaded");
+                None
+            }
+        };
     while let Some(Ok(message)) = receiver.next().await {
         match message {
             Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
@@ -134,8 +138,22 @@ pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf, mcp_runtime: Mc
                     let model = config.model.clone();
                     let endpoint = config.endpoint.clone();
                     let reasoning_effort = config.reasoning_effort.clone();
-                    if let Some(store) = &secure_store {
-                        let _ = store.save("provider", &config);
+                    if let Err(error) = crate::secure_store::save_json("provider", &config).await {
+                        tracing::error!(%error, "provider settings could not be persisted");
+                        if send(
+                            &mut sender,
+                            ServerMessage::Error {
+                                code: "provider_persist_failed".into(),
+                                message: format!(
+                                    "Provider settings could not be persisted: {error}"
+                                ),
+                            },
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
                     }
                     provider = Some(config);
                     if send(
@@ -178,7 +196,8 @@ pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf, mcp_runtime: Mc
                     name,
                     input,
                 }) => {
-                    let result = execute_tool(&workspace_root, &mcp_runtime, &name, input).await;
+                    let result =
+                        execute_tool(&workspace_root, &mcp_runtime, &name, input, None).await;
                     let (ok, output) = match result {
                         Ok(output) => (true, output),
                         Err(error) => (false, error),
@@ -240,11 +259,45 @@ pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf, mcp_runtime: Mc
     }
 }
 
+#[derive(Clone, Debug)]
+struct ToolTrace {
+    call: serde_json::Value,
+    name: String,
+    output: String,
+    ok: bool,
+}
+
+#[derive(Debug)]
+enum ToolTraceEvent {
+    Started(serde_json::Value),
+    Output { call_id: String, delta: String },
+    Completed(ToolTrace),
+}
+
+#[derive(Clone)]
+struct ToolOutputStream {
+    call_id: String,
+    trace_sender: mpsc::Sender<ToolTraceEvent>,
+}
+
+impl ToolOutputStream {
+    async fn send(&self, delta: String) -> Result<(), String> {
+        self.trace_sender
+            .send(ToolTraceEvent::Output {
+                call_id: self.call_id.clone(),
+                delta,
+            })
+            .await
+            .map_err(|_| "tool lifecycle stream closed".to_owned())
+    }
+}
+
 async fn execute_tool(
     workspace_root: &std::path::Path,
     mcp_runtime: &McpRuntime,
     name: &str,
     input: serde_json::Value,
+    output_stream: Option<ToolOutputStream>,
 ) -> Result<String, String> {
     match name {
         "read" => {
@@ -272,14 +325,15 @@ async fn execute_tool(
             .await
         }
         "bash" | "shell" => {
-            crate::catalog::execute_bash(
-                workspace_root,
-                input
-                    .get("command")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("bash requires command")?,
-            )
-            .await
+            let command = input
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("bash requires command")?;
+            if let Some(output_stream) = output_stream {
+                execute_streaming_bash(workspace_root, command, output_stream).await
+            } else {
+                crate::catalog::execute_bash(workspace_root, command).await
+            }
         }
         "glob" => crate::catalog::execute_glob(
             workspace_root,
@@ -325,17 +379,34 @@ async fn execute_tool(
     }
 }
 
-#[derive(Clone)]
-struct ToolTrace {
-    call: serde_json::Value,
-    name: String,
-    output: String,
-    ok: bool,
-}
-
-enum ToolTraceEvent {
-    Started(serde_json::Value),
-    Completed(ToolTrace),
+async fn execute_streaming_bash(
+    workspace_root: &std::path::Path,
+    command: &str,
+    output_stream: ToolOutputStream,
+) -> Result<String, String> {
+    let (output_sender, mut output_receiver) = mpsc::channel(1);
+    let mut execution = Box::pin(crate::catalog::execute_bash_streaming(
+        workspace_root,
+        command,
+        output_sender,
+    ));
+    let mut output_open = true;
+    loop {
+        tokio::select! {
+            output = output_receiver.recv(), if output_open => {
+                match output {
+                    Some(delta) => output_stream.send(delta).await?,
+                    None => output_open = false,
+                }
+            }
+            result = &mut execution => {
+                while let Ok(delta) = output_receiver.try_recv() {
+                    output_stream.send(delta).await?;
+                }
+                return result;
+            }
+        }
+    }
 }
 
 struct AgentResult {
@@ -361,7 +432,7 @@ where
         },
     )
     .await?;
-    let (trace_sender, mut trace_receiver) = mpsc::unbounded_channel();
+    let (trace_sender, mut trace_receiver) = mpsc::channel(1);
     let mut provider_call = Box::pin(call_openai_compatible(
         config,
         workspace_root,
@@ -421,7 +492,7 @@ where
                     envelope: envelope(
                         run_id,
                         session_id,
-                        2,
+                        sequence,
                         RigaEvent::RunFailed { message: error },
                     ),
                 },
@@ -443,6 +514,7 @@ where
 {
     let event = match event {
         ToolTraceEvent::Started(call) => RigaEvent::ToolCallStarted { call },
+        ToolTraceEvent::Output { call_id, delta } => RigaEvent::ToolOutputDelta { call_id, delta },
         ToolTraceEvent::Completed(trace) => {
             let call_id = trace
                 .call
@@ -476,7 +548,7 @@ async fn call_openai_compatible(
     workspace_root: &std::path::Path,
     prompt: &str,
     mcp_runtime: &McpRuntime,
-    trace_sender: mpsc::UnboundedSender<ToolTraceEvent>,
+    trace_sender: mpsc::Sender<ToolTraceEvent>,
 ) -> Result<AgentResult, String> {
     if config.model.to_ascii_lowercase().starts_with("gpt-5") {
         return call_responses_api(config, workspace_root, prompt, mcp_runtime, trace_sender).await;
@@ -488,7 +560,7 @@ async fn call_chat_with_tools(
     workspace_root: &std::path::Path,
     prompt: &str,
     mcp_runtime: &McpRuntime,
-    trace_sender: mpsc::UnboundedSender<ToolTraceEvent>,
+    trace_sender: mpsc::Sender<ToolTraceEvent>,
 ) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
@@ -572,8 +644,21 @@ async fn call_chat_with_tools(
             let input: serde_json::Value = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
             let call = serde_json::json!({"call_id": call_id, "name": name, "arguments": input});
-            let _ = trace_sender.send(ToolTraceEvent::Started(call.clone()));
-            let result = execute_tool(workspace_root, mcp_runtime, name, input.clone()).await;
+            trace_sender
+                .send(ToolTraceEvent::Started(call.clone()))
+                .await
+                .map_err(|_| "tool lifecycle stream closed")?;
+            let result = execute_tool(
+                workspace_root,
+                mcp_runtime,
+                name,
+                input.clone(),
+                Some(ToolOutputStream {
+                    call_id: call_id.to_owned(),
+                    trace_sender: trace_sender.clone(),
+                }),
+            )
+            .await;
             let (ok, output) = match result {
                 Ok(output) => (true, output),
                 Err(error) => (false, format!("tool error: {error}")),
@@ -584,7 +669,10 @@ async fn call_chat_with_tools(
                 output: output.clone(),
                 ok,
             };
-            let _ = trace_sender.send(ToolTraceEvent::Completed(trace));
+            trace_sender
+                .send(ToolTraceEvent::Completed(trace))
+                .await
+                .map_err(|_| "tool lifecycle stream closed")?;
             messages.push(
                 serde_json::json!({ "role": "tool", "tool_call_id": call_id, "content": output }),
             );
@@ -598,7 +686,7 @@ async fn call_responses_api(
     workspace_root: &std::path::Path,
     prompt: &str,
     mcp_runtime: &McpRuntime,
-    trace_sender: mpsc::UnboundedSender<ToolTraceEvent>,
+    trace_sender: mpsc::Sender<ToolTraceEvent>,
 ) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
@@ -691,8 +779,21 @@ async fn call_responses_api(
                 .unwrap_or("tool-call");
             let call_json =
                 serde_json::json!({"call_id": call_id, "name": name, "arguments": input_value});
-            let _ = trace_sender.send(ToolTraceEvent::Started(call_json.clone()));
-            let result = execute_tool(workspace_root, mcp_runtime, name, input_value.clone()).await;
+            trace_sender
+                .send(ToolTraceEvent::Started(call_json.clone()))
+                .await
+                .map_err(|_| "tool lifecycle stream closed")?;
+            let result = execute_tool(
+                workspace_root,
+                mcp_runtime,
+                name,
+                input_value.clone(),
+                Some(ToolOutputStream {
+                    call_id: call_id.to_owned(),
+                    trace_sender: trace_sender.clone(),
+                }),
+            )
+            .await;
             let (ok, output) = match result {
                 Ok(output) => (true, output),
                 Err(error) => (false, format!("tool error: {error}")),
@@ -703,7 +804,10 @@ async fn call_responses_api(
                 output: output.clone(),
                 ok,
             };
-            let _ = trace_sender.send(ToolTraceEvent::Completed(trace));
+            trace_sender
+                .send(ToolTraceEvent::Completed(trace))
+                .await
+                .map_err(|_| "tool lifecycle stream closed")?;
             outputs.push(serde_json::json!({"type":"function_call_output", "call_id": call_id, "output": output}));
         }
         input = serde_json::Value::Array(outputs);

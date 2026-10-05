@@ -5,6 +5,8 @@ use aes_gcm::{
 use sha2::{Digest, Sha256};
 use std::{fs, path::PathBuf};
 
+use sqlx::Row;
+
 #[derive(Clone)]
 pub struct SecureStore {
     root: PathBuf,
@@ -80,6 +82,156 @@ pub fn database_backend() -> &'static str {
         Ok(_) => "unsupported",
         Err(_) => "encrypted-file",
     }
+}
+
+fn data_root() -> PathBuf {
+    std::env::var_os("RIGA_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/riga"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".riga-data"))
+}
+
+/// Loads application state from the configured database, encrypted file store, or a local
+/// JSON file when no encryption token has been configured yet.
+pub async fn load_json<T: serde::de::DeserializeOwned>(name: &str) -> Result<Option<T>, String> {
+    if let Some(url) = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return load_database(&url, name).await;
+    }
+    if let Some(store) = SecureStore::from_env() {
+        return store.load(name);
+    }
+    let path = data_root().join(format!("{name}.json"));
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Saves application state to the configured database, encrypted file store, or a local
+/// JSON file when no encryption token has been configured yet.
+pub async fn save_json<T: serde::Serialize>(name: &str, value: &T) -> Result<(), String> {
+    if let Some(url) = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return save_database(&url, name, value).await;
+    }
+    if let Some(store) = SecureStore::from_env() {
+        return store.save(name, value);
+    }
+    let root = data_root();
+    fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+    let temp = root.join(format!(".{name}.tmp"));
+    let path = root.join(format!("{name}.json"));
+    fs::write(
+        &temp,
+        serde_json::to_vec_pretty(value).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    fs::rename(temp, path).map_err(|error| error.to_string())
+}
+
+async fn load_database<T: serde::de::DeserializeOwned>(
+    url: &str,
+    name: &str,
+) -> Result<Option<T>, String> {
+    match database_backend() {
+        "sqlite" => {
+            let pool = sqlx::SqlitePool::connect(url)
+                .await
+                .map_err(|error| error.to_string())?;
+            sqlx::query("CREATE TABLE IF NOT EXISTS riga_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .execute(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            let row = sqlx::query("SELECT value FROM riga_settings WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            row.map(|value| {
+                value
+                    .try_get::<String, _>("value")
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?
+            .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+            .transpose()
+        }
+        "postgres" => {
+            let pool = sqlx::PgPool::connect(url)
+                .await
+                .map_err(|error| error.to_string())?;
+            sqlx::query("CREATE TABLE IF NOT EXISTS riga_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .execute(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            let row = sqlx::query("SELECT value FROM riga_settings WHERE name = $1")
+                .bind(name)
+                .fetch_optional(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            row.map(|value| {
+                value
+                    .try_get::<String, _>("value")
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?
+            .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+            .transpose()
+        }
+        _ => Err("DATABASE_URL must use sqlite:, postgres:, or postgresql:".into()),
+    }
+}
+
+async fn save_database<T: serde::Serialize>(
+    url: &str,
+    name: &str,
+    value: &T,
+) -> Result<(), String> {
+    let serialized = serde_json::to_string(value).map_err(|error| error.to_string())?;
+    match database_backend() {
+        "sqlite" => {
+            let pool = sqlx::SqlitePool::connect(url)
+                .await
+                .map_err(|error| error.to_string())?;
+            sqlx::query("CREATE TABLE IF NOT EXISTS riga_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .execute(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            sqlx::query("INSERT INTO riga_settings (name, value) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value = excluded.value")
+                .bind(name)
+                .bind(serialized)
+                .execute(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        "postgres" => {
+            let pool = sqlx::PgPool::connect(url)
+                .await
+                .map_err(|error| error.to_string())?;
+            sqlx::query("CREATE TABLE IF NOT EXISTS riga_settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .execute(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+            sqlx::query("INSERT INTO riga_settings (name, value) VALUES ($1, $2) ON CONFLICT(name) DO UPDATE SET value = EXCLUDED.value")
+                .bind(name)
+                .bind(serialized)
+                .execute(&pool)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        _ => return Err("DATABASE_URL must use sqlite:, postgres:, or postgresql:".into()),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
