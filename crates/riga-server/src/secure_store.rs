@@ -47,7 +47,7 @@ impl SecureStore {
         let plaintext = cipher
             .decrypt(Nonce::from_slice(&bytes[..12]), &bytes[12..])
             .map_err(|_| {
-                "encrypted state cannot be decrypted with the current RIGA_TOKEN".to_owned()
+                "encrypted state cannot be decrypted with the configured secret; the encryption key may have changed".to_owned()
             })?;
         serde_json::from_slice(&plaintext)
             .map(Some)
@@ -188,7 +188,7 @@ async fn load_database<T: serde::de::DeserializeOwned>(
             .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
             .transpose()
         }
-        _ => Err("DATABASE_URL must use sqlite:, postgres:, or postgresql:".into()),
+        _ => Err("unsupported database URL scheme; use sqlite:, postgres:, or postgresql:".into()),
     }
 }
 
@@ -229,7 +229,11 @@ async fn save_database<T: serde::Serialize>(
                 .await
                 .map_err(|error| error.to_string())?;
         }
-        _ => return Err("DATABASE_URL must use sqlite:, postgres:, or postgresql:".into()),
+        _ => {
+            return Err(
+                "unsupported database URL scheme; use sqlite:, postgres:, or postgresql:".into(),
+            );
+        }
     }
     Ok(())
 }

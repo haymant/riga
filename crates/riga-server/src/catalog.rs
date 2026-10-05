@@ -407,16 +407,90 @@ pub fn find_agent_profile(name: &str) -> Option<AgentProfile> {
     })
 }
 
+/// The `task` tool: list subagents, dispatch one, or manage durable task
+/// records.
+///
+/// Dispatch is normally intercepted by the run loop (`is_subagent_dispatch`)
+/// and runs a real child; the arm here is only reached when the tool is invoked
+/// directly.
 pub fn execute_task(input: &serde_json::Value) -> Result<String, String> {
     let action = input
         .get("action")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("list");
-    if matches!(action, "agents" | "agent_list" | "dispatch" | "agent") {
-        return execute_agent_action(input, action);
+        .unwrap_or_default();
+    match action {
+        "agents" | "agent_list" => list_agent_profiles(),
+        "dispatch" | "agent" | "run" => dispatch_handoff(input),
+        "list" | "inspect" | "create" | "update" => execute_durable_task(input, action),
+        "" => Err(
+            "task requires an action: \"agents\" lists subagents, \"dispatch\" with `agent` and `prompt` runs one, and create/list/inspect/update manage durable tasks"
+                .into(),
+        ),
+        other => Err(format!(
+            "unknown task action `{other}`. Call task with action \"agents\" to list subagents, or action \"dispatch\" with `agent` and `prompt` to run one."
+        )),
     }
-    let store = crate::secure_store::SecureStore::from_env()
-        .ok_or("task persistence requires RIGA_TOKEN")?;
+}
+
+/// A compact list of the subagent profiles, each with the exact call that runs
+/// it.
+///
+/// The full profile dump was large enough to drown the context and vague enough
+/// that the model read it as "work done", then reported success without ever
+/// writing a file. Naming the dispatch call removes that ambiguity.
+fn list_agent_profiles() -> Result<String, String> {
+    let agents: Vec<serde_json::Value> = agent_profiles()
+        .into_iter()
+        .map(|profile| {
+            serde_json::json!({
+                "name": profile.name,
+                "aliases": profile.aliases,
+                "purpose": profile.purpose,
+                "read_only": profile.read_only,
+                "run_with": format!("task action=dispatch agent={} prompt=<the task>", profile.name),
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&agents).map_err(|error| error.to_string())
+}
+
+/// The direct-call handoff for a dispatch. The run loop intercepts real
+/// dispatches before this, so this is a fallback for a client that calls the
+/// tool itself.
+fn dispatch_handoff(input: &serde_json::Value) -> Result<String, String> {
+    let name = input
+        .get("agent")
+        .or_else(|| input.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("task dispatch requires agent")?;
+    let profile =
+        find_agent_profile(name).ok_or_else(|| format!("unknown agent profile: {name}"))?;
+    let request = input
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    serde_json::to_string_pretty(&serde_json::json!({
+        "dispatch": "accepted",
+        "agent": profile.name,
+        "prompt": request,
+        "handoff": "The parent RIGA run remains responsible for tool execution and approvals."
+    }))
+    .map_err(|error| error.to_string())
+}
+
+/// Durable task records, used for cross-run bookkeeping.
+///
+/// These are optional, so they degrade to a neutral message when the session
+/// has no secure store. The message deliberately does not name an environment
+/// variable: an earlier version said "requires RIGA_TOKEN", the model asked the
+/// user for the token, and then began putting it in tool arguments.
+fn execute_durable_task(input: &serde_json::Value, action: &str) -> Result<String, String> {
+    let Some(store) = crate::secure_store::SecureStore::from_env() else {
+        return Err(
+            "durable task storage is not configured for this session; use the update_plan and update_todos tools for in-run progress instead"
+                .into(),
+        );
+    };
     let mut tasks = store.load::<Vec<RigaTask>>("tasks")?.unwrap_or_default();
     match action {
         "list" => serde_json::to_string_pretty(&tasks).map_err(|error| error.to_string()),
@@ -484,30 +558,6 @@ pub fn execute_task(input: &serde_json::Value) -> Result<String, String> {
         }
         _ => Err("task action must be list, inspect, create, or update".into()),
     }
-}
-
-fn execute_agent_action(input: &serde_json::Value, action: &str) -> Result<String, String> {
-    if matches!(action, "agents" | "agent_list") {
-        return serde_json::to_string_pretty(&agent_profiles()).map_err(|error| error.to_string());
-    }
-    let name = input
-        .get("agent")
-        .or_else(|| input.get("name"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or("task dispatch requires agent")?;
-    let profile =
-        find_agent_profile(name).ok_or_else(|| format!("unknown agent profile: {name}"))?;
-    let request = input
-        .get("prompt")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    serde_json::to_string_pretty(&serde_json::json!({
-        "dispatch": "accepted",
-        "agent": profile,
-        "prompt": request,
-        "handoff": "The parent RIGA run remains responsible for tool execution and approvals."
-    }))
-    .map_err(|error| error.to_string())
 }
 
 fn unix_timestamp() -> u128 {
@@ -883,5 +933,40 @@ mod tests {
         let capped = super::truncate_tool_result(long, 100);
         assert!(capped.contains("… truncated"));
         assert_eq!(capped.lines().next().unwrap().chars().count(), 100);
+    }
+
+    #[test]
+    fn task_lists_agents_compactly_with_how_to_dispatch() {
+        let output = super::execute_task(&serde_json::json!({"action": "agents"})).unwrap();
+        assert!(output.contains("\"name\": \"explore\""), "{output}");
+        assert!(output.contains("action=dispatch"), "{output}");
+        // The full profile dump drowned the context and read as "work done".
+        assert!(!output.contains("system_rules"), "{output}");
+    }
+
+    #[test]
+    fn task_rejects_unknown_and_missing_actions_without_naming_a_secret() {
+        // The reported bug: `action: start` fell through to the persistence
+        // path and reported a missing token, so the model asked the user for it.
+        let unknown = super::execute_task(&serde_json::json!({"action": "start"})).unwrap_err();
+        assert!(unknown.contains("unknown task action"), "{unknown}");
+        assert!(!unknown.contains("RIGA_TOKEN"), "{unknown}");
+
+        let missing = super::execute_task(&serde_json::json!({})).unwrap_err();
+        assert!(missing.contains("requires an action"), "{missing}");
+        assert!(!missing.contains("RIGA_TOKEN"), "{missing}");
+    }
+
+    #[test]
+    fn durable_task_actions_degrade_without_naming_an_env_var() {
+        // With no secure store configured (the test environment), a durable
+        // action must return a neutral message. The old one named RIGA_TOKEN and
+        // the model went looking for the secret.
+        let error = super::execute_task(&serde_json::json!({"action": "list"})).unwrap_err();
+        assert!(!error.contains("RIGA_TOKEN"), "{error}");
+        assert!(
+            error.contains("update_plan") || error.contains("durable task storage"),
+            "{error}"
+        );
     }
 }

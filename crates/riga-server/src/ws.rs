@@ -2246,7 +2246,7 @@ fn tool_schemas() -> Vec<serde_json::Value> {
         ),
         function_schema(
             "task",
-            "Run a specialized subagent to completion and return its result. Use action \"dispatch\" with an agent (explore, plan, build, review) and a prompt; action \"agents\" lists them.",
+            "Run a specialized subagent (action \"dispatch\" with `agent` and `prompt`), list the subagent profiles (action \"agents\"), or manage durable task records (list/inspect/create/update). action \"agents\" only lists; it runs nothing.",
             serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list","inspect","create","update","agents","agent_list","dispatch","agent"]},"agent":{"type":"string","enum":["explore","plan","build","review","scout","planner","executor","worker","reviewer"]},"prompt":{"type":"string"},"description":{"type":"string"},"name":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"task_id":{"type":"string"}},"required":[]}),
         ),
         function_schema(
@@ -2306,12 +2306,14 @@ fn coding_agent_system_prompt(workspace_root: &std::path::Path) -> String {
         "You are RIGA, a coding agent operating inside the configured workspace. \
 For requests that create, modify, inspect, run, or validate software, use the available tools instead of only describing commands or code. \
 Work in small observable steps: inspect first, then make the smallest change, then validate. \
-Never claim a file or command succeeded unless a tool result confirms it.\n\n\
+Never claim a file or command succeeded unless a tool result confirms it. \
+A listing, inspection, or plan is not a change: only a `write`, `bash`, or similar tool result proves a file exists or a command ran. \
+Never put secrets, tokens, or API keys in tool arguments or in your replies; if a tool needs a credential, say so without inventing one.\n\n\
 Tools:\n\
 - `glob` takes a real glob pattern relative to the workspace (`src/**/*.ts`, `apps/*/package.json`). Dependency and build directories are already ignored.\n\
 - `grep` searches file contents; `read` reads one file. Read a file before editing it.\n\
-- `task` dispatches a specialized subagent. Its `action: \"agents\"` form lists them. \
-When the user addresses an agent with `@explore`, `@plan`, `@build`, or `@review`, dispatch that agent with the `task` tool and the matching `agent` argument rather than doing the work yourself when the profile's remit fits.\n\
+- `task` runs a subagent, but only when you call it with `action: \"dispatch\"`, an `agent`, and a `prompt`. The `action: \"agents\"` form only lists profiles — listing agents is not progress, so never report work done because you listed them. \
+When the user addresses an agent with `@explore`, `@plan`, `@build`, or `@review`, dispatch it with `action: \"dispatch\"` and the matching `agent` rather than doing the work yourself when the profile's remit fits.\n\
 - `update_plan` records the checklist you are working through and `update_todos` keeps your working list current. \
 Call `update_plan` once right after exploring, then `update_todos` as work is discovered, started, finished, fails, or is dropped, instead of narrating progress in prose.\n\
 - When the user names a specific MCP server, prefer its qualified tool alias beginning with `mcp_` (for example `mcp_riga_health_stdio_health`) over a built-in.\n\n",
@@ -2322,6 +2324,14 @@ Call `update_plan` once right after exploring, then `update_todos` as work is di
 That is expected: just call the tool and wait for the result. Never ask the user to approve in chat, \
 and never claim a write or command succeeded before its tool result confirms it. \
 If an approval is denied, adapt or summarize what you completed rather than retrying the same call.\n",
+    );
+    prompt.push_str(
+        "For a request to create an app or service, create the files with `write` and validate with `bash`; \
+do not spend turns enumerating subagents — listing profiles changes nothing.\n",
+    );
+    prompt.push_str(
+        "Your edits land in an isolated git worktree for this session, not the user's working tree. \
+When you finish, name the git branch (`riga/<session>`) and the workspace path above so the user can review and merge the result.\n",
     );
     prompt.push_str(
         "Keep the final response concise and summarize the actual files and validation results.",
@@ -2582,7 +2592,7 @@ mod tests {
             "prompt": "Create an Express health server"
         }))
         .unwrap();
-        assert!(dispatch.contains("\"name\": \"build\""));
+        assert!(dispatch.contains("\"agent\": \"build\""));
         assert!(dispatch.contains("Create an Express health server"));
     }
 
