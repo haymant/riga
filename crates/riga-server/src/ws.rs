@@ -77,21 +77,6 @@ pub enum ServerMessage {
     },
 }
 
-#[derive(Debug, Deserialize)]
-struct ChatCompletionResponse {
-    choices: Vec<Choice>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Choice {
-    message: ChoiceMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct ChoiceMessage {
-    content: serde_json::Value,
-}
-
 pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf) {
     let (mut sender, mut receiver) = socket.split();
     let secure_store = crate::secure_store::SecureStore::from_env();
@@ -179,9 +164,16 @@ pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf) {
                         let _ = send(&mut sender, ServerMessage::Error { code: "provider_not_configured".into(), message: "Configure an OpenAI-compatible provider in Settings before starting a run.".into() }).await;
                         continue;
                     };
-                    if send_provider_events(&mut sender, &config, &run_id, &session_id, &prompt)
-                        .await
-                        .is_err()
+                    if send_provider_events(
+                        &mut sender,
+                        &config,
+                        &workspace_root,
+                        &run_id,
+                        &session_id,
+                        &prompt,
+                    )
+                    .await
+                    .is_err()
                     {
                         return;
                     }
@@ -289,6 +281,7 @@ async fn execute_tool(
 async fn send_provider_events<S>(
     sender: &mut S,
     config: &ProviderConfig,
+    workspace_root: &std::path::Path,
     run_id: &str,
     session_id: &str,
     prompt: &str,
@@ -303,7 +296,7 @@ where
         },
     )
     .await?;
-    match call_openai_compatible(config, prompt).await {
+    match call_openai_compatible(config, workspace_root, prompt).await {
         Ok(output) => {
             send(
                 sender,
@@ -344,10 +337,22 @@ where
     }
 }
 
-async fn call_openai_compatible(config: &ProviderConfig, prompt: &str) -> Result<String, String> {
+async fn call_openai_compatible(
+    config: &ProviderConfig,
+    workspace_root: &std::path::Path,
+    prompt: &str,
+) -> Result<String, String> {
     if config.model.to_ascii_lowercase().starts_with("gpt-5") {
         return call_responses_api(config, prompt).await;
     }
+    call_chat_with_tools(config, workspace_root, prompt).await
+}
+
+async fn call_chat_with_tools(
+    config: &ProviderConfig,
+    workspace_root: &std::path::Path,
+    prompt: &str,
+) -> Result<String, String> {
     let endpoint = if config
         .endpoint
         .trim_end_matches('/')
@@ -361,38 +366,77 @@ async fn call_openai_compatible(config: &ProviderConfig, prompt: &str) -> Result
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut request = client
-        .post(endpoint)
-        .json(&completion_request_body(&config.model, prompt));
-    if !config.api_key.trim().is_empty() {
-        request = request.bearer_auth(&config.api_key);
+    let mut messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
+    for _ in 0..6 {
+        let mut request = client
+            .post(&endpoint)
+            .json(&completion_request_body_with_messages(
+                &config.model,
+                &messages,
+            ));
+        if !config.api_key.trim().is_empty() {
+            request = request.bearer_auth(&config.api_key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| format!("provider connection failed: {e}"))?;
+        let status = response.status();
+        let body = response.text().await.map_err(|e| e.to_string())?;
+        if !status.is_success() {
+            return Err(format!(
+                "provider returned HTTP {status}: {}",
+                redact_body(&body)
+            ));
+        }
+        let value: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("invalid provider response: {e}"))?;
+        let message = value
+            .get("choices")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("message"))
+            .cloned()
+            .ok_or_else(|| "provider returned no choices".to_owned())?;
+        let tool_calls = message
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if tool_calls.is_empty() {
+            return message
+                .get("content")
+                .and_then(content_text)
+                .ok_or_else(|| "provider returned no assistant text".to_owned());
+        }
+        messages.push(message);
+        for tool_call in tool_calls {
+            let call_id = tool_call
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool-call");
+            let function = tool_call
+                .get("function")
+                .ok_or("provider returned malformed tool call")?;
+            let name = function
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("provider tool call has no name")?;
+            let arguments = function
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("{}");
+            let input: serde_json::Value = serde_json::from_str(arguments)
+                .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
+            let output = execute_tool(workspace_root, name, input)
+                .await
+                .unwrap_or_else(|error| format!("tool error: {error}"));
+            messages.push(
+                serde_json::json!({ "role": "tool", "tool_call_id": call_id, "content": output }),
+            );
+        }
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("provider connection failed: {e}"))?;
-    let status = response.status();
-    let body = response.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        let hint = if status == reqwest::StatusCode::FORBIDDEN {
-            " Check that this API key is authorized for the selected model and that the provider account permits inference."
-        } else if status == reqwest::StatusCode::UNAUTHORIZED {
-            " Check that the API key is valid and has not expired."
-        } else {
-            ""
-        };
-        return Err(format!(
-            "provider returned HTTP {status}:{hint} {}",
-            redact_body(&body),
-        ));
-    }
-    let completion: ChatCompletionResponse =
-        serde_json::from_str(&body).map_err(|e| format!("invalid provider response: {e}"))?;
-    completion
-        .choices
-        .first()
-        .and_then(|choice| content_text(&choice.message.content))
-        .ok_or_else(|| "provider returned no choices".into())
+    Err("provider exceeded the maximum tool-call turns".into())
 }
 
 async fn call_responses_api(config: &ProviderConfig, prompt: &str) -> Result<String, String> {
@@ -461,13 +505,66 @@ async fn call_responses_api(config: &ProviderConfig, prompt: &str) -> Result<Str
     Ok(output)
 }
 
-fn completion_request_body(model: &str, prompt: &str) -> serde_json::Value {
+fn completion_request_body_with_messages(
+    model: &str,
+    messages: &[serde_json::Value],
+) -> serde_json::Value {
     serde_json::json!({
         "model": model,
-        "messages": [{ "role": "user", "content": prompt }],
+        "messages": messages,
         "stream": false,
         "max_completion_tokens": 2048,
+        "tools": tool_schemas(),
+        "tool_choice": "auto",
     })
+}
+
+fn tool_schemas() -> Vec<serde_json::Value> {
+    vec![
+        function_schema(
+            "read",
+            "Read a UTF-8 file inside the workspace",
+            serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        ),
+        function_schema(
+            "write",
+            "Write a UTF-8 file; requires approval and the server write gate",
+            serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}),
+        ),
+        function_schema(
+            "glob",
+            "Find workspace files by suffix pattern",
+            serde_json::json!({"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}),
+        ),
+        function_schema(
+            "grep",
+            "Search text in workspace files",
+            serde_json::json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}),
+        ),
+        function_schema(
+            "web",
+            "Fetch a public HTTPS page",
+            serde_json::json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}),
+        ),
+        function_schema(
+            "bash",
+            "Run a workspace shell command; disabled unless explicitly enabled",
+            serde_json::json!({"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}),
+        ),
+        function_schema(
+            "skill",
+            "Load a repository skill document",
+            serde_json::json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+        ),
+    ]
+}
+
+fn function_schema(
+    name: &str,
+    description: &str,
+    parameters: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({"type":"function","function":{"name":name,"description":description,"parameters":parameters}})
 }
 
 fn content_text(content: &serde_json::Value) -> Option<String> {
@@ -540,7 +637,10 @@ mod tests {
 
     #[test]
     fn completion_request_uses_strict_max_completion_tokens() {
-        let body = super::completion_request_body("gpt-5-nano", "hello");
+        let body = super::completion_request_body_with_messages(
+            "gpt-5-nano",
+            &[serde_json::json!({"role": "user", "content": "hello"})],
+        );
         assert_eq!(body["max_completion_tokens"], 2048);
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["model"], "gpt-5-nano");
