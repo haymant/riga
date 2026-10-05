@@ -205,6 +205,7 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 
 /* assistant-ui tool-use vocabulary: tool group, timeline, terminal block, and lifecycle states */
 .tool-timeline { margin-left: 39px; max-width: 700px; border: 1px solid #303949; background: linear-gradient(145deg, #111722, #0e131b); border-radius: 12px; overflow: hidden; box-shadow: 0 12px 30px rgba(0,0,0,.14); }
+.tool-timeline { margin-top: 4px; margin-bottom: 4px; }
 .timeline-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 11px 13px; border-bottom: 1px solid #27303d; background: rgba(33,39,52,.52); }
 .timeline-title { display: flex; align-items: center; gap: 8px; color: #c8d0dc; }
 .timeline-title svg { color: #a78bfa; }
@@ -220,6 +221,8 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 .timeline-rail .tool-card:has(.tool-status.running)::before { background: var(--amber); }
 .timeline-rail .tool-card:has(.tool-status.error)::before { background: #f29a9a; }
 .timeline-rail .tool-card-top { padding: 9px 11px; }
+.timeline-rail .tool-card-top { background: rgba(27, 34, 45, .72); }
+.timeline-rail .tool-card-top:hover { background: rgba(39, 48, 63, .86); }
 .timeline-rail .tool-output { max-height: 180px; overflow: auto; }
 .terminal-output { color: #b9e6ce; background: #0a100f; border-top-color: #213b34; white-space: pre-wrap; }
 .tool-output-label { display: block; margin-bottom: 6px; color: #687587; text-transform: uppercase; letter-spacing: .08em; font-size: 9px; }

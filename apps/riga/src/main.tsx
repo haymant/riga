@@ -383,7 +383,7 @@ function ToolTimeline({ items }: { items: Extract<TranscriptItem, { role: "tool"
 
 function ToolCallView({ item }: { item: Extract<TranscriptItem, { role: "tool" }> }) {
   const terminal = item.name === "bash" || item.name === "shell";
-  return <details className={`tool-card ${terminal ? "terminal-tool" : ""}`} open={item.status !== "done"}>
+  return <details className={`tool-card ${terminal ? "terminal-tool" : ""}`} open>
     <summary className="tool-card-top">
       <div className="tool-symbol"><TerminalSquare size={15} /></div>
       <div><strong>{item.name}</strong><span>{item.command}</span></div>
