@@ -17,6 +17,21 @@ pub enum ProviderKind {
     Local,
 }
 
+/// Which OpenAI API shape a remote provider speaks.
+///
+/// `Chat` is the `/chat/completions` contract that OpenAI-compatible gateways
+/// (OpenCode Go, vLLM, LiteLLM, and most others) implement. `Responses` is
+/// OpenAI's newer `/responses` API. The shape is chosen explicitly rather than
+/// inferred from the model name: a compatible gateway answers `/responses` with
+/// an HTML 404 even for a `gpt-5*` model, so a name prefix is not a safe signal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderApi {
+    #[default]
+    Chat,
+    Responses,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub endpoint: String,
@@ -29,6 +44,9 @@ pub struct ProviderConfig {
     /// for `Local`, which is why the UI can keep sending the same shape.
     #[serde(default)]
     pub kind: ProviderKind,
+    /// Which remote API to call. Ignored when `kind` is `Local`.
+    #[serde(default)]
+    pub api: ProviderApi,
 }
 
 impl ProviderConfig {
@@ -86,6 +104,9 @@ pub enum ServerMessage {
         /// echoed as stored, so a client switching back to remote keeps them,
         /// but they are ignored when this is `local`.
         kind: ProviderKind,
+        /// Which remote API the stored config will call, so the form can show
+        /// the current choice after a reload.
+        api: ProviderApi,
     },
     Event {
         envelope: RigaEventEnvelope,
@@ -153,6 +174,7 @@ pub async fn upgrade(
                                     model: config.model.clone(),
                                     reasoning_effort: config.reasoning_effort.clone(),
                                     kind: config.kind,
+                                    api: config.api,
                                 },
                             )
                             .await
@@ -171,6 +193,7 @@ pub async fn upgrade(
                         let endpoint = config.endpoint.clone();
                         let reasoning_effort = config.reasoning_effort.clone();
                         let kind = config.kind;
+                        let api = config.api;
                         if let Err(error) =
                             crate::secure_store::save_json("provider", &config).await
                         {
@@ -198,6 +221,7 @@ pub async fn upgrade(
                                 model,
                                 reasoning_effort,
                                 kind,
+                                api,
                             },
                         )
                         .await
@@ -632,6 +656,8 @@ fn resolve_run_provider(
             model: "local".into(),
             reasoning_effort: default_reasoning_effort(),
             kind: ProviderKind::Local,
+            // Ignored for a local run; kept explicit so the struct is complete.
+            api: ProviderApi::Chat,
         });
     }
     Err((
@@ -649,7 +675,7 @@ async fn call_openai_compatible(
     local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
 ) -> Result<AgentResult, String> {
     // A local model short-circuits every HTTP path: there is no endpoint to
-    // call and no Responses API, so the gpt-5 branch must not be reached.
+    // call and no Responses API, so the API shape must not be consulted.
     if config.is_local() {
         return call_local_model(
             config,
@@ -661,10 +687,14 @@ async fn call_openai_compatible(
         )
         .await;
     }
-    if config.model.to_ascii_lowercase().starts_with("gpt-5") {
-        return call_responses_api(config, workspace_root, prompt, mcp_runtime, trace_sender).await;
+    match config.api {
+        ProviderApi::Responses => {
+            call_responses_api(config, workspace_root, prompt, mcp_runtime, trace_sender).await
+        }
+        ProviderApi::Chat => {
+            call_chat_with_tools(config, workspace_root, prompt, mcp_runtime, trace_sender).await
+        }
     }
-    call_chat_with_tools(config, workspace_root, prompt, mcp_runtime, trace_sender).await
 }
 async fn call_chat_with_tools(
     config: &ProviderConfig,
@@ -1309,7 +1339,7 @@ fn envelope(run_id: &str, session_id: &str, sequence: u64, event: RigaEvent) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientMessage, ParsedToolCall, ProviderConfig, ProviderKind, ServerMessage,
+        ClientMessage, ParsedToolCall, ProviderApi, ProviderConfig, ProviderKind, ServerMessage,
         parse_local_tool_calls, resolve_run_provider,
     };
     use riga_kernel::events::RigaEvent;
@@ -1347,10 +1377,33 @@ mod tests {
             model: "opencode-go".into(),
             reasoning_effort: "low".into(),
             kind: ProviderKind::Local,
+            api: ProviderApi::Chat,
         })
         .unwrap();
         assert!(local.contains(r#""kind":"local""#), "{local}");
         assert!(local.contains(r#""endpoint":"https://api.example/v1""#));
+    }
+
+    #[test]
+    fn a_gpt5_model_on_a_compatible_endpoint_uses_chat_completions() {
+        // The reported bug: the `gpt-5` name prefix alone selected the Responses
+        // API, and an OpenAI-compatible gateway answered `/responses` with an
+        // HTML 404. The shape is explicit now and defaults to the compatible
+        // chat contract.
+        let config: ProviderConfig = serde_json::from_str(
+            r#"{"endpoint":"https://api.example/v1","api_key":"key","model":"gpt-5-nano"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.api, ProviderApi::Chat);
+    }
+
+    #[test]
+    fn responses_api_is_opt_in_and_survives_a_round_trip() {
+        let config: ProviderConfig = serde_json::from_str(
+            r#"{"endpoint":"https://api.openai.com/v1","api_key":"key","model":"gpt-5-codex","api":"responses"}"#,
+        )
+        .unwrap();
+        assert_eq!(config.api, ProviderApi::Responses);
     }
 
     #[test]
@@ -1464,6 +1517,7 @@ mod tests {
             model: "opencode-go".into(),
             reasoning_effort: "high".into(),
             kind: ProviderKind::Remote,
+            api: ProviderApi::Chat,
         };
         let resolved = resolve_run_provider(Some(&stored), true).expect("stored provider must win");
         assert_eq!(resolved.kind, ProviderKind::Remote);
@@ -1481,6 +1535,7 @@ mod tests {
             model: "local".into(),
             reasoning_effort: "medium".into(),
             kind: ProviderKind::Local,
+            api: ProviderApi::Chat,
         };
         let resolved = resolve_run_provider(Some(&stored), false).expect("passed through");
         assert_eq!(resolved.kind, ProviderKind::Local);

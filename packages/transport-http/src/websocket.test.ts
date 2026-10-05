@@ -68,7 +68,20 @@ describe("RigaWebSocketClient", () => {
     socket.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
     await ready;
     await client.configureProvider("https://api.example/v1", "ephemeral-key", "opencode-go", "low");
-    expect(JSON.parse(socket.sent.at(-1)!)).toEqual({ type: "configure_provider", endpoint: "https://api.example/v1", api_key: "ephemeral-key", model: "opencode-go", reasoning_effort: "low", kind: "remote" });
+    expect(JSON.parse(socket.sent.at(-1)!)).toEqual({ type: "configure_provider", endpoint: "https://api.example/v1", api_key: "ephemeral-key", model: "opencode-go", reasoning_effort: "low", kind: "remote", api: "chat" });
+  });
+
+  it("sends the responses API only when it is selected", async () => {
+    // A `gpt-5*` model name must not imply the Responses API; the caller picks
+    // it explicitly, because a compatible gateway 404s on `/responses`.
+    const socket = new FakeSocket();
+    const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn() });
+    const ready = client.connect();
+    socket.open();
+    socket.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
+    await ready;
+    await client.configureProvider("https://api.openai.com/v1", "k", "gpt-5-codex", "low", "remote", "responses");
+    expect(JSON.parse(socket.sent.at(-1)!).api).toBe("responses");
   });
 
   it("sends kind local so the server runs the in-process GGUF", async () => {
@@ -127,28 +140,30 @@ describe("RigaWebSocketClient", () => {
   });
 });
 
-it("restores provider metadata and the active backend kind without a credential", async () => {
+it("restores provider metadata, kind and api without a credential", async () => {
   const socket = new FakeSocket();
   const restored: string[] = [];
-  const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn(), onProviderConfigured: (endpoint, model, _effort, kind) => restored.push(`${endpoint}|${model}|${kind}`) });
+  const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn(), onProviderConfigured: (endpoint, model, _effort, kind, api) => restored.push(`${endpoint}|${model}|${kind}|${api}`) });
   const ready = client.connect();
   socket.open();
   socket.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
   await ready;
-  socket.receive({ type: "provider_configured", endpoint: "https://api.example/v1", model: "opencode-go", reasoning_effort: "low", kind: "local" });
-  expect(restored).toEqual(["https://api.example/v1|opencode-go|local"]);
+  socket.receive({ type: "provider_configured", endpoint: "https://api.example/v1", model: "opencode-go", reasoning_effort: "low", kind: "local", api: "responses" });
+  expect(restored).toEqual(["https://api.example/v1|opencode-go|local|responses"]);
 });
 
-it("treats a provider frame from an older server as remote", async () => {
-  // `kind` was added after the first release, so a server that omits it must not
-  // be read as local merely because the field is absent.
+it("treats a provider frame from an older server as remote over chat completions", async () => {
+  // `kind` and `api` were added after the first release, so a server that omits
+  // them must not be read as local, nor as the Responses API.
   const socket = new FakeSocket();
   let kind: string | undefined;
-  const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn(), onProviderConfigured: (_endpoint, _model, _effort, value) => { kind = value; } });
+  let api: string | undefined;
+  const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn(), onProviderConfigured: (_endpoint, _model, _effort, value, chosenApi) => { kind = value; api = chosenApi; } });
   const ready = client.connect();
   socket.open();
   socket.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
   await ready;
   socket.receive({ type: "provider_configured", endpoint: "https://api.example/v1", model: "opencode-go", reasoning_effort: "low" });
   expect(kind).toBe("remote");
+  expect(api).toBe("chat");
 });
