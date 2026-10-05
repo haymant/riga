@@ -55,9 +55,20 @@ describe("RigaWebSocketClient", () => {
     await client.cancelRun("run-1");
     expect(socket.sent.slice(1).map((value) => JSON.parse(value))).toEqual([
       { type: "start_run", run_id: "run-1", session_id: "session-1", prompt: "fix tests" },
-      { type: "approval", run_id: "run-1", approval_id: "approval-1", approved: true },
+      { type: "approval", run_id: "run-1", approval_id: "approval-1", approved: true, option: undefined },
       { type: "cancel_run", run_id: "run-1" },
     ]);
+  });
+
+  it("resumes a run from a sequence cursor", async () => {
+    const socket = new FakeSocket();
+    const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn() });
+    const ready = client.connect();
+    socket.open();
+    socket.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
+    await ready;
+    await client.resumeRun("run-1", 4);
+    expect(JSON.parse(socket.sent.at(-1)!)).toEqual({ type: "resume_run", run_id: "run-1", after_sequence: 4 });
   });
 
   it("sends provider endpoint, key, and model only in the live socket frame", async () => {

@@ -12,6 +12,7 @@ export type RigaWebSocketClientMessage =
   | { type: "hello"; client_version: string }
   | { type: "configure_provider"; endpoint: string; api_key: string; model: string; reasoning_effort: "low" | "medium" | "high"; kind?: ProviderKind; api?: ProviderApi }
   | { type: "start_run"; run_id: string; session_id: string; prompt: string }
+  | { type: "resume_run"; run_id: string; after_sequence: number }
   | { type: "cancel_run"; run_id: string }
   | { type: "approval"; run_id: string; approval_id: string; approved: boolean; option?: "once" | "always" }
   | { type: "ping"; nonce: string };
@@ -115,6 +116,17 @@ export class RigaWebSocketClient {
   async startRun(runId: string, sessionId: string, prompt: string): Promise<void> {
     await this.connect();
     this.send({ type: "start_run", run_id: runId, session_id: sessionId, prompt });
+  }
+
+  /**
+   * Replay a run's events after a sequence cursor.
+   *
+   * A client that disconnected mid-run reconnects, then calls this with the last
+   * sequence it saw to catch up without re-running the agent.
+   */
+  async resumeRun(runId: string, afterSequence: number): Promise<void> {
+    await this.connect();
+    this.send({ type: "resume_run", run_id: runId, after_sequence: afterSequence });
   }
 
   async configureProvider(endpoint: string, apiKey: string, model: string, reasoningEffort: "low" | "medium" | "high", kind: ProviderKind = "remote", api: ProviderApi = "chat"): Promise<void> {

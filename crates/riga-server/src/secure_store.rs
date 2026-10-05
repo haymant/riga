@@ -84,7 +84,7 @@ pub fn database_backend() -> &'static str {
     }
 }
 
-fn data_root() -> PathBuf {
+pub(crate) fn data_root() -> PathBuf {
     std::env::var_os("RIGA_DATA_DIR")
         .map(PathBuf::from)
         .or_else(|| {

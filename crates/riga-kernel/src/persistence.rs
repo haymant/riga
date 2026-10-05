@@ -96,6 +96,13 @@ pub struct EventJournal {
 impl EventJournal {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, RigaError> {
         let path = path.into();
+        // Create the parent so a journal under a fresh `runs/` directory works
+        // without the caller having to provision it.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|error| persistence_error(error.to_string()))?;
+        }
         let events = if path.exists() {
             read_json(&path)?
         } else {
@@ -197,6 +204,17 @@ mod tests {
         assert_eq!(journal.all().len(), 2);
         assert_eq!(journal.after_sequence(1).len(), 1);
         let _ = std::fs::remove_file(root);
+    }
+
+    #[test]
+    fn journal_open_creates_missing_parent_directories() {
+        // A run journal lives under `runs/`, which does not exist yet.
+        let root = temp_dir("journal-parents");
+        let journal_path = root.join("runs").join("run-1.json");
+        let mut journal = EventJournal::open(&journal_path).unwrap();
+        journal.append(event("one", 1)).unwrap();
+        assert!(journal_path.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

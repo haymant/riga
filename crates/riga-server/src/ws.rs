@@ -264,6 +264,13 @@ pub enum ClientMessage {
         session_id: String,
         prompt: String,
     },
+    /// Replay the events of a run after a cursor, for a client that
+    /// disconnected mid-run and wants to catch up.
+    ResumeRun {
+        run_id: String,
+        #[serde(default)]
+        after_sequence: u64,
+    },
     CancelRun {
         run_id: String,
     },
@@ -458,6 +465,37 @@ pub async fn upgrade(
                     }
                     Ok(ClientMessage::CancelRun { run_id }) => {
                         let _ = send(&mut sender, ServerMessage::RunCancelled { run_id }).await;
+                    }
+                    Ok(ClientMessage::ResumeRun {
+                        run_id,
+                        after_sequence,
+                    }) => {
+                        // Replay a run's journaled events from the client's
+                        // cursor, so a reconnect catches up without re-running.
+                        match riga_kernel::persistence::EventJournal::open(run_journal_path(
+                            &run_id,
+                        )) {
+                            Ok(journal) => {
+                                for replay in journal.after_sequence(after_sequence) {
+                                    if send(&mut sender, ServerMessage::Event { envelope: replay })
+                                        .await
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = send(
+                                    &mut sender,
+                                    ServerMessage::Error {
+                                        code: "run_resume_failed".into(),
+                                        message: error.message,
+                                    },
+                                )
+                                .await;
+                            }
+                        }
                     }
                     Ok(ClientMessage::ToolCall {
                         call_id,
@@ -805,11 +843,13 @@ async fn send_provider_events<S>(
 where
     S: SinkExt<Message> + Unpin,
 {
-    send(
+    // Durable journal for this run. Reopened per run; appends are idempotent on
+    // `event_id`, so a retried frame cannot duplicate.
+    let mut journal = riga_kernel::persistence::EventJournal::open(run_journal_path(run_id)).ok();
+    emit_event(
         sender,
-        ServerMessage::Event {
-            envelope: envelope(run_id, session_id, 1, RigaEvent::RunStarted),
-        },
+        &mut journal,
+        envelope(run_id, session_id, 1, RigaEvent::RunStarted),
     )
     .await?;
     let (trace_sender, mut trace_receiver) = mpsc::channel(1);
@@ -859,7 +899,7 @@ where
         tokio::select! {
             trace = trace_receiver.recv() => {
                 if let Some(trace) = trace {
-                    send_tool_event(sender, run_id, session_id, &mut sequence, trace).await?;
+                    send_tool_event(sender, &mut journal, run_id, session_id, &mut sequence, trace).await?;
                 }
             }
             // While the run is suspended on an approval, keep reading so the
@@ -884,6 +924,15 @@ where
                                 // message is consumed here so it cannot be
                                 // mistaken for a protocol error mid-run.
                             }
+                            Ok(ClientMessage::ResumeRun { run_id: resume_id, after_sequence }) => {
+                                // A client catching up mid-run: replay from the
+                                // journal it already has.
+                                if let Ok(existing) = riga_kernel::persistence::EventJournal::open(run_journal_path(&resume_id)) {
+                                    for replay in existing.after_sequence(after_sequence) {
+                                        let _ = send(sender, ServerMessage::Event { envelope: replay }).await;
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -898,52 +947,57 @@ where
         }
     };
     while let Ok(trace) = trace_receiver.try_recv() {
-        send_tool_event(sender, run_id, session_id, &mut sequence, trace).await?;
+        send_tool_event(
+            sender,
+            &mut journal,
+            run_id,
+            session_id,
+            &mut sequence,
+            trace,
+        )
+        .await?;
     }
     match result {
         Ok(result) => {
-            send(
+            emit_event(
                 sender,
-                ServerMessage::Event {
-                    envelope: envelope(
-                        run_id,
-                        session_id,
-                        sequence,
-                        RigaEvent::TextDelta {
-                            delta: result.output.clone(),
-                        },
-                    ),
-                },
+                &mut journal,
+                envelope(
+                    run_id,
+                    session_id,
+                    sequence,
+                    RigaEvent::TextDelta {
+                        delta: result.output.clone(),
+                    },
+                ),
             )
             .await?;
             let output = result.output;
-            send(
+            emit_event(
                 sender,
-                ServerMessage::Event {
-                    envelope: envelope(
-                        run_id,
-                        session_id,
-                        sequence + 1,
-                        RigaEvent::RunCompleted {
-                            output: output.clone(),
-                        },
-                    ),
-                },
+                &mut journal,
+                envelope(
+                    run_id,
+                    session_id,
+                    sequence + 1,
+                    RigaEvent::RunCompleted {
+                        output: output.clone(),
+                    },
+                ),
             )
             .await?;
             Ok(Some(output))
         }
         Err(error) => {
-            send(
+            emit_event(
                 sender,
-                ServerMessage::Event {
-                    envelope: envelope(
-                        run_id,
-                        session_id,
-                        sequence,
-                        RigaEvent::RunFailed { message: error },
-                    ),
-                },
+                &mut journal,
+                envelope(
+                    run_id,
+                    session_id,
+                    sequence,
+                    RigaEvent::RunFailed { message: error },
+                ),
             )
             .await?;
             Ok(None)
@@ -979,6 +1033,7 @@ async fn append_turns(
 
 async fn send_tool_event<S>(
     sender: &mut S,
+    journal: &mut Option<riga_kernel::persistence::EventJournal>,
     run_id: &str,
     session_id: &str,
     sequence: &mut u64,
@@ -1008,11 +1063,10 @@ where
         }
         ToolTraceEvent::Ui(event) => event,
     };
-    send(
+    emit_event(
         sender,
-        ServerMessage::Event {
-            envelope: envelope(run_id, session_id, *sequence, event),
-        },
+        journal,
+        envelope(run_id, session_id, *sequence, event),
     )
     .await?;
     *sequence += 1;
@@ -2067,6 +2121,46 @@ fn envelope(run_id: &str, session_id: &str, sequence: u64, event: RigaEvent) -> 
         timestamp: "now".into(),
         event,
     }
+}
+
+/// Sanitize a client-supplied run id into a safe file-name component.
+fn sanitize_run_id(run_id: &str) -> String {
+    run_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Durable journal for one run, under the data directory.
+fn run_journal_path(run_id: &str) -> std::path::PathBuf {
+    crate::secure_store::data_root()
+        .join("runs")
+        .join(format!("run-{}.json", sanitize_run_id(run_id)))
+}
+
+/// Send an event and, when a journal is open, durably record it first so a
+/// reconnect can replay it. A journal failure is logged, never fatal: losing
+/// durability is worse than losing the run, but not worse than losing the run.
+async fn emit_event<S>(
+    sender: &mut S,
+    journal: &mut Option<riga_kernel::persistence::EventJournal>,
+    envelope: RigaEventEnvelope,
+) -> Result<(), S::Error>
+where
+    S: SinkExt<Message> + Unpin,
+{
+    if let Some(journal) = journal.as_mut()
+        && let Err(error) = journal.append(envelope.clone())
+    {
+        tracing::warn!(?error, "run event could not be journaled");
+    }
+    send(sender, ServerMessage::Event { envelope }).await
 }
 
 #[cfg(test)]
