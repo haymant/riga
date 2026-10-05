@@ -76,6 +76,9 @@ struct RunEvidence {
     /// Set once any workspace-write or process-execution tool succeeds, in this
     /// loop or any subagent's, so a child's work counts toward the parent.
     mutated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set once any token was streamed to the client, so the final `RunCompleted`
+    /// path does not resend the whole reply as one delta on top of it.
+    streamed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RunEvidence {
@@ -90,6 +93,89 @@ impl RunEvidence {
 
     fn has_work(&self) -> bool {
         self.mutated.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn streamed(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.streamed.clone()
+    }
+
+    fn was_streamed(&self) -> bool {
+        self.streamed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Forwards local-model tokens to the UI as they are decoded, without leaking
+/// the `<tool_call>` block into the visible transcript.
+///
+/// A turn is either prose or a single tool call, and that cannot be known until
+/// enough of the turn has arrived. The opening bytes are therefore held back and
+/// then either streamed once the marker is ruled out, or dropped once it is
+/// recognised. Sends block, because this runs on the generation thread and the
+/// read loop drains the channel.
+struct LocalDeltaStream {
+    sender: mpsc::Sender<ToolTraceEvent>,
+    pending: String,
+    /// `None` until the turn's shape is known; `Some(true)` prose, `Some(false)`
+    /// a tool call.
+    decided: Option<bool>,
+    streamed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LocalDeltaStream {
+    const MARKER: &'static str = "<tool_call>";
+
+    fn new(
+        sender: mpsc::Sender<ToolTraceEvent>,
+        streamed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            sender,
+            pending: String::new(),
+            decided: None,
+            streamed,
+        }
+    }
+
+    fn push(&mut self, delta: &str) {
+        match self.decided {
+            Some(true) => self.emit(delta),
+            Some(false) => {}
+            None => {
+                self.pending.push_str(delta);
+                let trimmed = self.pending.trim_start();
+                if trimmed.starts_with(Self::MARKER) {
+                    self.decided = Some(false);
+                    self.pending.clear();
+                } else if trimmed.len() >= Self::MARKER.len() || !Self::MARKER.starts_with(trimmed)
+                {
+                    self.decided = Some(true);
+                    let buffered = std::mem::take(&mut self.pending);
+                    self.emit(&buffered);
+                }
+            }
+        }
+    }
+
+    /// Flush a still-undecided short turn as prose when generation ends.
+    fn finish(&mut self) {
+        if self.decided.is_none() {
+            self.decided = Some(true);
+            let buffered = std::mem::take(&mut self.pending);
+            self.emit(&buffered);
+        }
+    }
+
+    fn emit(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.streamed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.sender.blocking_send(ToolTraceEvent::Ui(
+            riga_kernel::events::RigaEvent::TextDelta {
+                delta: delta.to_owned(),
+            },
+        ));
     }
 }
 
@@ -783,20 +869,14 @@ async fn execute_tool(
         "read" => {
             crate::catalog::execute_read(
                 workspace_root,
-                input
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("read requires path")?,
+                path_arg(&input).ok_or("read requires path")?,
             )
             .await
         }
         "write" => {
             crate::catalog::execute_write(
                 workspace_root,
-                input
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("write requires path")?,
+                path_arg(&input).ok_or("write requires path")?,
                 input
                     .get("content")
                     .and_then(serde_json::Value::as_str)
@@ -894,6 +974,17 @@ async fn execute_tool(
         }
         _ => mcp_runtime.execute(name, &input).await,
     }
+}
+
+/// The path a file tool was asked to act on.
+///
+/// Small local models routinely emit `file` or `filename` instead of `path`, and
+/// a strict read made the write fail silently in the transcript that prompted
+/// this. The canonical key is preferred; the rest are accepted.
+fn path_arg(input: &serde_json::Value) -> Option<&str> {
+    ["path", "file", "filename", "file_path"]
+        .into_iter()
+        .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
 }
 
 async fn execute_streaming_bash(
@@ -1092,19 +1183,24 @@ where
             } else {
                 result.output
             };
-            emit_event(
-                sender,
-                &mut journal,
-                envelope(
-                    run_id,
-                    session_id,
-                    sequence,
-                    RigaEvent::TextDelta {
-                        delta: output.clone(),
-                    },
-                ),
-            )
-            .await?;
+            // When the model streamed token by token, the reply is already in the
+            // client; resending it as one delta would duplicate it. A provider
+            // that answers in one piece still needs this delta.
+            if !evidence.was_streamed() {
+                emit_event(
+                    sender,
+                    &mut journal,
+                    envelope(
+                        run_id,
+                        session_id,
+                        sequence,
+                        RigaEvent::TextDelta {
+                            delta: output.clone(),
+                        },
+                    ),
+                )
+                .await?;
+            }
             emit_event(
                 sender,
                 &mut journal,
@@ -1835,6 +1931,12 @@ fn subagent_model_for(config: &ProviderConfig, profile: &crate::catalog::AgentPr
 }
 const LOCAL_MAX_TURNS: usize = 8;
 
+/// How many times a local turn is asked to re-emit an unparseable tool call.
+const MAX_TOOL_CALL_RETRIES: usize = 2;
+
+const LOCAL_TOOL_CALL_RETRY: &str = "Your reply contained a <tool_call> block that was not valid JSON; it was probably cut off. \
+Reply with exactly ONE smaller tool call whose <tool_call> block is valid JSON. Prefer several small `write` calls over one large one.";
+
 /// Tokens requested per local turn before `resolve_max_tokens` shrinks it to the
 /// room the prompt leaves. Deliberately modest: a 1.5B model at 4k tokens on CPU
 /// is minutes of work, and the tool loop re-decodes the history every turn.
@@ -1998,6 +2100,9 @@ async fn run_local_loop(
     });
     let mut final_text = String::new();
     let mut nudges = 0usize;
+    // Bounded, so a model stuck on an unparseable tool call cannot spend the
+    // whole turn budget regenerating.
+    let mut tool_call_retries = 0usize;
     for turn in 0..LOCAL_MAX_TURNS {
         // Generation is blocking C, so it runs on the blocking pool. The future
         // is awaited directly: nothing else in this task needs the executor, and
@@ -2008,17 +2113,49 @@ async fn run_local_loop(
         // call site), so it is currently always false; passing it explicitly
         // keeps the generate contract intact for when cancellation is wired.
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let text = tokio::task::spawn_blocking(move || {
-            runtime.generate(&request, LOCAL_MAX_TOKENS, &cancel, |_delta| {})
+        // Stream this turn's tokens as they decode, keeping the tool-call block
+        // out of the visible reply.
+        let stream_sender = trace_sender.clone();
+        let streamed_flag = evidence.streamed();
+        let generated = tokio::task::spawn_blocking(move || {
+            let mut stream = LocalDeltaStream::new(stream_sender, streamed_flag);
+            let result = runtime.generate(&request, LOCAL_MAX_TOKENS, &cancel, |delta| {
+                stream.push(delta)
+            });
+            stream.finish();
+            result
         })
         .await
         .map_err(|error| format!("local inference worker failed: {error}"))??;
+        let text = generated.text;
+        let truncated = generated.truncated;
         let (prose, tool_calls) = parse_local_tool_calls(&text);
         if !prose.is_empty() {
             final_text = prose.clone();
         }
         if tool_calls.is_empty() {
-            let answer = if final_text.is_empty() {
+            // A `<tool_call>` block that did not parse is usually cut off at the
+            // token cap, or invalid JSON. Tell the model and let it retry a
+            // smaller call, rather than showing the raw block as the answer.
+            if text.contains("<tool_call>") {
+                if tool_call_retries < MAX_TOOL_CALL_RETRIES {
+                    tool_call_retries += 1;
+                    messages.push(crate::local_model::ChatMessage {
+                        role: "assistant".into(),
+                        content: text.clone(),
+                    });
+                    messages.push(crate::local_model::ChatMessage {
+                        role: "user".into(),
+                        content: LOCAL_TOOL_CALL_RETRY.into(),
+                    });
+                    continue;
+                }
+                return Err(
+                    "the local model kept emitting a tool call that is not valid JSON; it may need a larger output limit or a smaller request"
+                        .into(),
+                );
+            }
+            let mut answer = if final_text.is_empty() {
                 text.clone()
             } else {
                 final_text.clone()
@@ -2034,6 +2171,11 @@ async fn run_local_loop(
                     content: CLAIM_NUDGE.into(),
                 });
                 continue;
+            }
+            if truncated {
+                answer.push_str(&format!(
+                    "\n\n[truncated] The local model reached its {LOCAL_MAX_TOKENS}-token output limit, so this reply is cut off."
+                ));
             }
             return Ok(AgentResult { output: answer });
         }
@@ -3240,5 +3382,68 @@ mod tests {
         assert!(!evidence.has_work());
         evidence.record("bash", true);
         assert!(evidence.has_work());
+    }
+
+    #[test]
+    fn path_arguments_accept_the_aliases_small_models_emit() {
+        assert_eq!(
+            super::path_arg(&serde_json::json!({"path": "a"})),
+            Some("a")
+        );
+        assert_eq!(
+            super::path_arg(&serde_json::json!({"file": "b"})),
+            Some("b")
+        );
+        assert_eq!(
+            super::path_arg(&serde_json::json!({"filename": "c"})),
+            Some("c")
+        );
+        assert_eq!(
+            super::path_arg(&serde_json::json!({"file_path": "d"})),
+            Some("d")
+        );
+        // Canonical key wins when both are present.
+        assert_eq!(
+            super::path_arg(&serde_json::json!({"path": "a", "file": "b"})),
+            Some("a")
+        );
+        assert_eq!(super::path_arg(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn local_stream_forwards_prose_and_keeps_tool_calls_out() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let drain = |mut receiver: mpsc::Receiver<super::ToolTraceEvent>| {
+            let mut text = String::new();
+            while let Ok(event) = receiver.try_recv() {
+                if let super::ToolTraceEvent::Ui(RigaEvent::TextDelta { delta }) = event {
+                    text.push_str(&delta);
+                }
+            }
+            text
+        };
+
+        // Prose streams, including a short turn held back until it settles.
+        let (sender, receiver) = mpsc::channel(16);
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut stream = super::LocalDeltaStream::new(sender, flag.clone());
+        stream.push("The answer is ");
+        stream.push("42.");
+        stream.finish();
+        assert_eq!(drain(receiver), "The answer is 42.");
+        assert!(flag.load(Ordering::Relaxed), "streaming must be recorded");
+
+        // A tool-call turn is not shown at all, and must not mark the run as
+        // streamed (the tool result is what carries it).
+        let (sender, receiver) = mpsc::channel(16);
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut stream = super::LocalDeltaStream::new(sender, flag.clone());
+        stream.push("<tool_call>{\"name\":\"read\",");
+        stream.push("\"arguments\":{\"path\":\"a\"}}</tool_call>");
+        stream.finish();
+        assert_eq!(drain(receiver), "");
+        assert!(!flag.load(Ordering::Relaxed));
     }
 }

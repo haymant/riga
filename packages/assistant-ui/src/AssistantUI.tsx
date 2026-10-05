@@ -350,6 +350,19 @@ function AssistantUIInner({
           // Flush before marking the run done, otherwise the tail of the reply
           // would sit in the buffer until the next frame after the spinner stops.
           flushStreamedText();
+          // The final output is authoritative: a streamed reply is replaced with
+          // it so any post-hoc note (a verification or truncation marker) shows.
+          const finalOutput = (event as { RunCompleted: { output: string } }).RunCompleted.output;
+          const finalId = `stream-${envelope.run_id}`;
+          setTranscript((current) => {
+            const at = current.findIndex((item) => item.id === finalId);
+            if (at < 0) return current;
+            const item = current[at] as Extract<TranscriptItem, { role: "assistant" | "user" | "system" }>;
+            if (item.text === finalOutput) return current;
+            const next = [...current];
+            next[at] = { ...item, text: finalOutput };
+            return next;
+          });
           activeRunIdRef.current = null;
           setIsRunning(false);
         } else if (typeof event === "object" && event !== null && "RunFailed" in event) {

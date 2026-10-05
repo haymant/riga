@@ -659,7 +659,7 @@ impl LocalModelRuntime {
         max_tokens: u32,
         cancel: &AtomicBool,
         mut on_delta: F,
-    ) -> Result<String, String>
+    ) -> Result<Generated, String>
     where
         F: FnMut(&str),
     {
@@ -750,13 +750,19 @@ impl LocalModelRuntime {
         // `prompt_len` and advances by one per sampled token. i32 because that is
         // what `LlamaBatch::add` takes for a position.
         let prompt_len = tokens.len() as i32;
+        // Whether generation ended on purpose (an end token, or a cancellation)
+        // rather than by running out of the token budget. A run that ran out is
+        // cut off mid-thought, which the caller has to know.
+        let mut ended_on_token = false;
         for position in (prompt_len..).take(max_tokens as usize) {
             if cancel.load(Ordering::Relaxed) {
+                ended_on_token = true;
                 break;
             }
             let token = sampler.sample(&context, sample_row);
             sampler.accept(token);
             if loaded.model.vocab().is_eog(token) {
+                ended_on_token = true;
                 break;
             }
             let piece = loaded.model.vocab().token_to_piece(token, true, None);
@@ -779,8 +785,21 @@ impl LocalModelRuntime {
                 .map_err(|error| format!("Token decoding failed: {error}"))?;
             sample_row = 0;
         }
-        Ok(text)
+        Ok(Generated {
+            text,
+            truncated: !ended_on_token,
+        })
     }
+}
+
+/// One local completion.
+#[derive(Debug, Clone)]
+pub struct Generated {
+    pub text: String,
+    /// True when generation stopped at the token cap instead of an end token, so
+    /// `text` is cut off. A cut tool call is not parseable, and a cut answer is
+    /// incomplete; the caller must not present either as a finished result.
+    pub truncated: bool,
 }
 
 fn is_gguf(path: &Path) -> bool {
