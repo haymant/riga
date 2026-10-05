@@ -574,9 +574,15 @@ pub enum ServerMessage {
 
 /// Stream one run's events to a socket until the run ends or the socket drops.
 ///
-/// Replays the journal from `after_sequence` first, then follows the live
-/// broadcast, deduplicating by sequence. Returning does **not** stop the run:
-/// that is what lets a locked phone keep thinking and catch up on unlock.
+/// When `replay` is set, the journal is sent from `after_sequence` first; then
+/// the live broadcast is followed, deduplicating by sequence. `replay` is for a
+/// reconnecting client catching up on a run it has partly seen. A fresh
+/// `start_run` passes `false`: its receiver was subscribed before the run was
+/// spawned, so every frame is already buffered, and replaying the journal (which
+/// omits ephemeral token frames) would only advance the cursor past them.
+///
+/// Returning does **not** stop the run: that is what lets a locked phone keep
+/// thinking and catch up on unlock.
 #[allow(clippy::too_many_arguments)]
 async fn forward_run<S>(
     sender: &mut S,
@@ -584,6 +590,7 @@ async fn forward_run<S>(
     mut upstream: tokio::sync::broadcast::Receiver<RigaEventEnvelope>,
     run_id: &str,
     after_sequence: u64,
+    replay: bool,
     broker: &ApprovalBroker,
     runs: &RunRegistry,
 ) where
@@ -593,7 +600,9 @@ async fn forward_run<S>(
     // Catch up on anything already journaled. The receiver was subscribed before
     // this read, so live frames published meanwhile are buffered, not lost; the
     // sequence guard below drops any that overlap the replay.
-    if let Ok(journal) = riga_kernel::persistence::EventJournal::open(run_journal_path(run_id)) {
+    if replay
+        && let Ok(journal) = riga_kernel::persistence::EventJournal::open(run_journal_path(run_id))
+    {
         for replay in journal.after_sequence(after_sequence) {
             last = last.max(replay.sequence);
             if send(sender, ServerMessage::Event { envelope: replay })
@@ -831,6 +840,7 @@ pub(crate) async fn upgrade(
                                     upstream,
                                     &run_id,
                                     after_sequence,
+                                    true,
                                     &broker,
                                     &runs,
                                 )
@@ -1041,15 +1051,17 @@ pub(crate) async fn upgrade(
                                 runs_task.lock().await.remove(&run_id_task);
                             });
                         }
-                        // Follow the run from the start. If this socket drops,
-                        // only the follow ends; the run keeps going, and the next
-                        // `start_run`/`resume_run` catches up from the journal.
+                        // Follow the run from the start out of the subscription
+                        // buffer (it was taken before the run was spawned, so it
+                        // holds every frame, token deltas included). Replaying the
+                        // journal here would advance the cursor past those deltas.
                         forward_run(
                             &mut sender,
                             &mut receiver,
                             upstream,
                             &run_id,
                             0,
+                            false,
                             &broker,
                             &runs,
                         )

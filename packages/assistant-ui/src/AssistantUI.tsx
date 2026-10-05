@@ -356,7 +356,14 @@ function AssistantUIInner({
           const finalId = `stream-${envelope.run_id}`;
           setTranscript((current) => {
             const at = current.findIndex((item) => item.id === finalId);
-            if (at < 0) return current;
+            // No streamed message means the token frames never reached this
+            // client — a run followed only after a reconnect, because the deltas
+            // are not journaled. Create the message from the completed output
+            // rather than dropping the whole reply.
+            if (at < 0) {
+              if (!finalOutput) return current;
+              return [...current, { id: finalId, role: "assistant", text: finalOutput, time: "now" }];
+            }
             const item = current[at] as Extract<TranscriptItem, { role: "assistant" | "user" | "system" }>;
             if (item.text === finalOutput) return current;
             const next = [...current];
