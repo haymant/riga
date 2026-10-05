@@ -813,16 +813,47 @@ where
     )
     .await?;
     let (trace_sender, mut trace_receiver) = mpsc::channel(1);
-    let mut provider_call = Box::pin(call_openai_compatible(
-        config,
-        workspace_root,
-        prompt,
-        mcp_runtime,
-        trace_sender,
-        local_models,
-        history,
-        broker,
-    ));
+    // A leading `@agent` runs that subagent directly; otherwise the
+    // orchestrator model decides what to do.
+    let mut provider_call: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AgentResult, String>> + Send>,
+    > = if let Some((agent, task)) = leading_agent_mention(prompt) {
+        let workspace = workspace_root.to_path_buf();
+        let config = config.clone();
+        let mcp_runtime = mcp_runtime.clone();
+        let trace = trace_sender.clone();
+        let broker = broker.clone();
+        Box::pin(async move {
+            let input = serde_json::json!({
+                "action": "dispatch",
+                "agent": agent,
+                "prompt": task,
+                "description": task,
+            });
+            dispatch_subagent(
+                &config,
+                &workspace,
+                &input,
+                &mcp_runtime,
+                &trace,
+                0,
+                &broker,
+            )
+            .await
+            .map(|output| AgentResult { output })
+        })
+    } else {
+        Box::pin(call_openai_compatible(
+            config,
+            workspace_root,
+            prompt,
+            mcp_runtime,
+            trace_sender,
+            local_models,
+            history,
+            broker,
+        ))
+    };
     let mut sequence = 2;
     let result = loop {
         tokio::select! {
@@ -1227,6 +1258,10 @@ async fn run_chat_loop(
                 // clear refusal it can adapt to.
                 Err(message) => Err(message),
                 Ok(()) if name == "task" && is_subagent_dispatch(&input) => {
+                    let agent = input
+                        .get("agent")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("subagent");
                     Box::pin(dispatch_subagent(
                         config,
                         workspace_root,
@@ -1237,6 +1272,7 @@ async fn run_chat_loop(
                         broker,
                     ))
                     .await
+                    .map(|output| format!("[{agent} subagent result]\n{output}"))
                 }
                 Ok(()) => {
                     execute_tool(
@@ -1289,6 +1325,23 @@ fn is_subagent_dispatch(input: &serde_json::Value) -> bool {
         .get("agent")
         .and_then(serde_json::Value::as_str)
         .is_some_and(|agent| !agent.trim().is_empty())
+}
+
+/// Detect a leading `@agent` mention and return the canonical agent name with
+/// the remaining instruction.
+///
+/// This makes the composer's `@explore`/`@plan`/`@build`/`@review` insert
+/// deterministic: the named subagent runs directly instead of the model having
+/// to notice the mention and choose to dispatch.
+fn leading_agent_mention(prompt: &str) -> Option<(String, String)> {
+    let rest = prompt.trim_start().strip_prefix('@')?;
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let name = parts.next()?.trim();
+    let task = parts.next().unwrap_or("").trim();
+    if name.is_empty() || task.is_empty() {
+        return None;
+    }
+    crate::catalog::find_agent_profile(name).map(|profile| (profile.name, task.to_owned()))
 }
 
 /// Process-wide counter for subagent task ids.
@@ -1387,7 +1440,7 @@ async fn dispatch_subagent(
         ))
         .await;
     if ok {
-        Ok(format!("[{} subagent result]\n{result}", profile.name))
+        Ok(result)
     } else {
         Err(format!("{} subagent failed: {result}", profile.name))
     }
@@ -2480,6 +2533,28 @@ mod tests {
         assert!(!super::is_subagent_dispatch(
             &serde_json::json!({"action": "dispatch", "prompt": "no agent"})
         ));
+    }
+
+    #[test]
+    fn leading_agent_mentions_are_resolved_to_the_canonical_profile() {
+        assert_eq!(
+            super::leading_agent_mention("@explore find the entry point"),
+            Some(("explore".to_owned(), "find the entry point".to_owned()))
+        );
+        assert_eq!(
+            super::leading_agent_mention("  @build add a route").map(|(agent, _)| agent),
+            Some("build".to_owned())
+        );
+        // An alias resolves to the profile's canonical name.
+        assert_eq!(
+            super::leading_agent_mention("@scout look around").map(|(agent, _)| agent),
+            Some("explore".to_owned())
+        );
+        // A mention that is not at the start, has no task, or names no known
+        // agent is left to the orchestrator.
+        assert!(super::leading_agent_mention("email @explore later").is_none());
+        assert!(super::leading_agent_mention("@explore").is_none());
+        assert!(super::leading_agent_mention("@unknown do a thing").is_none());
     }
 
     #[test]
