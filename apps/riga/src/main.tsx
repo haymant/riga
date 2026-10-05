@@ -57,6 +57,11 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [providerEndpoint, setProviderEndpoint] = useState("");
+  const [providerApiKey, setProviderApiKey] = useState("");
+  const [providerModel, setProviderModel] = useState("");
+  const [providerMode, setProviderMode] = useState<"remote" | "local">("remote");
   const [transportStatus, setTransportStatus] = useState<"connecting" | "connected" | "closed" | "error">("connecting");
   const transportRef = useRef<RigaWebSocketClient | null>(null);
 
@@ -67,6 +72,7 @@ function App() {
     const client = new RigaWebSocketClient({
       url: `${protocol}//${window.location.host}/ws`,
       onStatus: setTransportStatus,
+      onError: (code, message) => setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "system", text: `${code}: ${message}`, time: "now" }]),
       onEvent: (envelope: RigaEventEnvelope) => {
         const event = envelope.event;
         if (typeof event === "object" && event !== null && "TextDelta" in event) {
@@ -142,6 +148,20 @@ function App() {
     setToast("Approval declined; no workspace mutation was made");
   }
 
+  async function saveProvider() {
+    if (providerMode === "local") {
+      setToast("Local GGUF downloads and inference are available in the Tauri desktop build; browser mode uses an OpenAI-compatible endpoint.");
+      return;
+    }
+    if (!providerEndpoint.trim() || !providerModel.trim()) {
+      setToast("Endpoint and model are required");
+      return;
+    }
+    await transportRef.current?.configureProvider(providerEndpoint.trim(), providerApiKey, providerModel.trim());
+    setSettingsOpen(false);
+    setToast(`Provider configured in memory: ${providerModel.trim()}`);
+  }
+
   return (
     <div className="app-shell">
       <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
@@ -168,7 +188,7 @@ function App() {
         </nav>
         <div className="sidebar-footer">
           <div className="connection-status"><span className={transportStatus === "connected" ? "online-dot" : "pulse-dot"} /> WebSocket {transportStatus} · UI {RIGA_ASSISTANT_UI_VERSION}</div>
-          <button className="footer-link"><Settings2 size={15} /> Settings <span>⌘ ,</span></button>
+          <button className="footer-link" onClick={() => setSettingsOpen((value) => !value)}><Settings2 size={15} /> Settings <span>⌘ ,</span></button>
           <button className="footer-link"><Bell size={15} /> Notifications <span className="notification-count">2</span></button>
         </div>
       </aside>
@@ -180,6 +200,8 @@ function App() {
           <div className="topbar-left"><button className="icon-button menu-button" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}><Menu size={19} /></button><div className="breadcrumbs"><span>Workspace</span><span>/</span><strong>{activeSession.title}</strong></div></div>
           <div className="topbar-actions"><div className="run-indicator"><span className={isRunning ? "pulse-dot" : "online-dot"} /> {isRunning ? "Run in progress" : "Ready"}</div><button className="icon-button" aria-label="More options"><MoreHorizontal size={19} /></button><div className="avatar">AM</div></div>
         </header>
+
+        {settingsOpen && <section className="settings-panel"><div className="settings-panel-header"><div><p className="eyebrow">RUNTIME / PROVIDER</p><h2>Connect your model.</h2><p>Credentials stay in browser memory and are sent only over the current WebSocket session.</p></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><div className="provider-tabs"><button className={providerMode === "remote" ? "selected" : ""} onClick={() => setProviderMode("remote")}>OpenAI-compatible / OpenCode Go</button><button className={providerMode === "local" ? "selected" : ""} onClick={() => setProviderMode("local")}>Local GGUF model</button></div>{providerMode === "remote" ? <div className="provider-form"><label>API endpoint<input value={providerEndpoint} onChange={(event) => setProviderEndpoint(event.target.value)} placeholder="https://api.example.com/v1" /></label><label>API key <span>ephemeral</span><input type="password" value={providerApiKey} onChange={(event) => setProviderApiKey(event.target.value)} placeholder="sk-…" autoComplete="off" /></label><label>Model<input value={providerModel} onChange={(event) => setProviderModel(event.target.value)} placeholder="opencode-go / gpt-4o-mini" /></label><button className="approve-button settings-save" onClick={() => void saveProvider()}><Check size={15} /> Save in memory</button></div> : <div className="local-model-card"><div className="tool-symbol"><Bot size={17} /></div><div><strong>Download and run a GGUF model locally</strong><p>Inspired by Fina Builder: model downloads, SHA-256 verification, CPU/OpenMP, and optional CUDA builds belong to the Tauri desktop runtime. This browser session cannot access the host filesystem or GPU.</p><button className="outline-button" onClick={() => setToast("Use the Tauri desktop build to download and run local GGUF models.")}>Open desktop model manager</button></div></div>}</section>}
 
         <section className="run-strip"><div className="run-strip-main"><div className="run-icon"><Sparkles size={16} /></div><div><strong>Agent run</strong><span>{isRunning ? "Executing with approval policy" : "Paused at approval checkpoint"}</span></div></div><div className="run-strip-meta"><span><GitBranch size={14} /> main</span><span><Clock3 size={14} /> 00:42</span>{isRunning && <button className="stop-run" onClick={() => { void transportRef.current?.cancelRun("active-run"); setIsRunning(false); setToast("Run cancelled safely"); }}><CircleStop size={14} /> Stop</button>}</div></section>
 

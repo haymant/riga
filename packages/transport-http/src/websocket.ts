@@ -2,6 +2,7 @@ import type { RigaEventEnvelope } from "./index";
 
 export type RigaWebSocketClientMessage =
   | { type: "hello"; client_version: string }
+  | { type: "configure_provider"; endpoint: string; api_key: string; model: string }
   | { type: "start_run"; run_id: string; session_id: string; prompt: string }
   | { type: "cancel_run"; run_id: string }
   | { type: "approval"; run_id: string; approval_id: string; approved: boolean }
@@ -9,6 +10,7 @@ export type RigaWebSocketClientMessage =
 
 export type RigaWebSocketServerMessage =
   | { type: "ready"; protocol_version: number; server_version: string }
+  | { type: "provider_configured"; model: string }
   | { type: "event"; envelope: RigaEventEnvelope }
   | { type: "run_cancelled"; run_id: string }
   | { type: "approval_recorded"; run_id: string; approval_id: string; approved: boolean }
@@ -31,11 +33,13 @@ export class RigaWebSocketClient {
   private ready: Promise<void> | null = null;
   private readonly makeSocket: RigaWebSocketFactory;
   private readonly onEvent: (envelope: RigaEventEnvelope) => void;
+  private readonly onError: (code: string, message: string) => void;
   private readonly onStatus: (status: "connecting" | "connected" | "closed" | "error") => void;
 
-  constructor(options: { url: string; onEvent: (envelope: RigaEventEnvelope) => void; onStatus?: (status: "connecting" | "connected" | "closed" | "error") => void; socketFactory?: RigaWebSocketFactory }) {
+  constructor(options: { url: string; onEvent: (envelope: RigaEventEnvelope) => void; onError?: (code: string, message: string) => void; onStatus?: (status: "connecting" | "connected" | "closed" | "error") => void; socketFactory?: RigaWebSocketFactory }) {
     this.url = options.url;
     this.onEvent = options.onEvent;
+    this.onError = options.onError ?? (() => undefined);
     this.onStatus = options.onStatus ?? (() => undefined);
     this.makeSocket = options.socketFactory ?? ((url) => {
       const native = new WebSocket(url);
@@ -82,6 +86,7 @@ export class RigaWebSocketClient {
           this.onEvent(parsed.envelope);
         } else if (parsed.type === "error") {
           this.onStatus("error");
+          this.onError(parsed.code, parsed.message);
         }
       };
       socket.onerror = () => {
@@ -96,6 +101,11 @@ export class RigaWebSocketClient {
   async startRun(runId: string, sessionId: string, prompt: string): Promise<void> {
     await this.connect();
     this.send({ type: "start_run", run_id: runId, session_id: sessionId, prompt });
+  }
+
+  async configureProvider(endpoint: string, apiKey: string, model: string): Promise<void> {
+    await this.connect();
+    this.send({ type: "configure_provider", endpoint, api_key: apiKey, model });
   }
 
   async cancelRun(runId: string): Promise<void> {

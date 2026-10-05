@@ -60,6 +60,17 @@ describe("RigaWebSocketClient", () => {
     ]);
   });
 
+  it("sends provider endpoint, key, and model only in the live socket frame", async () => {
+    const socket = new FakeSocket();
+    const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn() });
+    const ready = client.connect();
+    socket.open();
+    socket.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
+    await ready;
+    await client.configureProvider("https://api.example/v1", "ephemeral-key", "opencode-go");
+    expect(JSON.parse(socket.sent.at(-1)!)).toEqual({ type: "configure_provider", endpoint: "https://api.example/v1", api_key: "ephemeral-key", model: "opencode-go" });
+  });
+
   it("delivers ordered kernel event envelopes without rewriting them", async () => {
     const socket = new FakeSocket();
     const events: unknown[] = [];

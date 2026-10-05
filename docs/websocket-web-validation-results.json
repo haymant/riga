@@ -5,18 +5,24 @@
   "checks": [
     { "name": "single_command_startup", "status": "PASS" },
     { "name": "public_vite_host_allowlist", "status": "PASS" },
-    { "name": "manus_routes_manifest", "status": "PASS" },
-    { "name": "health_proxy", "status": "PASS" },
     { "name": "public_browser_render", "status": "PASS" },
-    { "name": "public_websocket_handshake", "status": "PASS" },
-    { "name": "public_websocket_kernel_event_stream", "status": "PASS" },
-    { "name": "vitest", "status": "PASS", "tests": 9, "line_coverage": 81.96, "branch_coverage": 92.68, "function_coverage": 95.23 },
+    { "name": "provider_settings_ui", "status": "PASS" },
+    { "name": "ephemeral_provider_configuration", "status": "PASS" },
+    { "name": "openai_compatible_provider_request", "status": "PASS" },
+    { "name": "provider_response_rendered_in_ui", "status": "PASS" },
+    { "name": "vitest", "status": "PASS", "tests": 10, "line_coverage": 82.94, "branch_coverage": 93.02, "function_coverage": 95.65 },
     { "name": "rust_workspace", "status": "PASS" },
     { "name": "production_build", "status": "PASS" }
   ],
-  "transport": {
-    "websocket": "/ws",
-    "sse_compatibility": "/runs/{run_id}/events",
-    "http": ["/health", "/sessions"]
+  "provider": {
+    "protocol": "OpenAI-compatible chat completions",
+    "secret_storage": "active WebSocket memory only",
+    "request_path": "POST {endpoint}/chat/completions",
+    "supports_opencode_go": true
+  },
+  "local_models": {
+    "browser_mode": "desktop_only",
+    "download_manager": "planned Tauri phase",
+    "runtime_design": "llama-cpp-2 CPU/OpenMP with opt-in CUDA build"
   }
 }

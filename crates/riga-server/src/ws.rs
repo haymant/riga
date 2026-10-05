@@ -3,12 +3,20 @@ use futures_util::{SinkExt, StreamExt};
 use riga_kernel::events::{RigaEvent, RigaEventEnvelope};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderConfig {
+    pub endpoint: String,
+    pub api_key: String,
+    pub model: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Hello {
         client_version: String,
     },
+    ConfigureProvider(ProviderConfig),
     StartRun {
         run_id: String,
         session_id: String,
@@ -34,6 +42,9 @@ pub enum ServerMessage {
         protocol_version: u16,
         server_version: &'static str,
     },
+    ProviderConfigured {
+        model: String,
+    },
     Event {
         envelope: RigaEventEnvelope,
     },
@@ -54,20 +65,50 @@ pub enum ServerMessage {
     },
 }
 
+#[derive(Debug, Deserialize)]
+struct ChatCompletionResponse {
+    choices: Vec<Choice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Choice {
+    message: ChoiceMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChoiceMessage {
+    content: String,
+}
+
 pub async fn upgrade(socket: WebSocket) {
     let (mut sender, mut receiver) = socket.split();
+    let mut provider: Option<ProviderConfig> = None;
     while let Some(Ok(message)) = receiver.next().await {
         match message {
             Message::Text(text) => match serde_json::from_str::<ClientMessage>(&text) {
                 Ok(ClientMessage::Hello { .. }) => {
-                    let _ = send(
+                    if send(
                         &mut sender,
                         ServerMessage::Ready {
                             protocol_version: riga_kernel::PROTOCOL_VERSION,
                             server_version: "0.1.0",
                         },
                     )
-                    .await;
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(ClientMessage::ConfigureProvider(config)) => {
+                    let model = config.model.clone();
+                    provider = Some(config);
+                    if send(&mut sender, ServerMessage::ProviderConfigured { model })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
                 Ok(ClientMessage::Ping { nonce }) => {
                     let _ = send(&mut sender, ServerMessage::Pong { nonce }).await;
@@ -95,14 +136,15 @@ pub async fn upgrade(socket: WebSocket) {
                     session_id,
                     prompt,
                 }) => {
-                    let events = kernel_demo_events(&run_id, &session_id, &prompt);
-                    for envelope in events {
-                        if send(&mut sender, ServerMessage::Event { envelope })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
+                    let Some(config) = provider.clone() else {
+                        let _ = send(&mut sender, ServerMessage::Error { code: "provider_not_configured".into(), message: "Configure an OpenAI-compatible provider in Settings before starting a run.".into() }).await;
+                        continue;
+                    };
+                    if send_provider_events(&mut sender, &config, &run_id, &session_id, &prompt)
+                        .await
+                        .is_err()
+                    {
+                        return;
                     }
                 }
                 Err(error) => {
@@ -127,36 +169,113 @@ pub async fn upgrade(socket: WebSocket) {
     }
 }
 
+async fn send_provider_events<S>(
+    sender: &mut S,
+    config: &ProviderConfig,
+    run_id: &str,
+    session_id: &str,
+    prompt: &str,
+) -> Result<(), S::Error>
+where
+    S: SinkExt<Message> + Unpin,
+{
+    send(
+        sender,
+        ServerMessage::Event {
+            envelope: envelope(run_id, session_id, 1, RigaEvent::RunStarted),
+        },
+    )
+    .await?;
+    match call_openai_compatible(config, prompt).await {
+        Ok(output) => {
+            send(
+                sender,
+                ServerMessage::Event {
+                    envelope: envelope(
+                        run_id,
+                        session_id,
+                        2,
+                        RigaEvent::TextDelta {
+                            delta: output.clone(),
+                        },
+                    ),
+                },
+            )
+            .await?;
+            send(
+                sender,
+                ServerMessage::Event {
+                    envelope: envelope(run_id, session_id, 3, RigaEvent::RunCompleted { output }),
+                },
+            )
+            .await
+        }
+        Err(error) => {
+            send(
+                sender,
+                ServerMessage::Event {
+                    envelope: envelope(
+                        run_id,
+                        session_id,
+                        2,
+                        RigaEvent::RunFailed { message: error },
+                    ),
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn call_openai_compatible(config: &ProviderConfig, prompt: &str) -> Result<String, String> {
+    let endpoint = if config
+        .endpoint
+        .trim_end_matches('/')
+        .ends_with("/chat/completions")
+    {
+        config.endpoint.trim_end_matches('/').to_string()
+    } else {
+        format!("{}/chat/completions", config.endpoint.trim_end_matches('/'))
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut request = client.post(endpoint).json(&serde_json::json!({ "model": config.model, "messages": [{ "role": "user", "content": prompt }], "stream": false }));
+    if !config.api_key.trim().is_empty() {
+        request = request.bearer_auth(&config.api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("provider connection failed: {e}"))?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "provider returned HTTP {status}: {}",
+            redact_body(&body)
+        ));
+    }
+    let completion: ChatCompletionResponse =
+        serde_json::from_str(&body).map_err(|e| format!("invalid provider response: {e}"))?;
+    completion
+        .choices
+        .first()
+        .map(|choice| choice.message.content.clone())
+        .ok_or_else(|| "provider returned no choices".into())
+}
+
+fn redact_body(body: &str) -> String {
+    body.chars().take(300).collect()
+}
+
 async fn send<S>(sender: &mut S, message: ServerMessage) -> Result<(), S::Error>
 where
     S: SinkExt<Message> + Unpin,
 {
     let payload = serde_json::to_string(&message).expect("WebSocket message is serializable");
     sender.send(Message::Text(payload.into())).await
-}
-
-fn kernel_demo_events(run_id: &str, session_id: &str, prompt: &str) -> Vec<RigaEventEnvelope> {
-    let output = format!("Kernel accepted: {}", prompt.trim());
-    vec![
-        envelope(run_id, session_id, 1, RigaEvent::RunStarted),
-        envelope(
-            run_id,
-            session_id,
-            2,
-            RigaEvent::TextDelta {
-                delta: "I’m connected to the RIGA kernel over WebSocket. ".into(),
-            },
-        ),
-        envelope(
-            run_id,
-            session_id,
-            3,
-            RigaEvent::TextDelta {
-                delta: output.clone(),
-            },
-        ),
-        envelope(run_id, session_id, 4, RigaEvent::RunCompleted { output }),
-    ]
 }
 
 fn envelope(run_id: &str, session_id: &str, sequence: u64, event: RigaEvent) -> RigaEventEnvelope {
@@ -173,32 +292,29 @@ fn envelope(run_id: &str, session_id: &str, sequence: u64, event: RigaEvent) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientMessage, ServerMessage, kernel_demo_events};
+    use super::{ClientMessage, ProviderConfig, ServerMessage};
     use riga_kernel::events::RigaEvent;
 
     #[test]
-    fn protocol_accepts_start_and_serializes_kernel_events() {
-        let message: ClientMessage = serde_json::from_str(
-            r#"{"type":"start_run","run_id":"run-1","session_id":"session-1","prompt":"hello"}"#,
-        )
-        .unwrap();
-        assert!(matches!(message, ClientMessage::StartRun { .. }));
-        let events = kernel_demo_events("run-1", "session-1", "hello");
-        assert_eq!(events.len(), 4);
-        assert!(matches!(events[1].event, RigaEvent::TextDelta { .. }));
-        let ready = serde_json::to_string(&ServerMessage::Ready {
-            protocol_version: 1,
-            server_version: "0.1.0",
+    fn protocol_accepts_provider_configuration_without_persisting_it() {
+        let message: ClientMessage = serde_json::from_str(r#"{"type":"configure_provider","endpoint":"https://api.example/v1","api_key":"ephemeral","model":"opencode-go"}"#).unwrap();
+        assert!(
+            matches!(message, ClientMessage::ConfigureProvider(ProviderConfig { model, .. }) if model == "opencode-go")
+        );
+        let ready = serde_json::to_string(&ServerMessage::Event {
+            envelope: super::envelope("run", "session", 1, RigaEvent::RunStarted),
         })
         .unwrap();
-        assert!(ready.contains("ready"));
+        assert!(!ready.contains("ephemeral"));
     }
 
     #[test]
-    fn protocol_rejects_unknown_message_types() {
-        let result = serde_json::from_str::<ClientMessage>(
-            r#"{"type":"execute_shell","command":"rm -rf /"}"#,
+    fn unknown_commands_are_rejected() {
+        assert!(
+            serde_json::from_str::<ClientMessage>(
+                r#"{"type":"execute_shell","command":"rm -rf /"}"#
+            )
+            .is_err()
         );
-        assert!(result.is_err());
     }
 }
