@@ -68,7 +68,22 @@ describe("RigaWebSocketClient", () => {
     socket.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
     await ready;
     await client.configureProvider("https://api.example/v1", "ephemeral-key", "opencode-go", "low");
-    expect(JSON.parse(socket.sent.at(-1)!)).toEqual({ type: "configure_provider", endpoint: "https://api.example/v1", api_key: "ephemeral-key", model: "opencode-go", reasoning_effort: "low" });
+    expect(JSON.parse(socket.sent.at(-1)!)).toEqual({ type: "configure_provider", endpoint: "https://api.example/v1", api_key: "ephemeral-key", model: "opencode-go", reasoning_effort: "low", kind: "remote" });
+  });
+
+  it("sends kind local so the server runs the in-process GGUF", async () => {
+    // The endpoint and key are meaningless for a local run, but sending the same
+    // shape keeps one configure path in the UI.
+    const socket = new FakeSocket();
+    const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn() });
+    const ready = client.connect();
+    socket.open();
+    socket.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
+    await ready;
+    await client.configureProvider("", "", "local", "low", "local");
+    const frame = JSON.parse(socket.sent.at(-1)!) as Record<string, unknown>;
+    expect(frame.kind).toBe("local");
+    expect(frame.type).toBe("configure_provider");
   });
 
   it("delivers ordered kernel event envelopes without rewriting them", async () => {

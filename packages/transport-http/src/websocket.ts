@@ -1,8 +1,10 @@
 import type { RigaEventEnvelope } from "./index";
 
+export type ProviderKind = "remote" | "local";
+
 export type RigaWebSocketClientMessage =
   | { type: "hello"; client_version: string }
-  | { type: "configure_provider"; endpoint: string; api_key: string; model: string; reasoning_effort: "low" | "medium" | "high" }
+  | { type: "configure_provider"; endpoint: string; api_key: string; model: string; reasoning_effort: "low" | "medium" | "high"; kind?: ProviderKind }
   | { type: "start_run"; run_id: string; session_id: string; prompt: string }
   | { type: "cancel_run"; run_id: string }
   | { type: "approval"; run_id: string; approval_id: string; approved: boolean }
@@ -107,9 +109,9 @@ export class RigaWebSocketClient {
     this.send({ type: "start_run", run_id: runId, session_id: sessionId, prompt });
   }
 
-  async configureProvider(endpoint: string, apiKey: string, model: string, reasoningEffort: "low" | "medium" | "high"): Promise<void> {
+  async configureProvider(endpoint: string, apiKey: string, model: string, reasoningEffort: "low" | "medium" | "high", kind: ProviderKind = "remote"): Promise<void> {
     await this.connect();
-    this.send({ type: "configure_provider", endpoint, api_key: apiKey, model, reasoning_effort: reasoningEffort });
+    this.send({ type: "configure_provider", endpoint, api_key: apiKey, model, reasoning_effort: reasoningEffort, kind });
   }
 
   async cancelRun(runId: string): Promise<void> {

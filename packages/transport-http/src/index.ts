@@ -55,3 +55,4 @@ export class RigaHttpClient {
 }
 
 export * from "./websocket";
+export * from "./local-models";

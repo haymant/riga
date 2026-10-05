@@ -52,6 +52,19 @@ RIGA_ENABLE_SHELL=1
 
 Keep shell and write execution disabled or approval-gated in production. Never commit `.env.local`, provider keys, `RIGA_TOKEN`, or uploaded files.
 
+### Desktop shell
+
+```bash
+npm install
+npm run tauri:dev
+```
+
+`tauri:dev` starts the kernel adapter and the Vite server through `beforeDevCommand`, then opens the native window against `http://127.0.0.1:1420`. Do not run `npm run dev` at the same time; port `1420` has `strictPort` enabled and both flows claim it. `npm run tauri:build` compiles the binary only, because `bundle.active` is `false` in `apps/riga/src-tauri/tauri.conf.json`.
+
+Linux desktop builds need the WebKitGTK development packages (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`, plus the usual `build-essential` and `pkg-config`).
+
+A bundled release binary is not yet wired: the shipped UI resolves `/ws` and `/catalog` relative to the `tauri://` origin, so the packaged app still needs the in-process server and the `packages/transport-tauri` boundary described in the roadmap.
+
 ## Provider configuration
 
 Configure an OpenAI-compatible endpoint, model, reasoning effort, and API key in the UI. Provider metadata is restored from the encrypted server store; the key is never returned to the browser in restoration frames.

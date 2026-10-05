@@ -6,19 +6,27 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
   },
   "dependencies": {
+    "@haymant/assistant-ui": "file:../../packages/assistant-ui",
+    "@haymant/transport-http": "file:../../packages/transport-http",
     "@riga/assistant-ui": "file:../../packages/assistant-ui",
     "@riga/transport-http": "file:../../packages/transport-http",
     "@tauri-apps/api": "^2.12.1",
     "lucide-react": "^1.52.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
-    "@haymant/assistant-ui": "file:../../packages/assistant-ui",
-    "@haymant/transport-http": "file:../../packages/transport-http"
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.12.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.1.1",
     "vite": "^8.3.2"
   }

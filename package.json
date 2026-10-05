@@ -14,7 +14,10 @@
     "test:e2e": "node scripts/test-e2e.mjs",
     "test": "vitest run --coverage",
     "dev": "concurrently --kill-others --names kernel,web \"./scripts/run-kernel.sh\" \"npm run dev --workspace @riga/desktop-ui -- --host 0.0.0.0\"",
-    "start": "npm run dev"
+    "start": "npm run dev",
+    "tauri": "npm run tauri --workspace @riga/desktop-ui",
+    "tauri:dev": "npm run tauri:dev --workspace @riga/desktop-ui",
+    "tauri:build": "npm run tauri:build --workspace @riga/desktop-ui"
   },
   "devDependencies": {
     "@vitest/coverage-v8": "^3.2.4",

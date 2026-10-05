@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
 import { createRoot } from "react-dom/client";
 import { DEFAULT_ASSISTANT_UI_OPTIONS, RIGA_ASSISTANT_UI_VERSION, type AssistantUiOptions } from "@haymant/assistant-ui";
-import { RigaWebSocketClient, type RigaEventEnvelope } from "@haymant/transport-http";
+import { RigaWebSocketClient, LocalModelClient, formatBytes, reduceDownloadState, type DownloadState, type LocalModelOverview, type RigaEventEnvelope } from "@haymant/transport-http";
 import {
   Bot,
   Check,
@@ -29,6 +29,12 @@ import {
   X,
 } from "lucide-react";
 import "./styles.css";
+import { Markdown } from "./Markdown";
+
+// An empty base URL makes every request resolve against the page origin, which
+// is how the rest of this app already talks to the kernel (`/catalog`,
+// `/attachments`) and what lets the Vite proxy forward it unchanged.
+const localModelClient = new LocalModelClient("");
 
 type Role = "user" | "assistant" | "system";
 type Session = { id: string; title: string; meta: string; active?: boolean };
@@ -110,6 +116,10 @@ function App({
   const [providerModel, setProviderModel] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("low");
   const [providerMode, setProviderMode] = useState<"remote" | "local">("remote");
+  const [localModels, setLocalModels] = useState<LocalModelOverview | null>(null);
+  const [downloads, setDownloads] = useState<Record<string, DownloadState>>({});
+  const [modelBusy, setModelBusy] = useState<string | null>(null);
+  const [modelError, setModelError] = useState<string | null>(null);
   const [theme, setTheme] = useState<"dark" | "light">(() => loadLocal("riga.theme.v1", "dark"));
   const [fullWidthEnabled, setFullWidthEnabled] = useState(initialFullWidth);
   const [transportStatus, setTransportStatus] = useState<"connecting" | "connected" | "closed" | "error">("connecting");
@@ -128,6 +138,11 @@ function App({
   const activeRunIdRef = useRef<string | null>(null);
   const catalogRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  // Streamed text waiting to be painted. A model emits a token at a time and each
+  // one would otherwise force a full markdown re-parse, so the deltas are
+  // coalesced into a single animation frame.
+  const pendingTextRef = useRef<{ runId: string; text: string } | null>(null);
+  const textFrameRef = useRef<number | null>(null);
 
   const activeSession = useMemo(() => sessions.find((session) => session.active) ?? sessions[0], [sessions]);
   const transcript = sessionTranscripts[activeSession.id] ?? [];
@@ -136,6 +151,39 @@ function App({
       const previous = current[activeSession.id] ?? [];
       const next = typeof updater === "function" ? updater(previous) : updater;
       return { ...current, [activeSession.id]: next };
+    });
+  };
+
+  /**
+   * Commit whatever streamed text is buffered into the transcript.
+   *
+   * Called from an animation frame so a run that emits deltas faster than the
+   * display refresh costs one render per frame rather than one per token. The
+   * markdown of a long reply is re-parsed on every render, so the difference is
+   * visible once a reply grows past a few hundred tokens.
+   */
+  const flushStreamedText = () => {
+    if (textFrameRef.current !== null) {
+      window.cancelAnimationFrame(textFrameRef.current);
+      textFrameRef.current = null;
+    }
+    const pending = pendingTextRef.current;
+    if (!pending) return;
+    pendingTextRef.current = null;
+    setTranscript((current) => {
+      const id = `stream-${pending.runId}`;
+      // Matched anywhere, not just at the end: a run can emit text, call a tool,
+      // then keep talking, and that continuation belongs to the same message.
+      // Keying on the run id also stops a second run from appending to the
+      // previous run's reply, which the old `startsWith("stream-")` test allowed.
+      const at = current.findIndex((item) => item.id === id);
+      if (at >= 0) {
+        const item = current[at] as Extract<TranscriptItem, { role: "assistant" | "user" | "system" }>;
+        const next = [...current];
+        next[at] = { ...item, text: `${item.text}${pending.text}` };
+        return next;
+      }
+      return [...current, { id, role: "assistant", text: pending.text, time: "now" }];
     });
   };
 
@@ -228,21 +276,25 @@ function App({
           setTranscript((current) => current.map((item) => item.role === "tool" && item.callId === result.call_id ? { ...item, status: result.ok ? "done" : "error", output: result.output ?? "" } : item));
         } else if (typeof event === "object" && event !== null && "TextDelta" in event) {
           const delta = (event as { TextDelta: { delta: string } }).TextDelta.delta;
-          setTranscript((current) => {
-            const last = current.at(-1);
-            if (last?.role === "assistant" && last.id.startsWith("stream-")) {
-              return [...current.slice(0, -1), { ...last, text: `${last.text}${delta}` }];
-            }
-            return [...current, { id: `stream-${envelope.run_id}`, role: "assistant", text: delta, time: "now" }];
-          });
+          const runId = envelope.run_id;
+          const pending = pendingTextRef.current;
+          if (pending && pending.runId === runId) pending.text += delta;
+          else pendingTextRef.current = { runId, text: delta };
+          if (textFrameRef.current === null) {
+            textFrameRef.current = window.requestAnimationFrame(flushStreamedText);
+          }
         } else if (typeof event === "object" && event !== null && "RunCompleted" in event) {
+          // Flush before marking the run done, otherwise the tail of the reply
+          // would sit in the buffer until the next frame after the spinner stops.
+          flushStreamedText();
           activeRunIdRef.current = null;
           setIsRunning(false);
         } else if (typeof event === "object" && event !== null && "RunFailed" in event) {
+          flushStreamedText();
           activeRunIdRef.current = null;
           setIsRunning(false);
           setTranscript((current) => [...current, { id: envelope.event_id, role: "system", text: `Agent run failed: ${(event as { RunFailed: { message: string } }).RunFailed.message}`, time: "now" }]);
-        } else if (event === "RunStarted") {
+        } else if (typeof event === "object" && event !== null && "RunStarted" in event) {
           setIsRunning(true);
         }
       },
@@ -251,6 +303,50 @@ function App({
     client.connect().catch(() => setTransportStatus("error"));
     return () => client.close();
   }, []);
+
+  const refreshLocalModels = useMemo(() => async () => {
+    try {
+      setLocalModels(await localModelClient.overview());
+      setModelError(null);
+    } catch (error) {
+      setModelError(error instanceof Error ? error.message : "Local model manager is unavailable");
+    }
+  }, []);
+
+  // The model manager is opened from Settings, so the catalog is fetched when
+  // that panel first appears rather than on every render. The event subscription
+  // is opened first and lives for the session: the server only broadcasts to
+  // current subscribers, so a subscription opened at download time would miss
+  // the opening progress frames.
+  useEffect(() => {
+    if (!settingsOpen || providerMode !== "local") return;
+    void refreshLocalModels();
+  }, [settingsOpen, providerMode, refreshLocalModels]);
+
+  useEffect(() => {
+    const unsubscribe = localModelClient.subscribe((event) => {
+      setDownloads((current) => reduceDownloadState(current, event));
+      // A finished or failed transfer changes what is on disk, so re-read the
+      // authoritative list rather than guessing from the event.
+      if (event.type === "download_finished" || event.type === "download_failed") {
+        void refreshLocalModels();
+      }
+    });
+    return unsubscribe;
+  }, [refreshLocalModels]);
+
+  async function runModelAction(label: string, action: () => Promise<void>) {
+    setModelBusy(label);
+    setModelError(null);
+    try {
+      await action();
+      await refreshLocalModels();
+    } catch (error) {
+      setModelError(error instanceof Error ? error.message : `${label} failed`);
+    } finally {
+      setModelBusy(null);
+    }
+  }
 
   function selectSession(id: string) {
     setSessions((current) => current.map((session) => ({ ...session, active: session.id === id })));
@@ -411,14 +507,22 @@ function App({
 
   async function saveProvider() {
     if (providerMode === "local") {
-      setToast("Local GGUF downloads and inference are available in the Tauri desktop build; browser mode uses an OpenAI-compatible endpoint.");
+      // The endpoint and key are meaningless for an in-process GGUF, so they are
+      // sent empty rather than left over from a previous remote configuration.
+      if (!localModels?.loaded) {
+        setToast("Load a local model first");
+        return;
+      }
+      await transportRef.current?.configureProvider("", "", "local", reasoningEffort, "local");
+      setSettingsOpen(false);
+      setToast(`Local model ready: ${localModels.loaded}`);
       return;
     }
     if (!providerEndpoint.trim() || !providerModel.trim()) {
       setToast("Endpoint and model are required");
       return;
     }
-    await transportRef.current?.configureProvider(providerEndpoint.trim(), providerApiKey, providerModel.trim(), reasoningEffort);
+    await transportRef.current?.configureProvider(providerEndpoint.trim(), providerApiKey, providerModel.trim(), reasoningEffort, "remote");
     setSettingsOpen(false);
     setToast(`Provider saved securely: ${providerModel.trim()}`);
   }
@@ -439,7 +543,7 @@ function App({
               <button className="icon-button chat-header-button" aria-label="New chat" title="New chat" onClick={createSession}><Plus size={16} /></button>
             </div>
             {historyOpen && <div className="chat-popover history-popover"><div className="chat-popover-header"><strong>Chat history</strong><button className="outline-button" onClick={createSession}><Plus size={13} /> New chat</button></div><nav className="compact-session-list" aria-label="Chat history">{sessions.map((session) => <button key={session.id} className={`compact-session-item ${session.active ? "active" : ""}`} onClick={() => selectSession(session.id)}><MessageSquare size={14} /><span><strong>{session.title}</strong><small>{session.meta}</small></span></button>)}</nav></div>}
-            {settingsOpen && <section className="chat-popover settings-popover"><div className="settings-panel-header"><div><p className="eyebrow">RUNTIME / PROVIDER</p><h2>Connect your model.</h2><p>Endpoint and model restore after reload. The API key is sent over WebSocket and retained only in the server's encrypted store.</p></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><div className="provider-tabs"><button className={providerMode === "remote" ? "selected" : ""} onClick={() => setProviderMode("remote")}>OpenAI-compatible / OpenCode Go</button><button className={providerMode === "local" ? "selected" : ""} onClick={() => setProviderMode("local")}>Local GGUF model</button></div>{providerMode === "remote" ? <div className="provider-form"><label>API endpoint<input value={providerEndpoint} onChange={(event) => setProviderEndpoint(event.target.value)} placeholder="https://api.example.com/v1" /></label><label>API key <span>encrypted at rest</span><input type="password" value={providerApiKey} onChange={(event) => setProviderApiKey(event.target.value)} placeholder="sk-…" autoComplete="off" /></label><label>Model<input value={providerModel} onChange={(event) => setProviderModel(event.target.value)} placeholder="opencode-go / gpt-4o-mini" /></label><label>Reasoning effort<select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label><button className="approve-button settings-save" onClick={() => void saveProvider()}><Check size={15} /> Save securely</button></div> : <div className="local-model-card"><div className="tool-symbol"><Bot size={17} /></div><div><strong>Download and run a GGUF model locally</strong><p>Inspired by Fina Builder: model downloads, SHA-256 verification, CPU/OpenMP, and optional CUDA builds belong to the Tauri desktop runtime. This browser session cannot access the host filesystem or GPU.</p><button className="outline-button" onClick={() => setToast("Use the Tauri desktop build to download and run local GGUF models.")}>Open desktop model manager</button></div></div>}</section>}
+            {settingsOpen && <section className="chat-popover settings-popover"><div className="settings-panel-header"><div><p className="eyebrow">RUNTIME / PROVIDER</p><h2>Connect your model.</h2><p>Endpoint and model restore after reload. The API key is sent over WebSocket and retained only in the server's encrypted store.</p></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><div className="provider-tabs"><button className={providerMode === "remote" ? "selected" : ""} onClick={() => setProviderMode("remote")}>OpenAI-compatible / OpenCode Go</button><button className={providerMode === "local" ? "selected" : ""} onClick={() => setProviderMode("local")}>Local GGUF model</button></div>{providerMode === "remote" ? <div className="provider-form"><label>API endpoint<input value={providerEndpoint} onChange={(event) => setProviderEndpoint(event.target.value)} placeholder="https://api.example.com/v1" /></label><label>API key <span>encrypted at rest</span><input type="password" value={providerApiKey} onChange={(event) => setProviderApiKey(event.target.value)} placeholder="sk-…" autoComplete="off" /></label><label>Model<input value={providerModel} onChange={(event) => setProviderModel(event.target.value)} placeholder="opencode-go / gpt-4o-mini" /></label><label>Reasoning effort<select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label><button className="approve-button settings-save" onClick={() => void saveProvider()}><Check size={15} /> Save securely</button></div> : <div className="local-model-panel"><div className="local-model-head"><div className="tool-symbol"><Bot size={17} /></div><div><strong>Local GGUF models</strong><p>Download a curated GGUF and run it in this process through llama.cpp. Runs on {localModels?.accelerator ?? "the local CPU"}{localModels?.accelerator?.includes("CPU") ? " — build with `--features cuda` for GPU offload." : "."}</p></div></div>{modelError && <p className="model-error">{modelError}</p>}<div className="model-section"><div className="model-section-title"><span>Downloaded</span><button className="outline-button" onClick={() => void refreshLocalModels()} disabled={modelBusy !== null}>Refresh</button></div>{!localModels && <p className="model-empty">Loading the model manager…</p>}{localModels?.installed.length === 0 && <p className="model-empty">No models yet. Download one below; it is verified against a pinned SHA-256 before use.</p>}{localModels?.installed.map((model) => { const state = downloads[model.id]; return <div className="model-row" key={model.path}><div className="model-row-main"><strong>{model.name}</strong><span>{formatBytes(model.size_bytes)} · {model.curated ? model.recommended_context ? `${model.recommended_context >= 1024 ? `${Math.round(model.recommended_context / 1024)}k` : model.recommended_context} ctx` : "curated GGUF" : "local GGUF"}</span></div><div className="model-row-actions">{state?.phase === "downloading" && <button className="outline-button" onClick={() => void runModelAction("cancel", () => localModelClient.cancelDownload(model.id))} disabled={modelBusy !== null}>{state.percent.toFixed(0)}% · Cancel</button>}{localModels.loaded === model.file_name ? <span className="model-loaded">Loaded</span> : <button className="approve-button" onClick={() => void runModelAction("load", () => localModelClient.load(model.path))} disabled={modelBusy !== null}>{modelBusy === "load" ? "Loading…" : "Load"}</button>}</div>{state?.phase === "downloading" && <div className="model-progress"><span style={{ width: `${Math.max(2, state.percent)}%` }} /></div>}{state?.phase === "failed" && <p className="model-error">{state.message}</p>}</div>; })}{localModels && <div className="model-section-title"><span>Curated catalog</span></div>}{localModels?.catalog.map((model) => { const state = downloads[model.id]; const already = localModels.installed.some((installed) => installed.id === model.id); return <div className="model-row" key={model.id}><div className="model-row-main"><strong>{model.name}</strong><span>{formatBytes(model.size_bytes)} · {model.quant} · {Math.round(model.recommended_context / 1024)}k ctx · <a href={model.license_url} target="_blank" rel="noreferrer">license</a></span></div><div className="model-row-actions">{already ? <span className="model-installed-tag">Installed</span> : state?.phase === "downloading" ? <button className="outline-button" onClick={() => void runModelAction("cancel", () => localModelClient.cancelDownload(model.id))} disabled={modelBusy !== null}>{state.percent.toFixed(0)}% · Cancel</button> : state?.phase === "finished" ? <span className="model-installed-tag">Ready</span> : <button className="approve-button" onClick={() => void runModelAction("download", () => localModelClient.download(model.id))} disabled={modelBusy !== null}>{modelBusy === "download" ? "Starting…" : "Download"}</button>}</div>{state?.phase === "downloading" && <div className="model-progress"><span style={{ width: `${Math.max(2, state.percent)}%` }} /></div>}{state?.phase === "failed" && <p className="model-error">{state.message}</p>}</div>; })}</div><button className="approve-button settings-save" onClick={() => void saveProvider()} disabled={!localModels?.loaded}><Check size={15} /> Use this model</button>{!localModels?.loaded && <p className="model-hint">Load a model above to enable local runs.</p>}</div>}</section>}
           </header>
           <div ref={transcriptRef} className="transcript" aria-live="polite">
             {transcript.length === 0 && <div className="empty-state"><div className="empty-icon"><Bot size={26} /></div><h2>Start a coding run</h2><p>Describe the change, then review every tool action before it touches your workspace.</p></div>}
@@ -502,7 +606,13 @@ function ToolCallView({ item }: { item: Extract<TranscriptItem, { role: "tool" }
 
 function TranscriptItemView({ item }: { item: TranscriptItem }) {
   if (item.role === "tool") return <ToolCallView item={item} />;
-  return <article className={`message-row ${item.role}`}><div className="message-avatar">{item.role === "assistant" ? <Bot size={15} /> : item.role === "system" ? <ShieldCheck size={15} /> : "AM"}</div><div className="message-body"><div className="message-meta"><strong>{item.role === "assistant" ? "RIGA" : item.role === "system" ? "System" : "You"}</strong><span>{item.time}</span></div><p>{item.text}</p></div></article>;
+  // Only the assistant's prose is rendered as markdown. A user message is echoed
+  // back verbatim on purpose: parsing it would reflow what was literally typed,
+  // and the system lines are fixed UI strings with no markdown in them.
+  const body = item.role === "assistant"
+    ? <Markdown text={item.text} />
+    : <p>{item.text}</p>;
+  return <article className={`message-row ${item.role}`}><div className="message-avatar">{item.role === "assistant" ? <Bot size={15} /> : item.role === "system" ? <ShieldCheck size={15} /> : "AM"}</div><div className="message-body"><div className="message-meta"><strong>{item.role === "assistant" ? "RIGA" : item.role === "system" ? "System" : "You"}</strong><span>{item.time}</span></div>{body}</div></article>;
 }
 
 export default App;

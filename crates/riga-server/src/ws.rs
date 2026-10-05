@@ -7,6 +7,16 @@ use tokio::sync::mpsc;
 
 use crate::mcp::McpRuntime;
 
+/// Which backend serves a run. Defaults to `Remote` so a client written before
+/// local models existed keeps working unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    #[default]
+    Remote,
+    Local,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub endpoint: String,
@@ -14,6 +24,17 @@ pub struct ProviderConfig {
     pub model: String,
     #[serde(default = "default_reasoning_effort")]
     pub reasoning_effort: String,
+    /// `Remote` talks to an OpenAI-compatible HTTP endpoint; `Local` runs an
+    /// in-process GGUF through llama.cpp. The endpoint and API key are ignored
+    /// for `Local`, which is why the UI can keep sending the same shape.
+    #[serde(default)]
+    pub kind: ProviderKind,
+}
+
+impl ProviderConfig {
+    fn is_local(&self) -> bool {
+        self.kind == ProviderKind::Local
+    }
 }
 
 fn default_reasoning_effort() -> String {
@@ -88,7 +109,12 @@ pub enum ServerMessage {
     },
 }
 
-pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf, mcp_runtime: McpRuntime) {
+pub async fn upgrade(
+    socket: WebSocket,
+    workspace_root: PathBuf,
+    mcp_runtime: McpRuntime,
+    local_models: std::sync::Arc<crate::local_model::LocalModelRuntime>,
+) {
     let (mut sender, mut receiver) = socket.split();
     let mut provider: Option<ProviderConfig> =
         match crate::secure_store::load_json("provider").await {
@@ -218,10 +244,23 @@ pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf, mcp_runtime: Mc
                     session_id,
                     prompt,
                 }) => {
-                    let Some(config) = provider.clone() else {
-                        let _ = send(&mut sender, ServerMessage::Error { code: "provider_not_configured".into(), message: "Configure an OpenAI-compatible provider in Settings before starting a run.".into() }).await;
-                        continue;
+                    let config = match resolve_run_provider(
+                        provider.as_ref(),
+                        local_models.loaded_file_name().is_some(),
+                    ) {
+                        Ok(config) => config,
+                        Err((code, message)) => {
+                            let _ = send(&mut sender, ServerMessage::Error { code: code.into(), message: message.into() }).await;
+                            continue;
+                        }
                     };
+                    // Fail before opening a run when a local provider is selected
+                    // but nothing is loaded, so the user gets an actionable
+                    // message instead of an inference error mid-stream.
+                    if config.is_local() && local_models.loaded_file_name().is_none() {
+                        let _ = send(&mut sender, ServerMessage::Error { code: "local_model_not_loaded".into(), message: "Load a local model in the model manager before starting a run.".into() }).await;
+                        continue;
+                    }
                     if send_provider_events(
                         &mut sender,
                         &config,
@@ -230,6 +269,7 @@ pub async fn upgrade(socket: WebSocket, workspace_root: PathBuf, mcp_runtime: Mc
                         &session_id,
                         &prompt,
                         &mcp_runtime,
+                        &local_models,
                     )
                     .await
                     .is_err()
@@ -421,6 +461,7 @@ async fn send_provider_events<S>(
     session_id: &str,
     prompt: &str,
     mcp_runtime: &McpRuntime,
+    local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
 ) -> Result<(), S::Error>
 where
     S: SinkExt<Message> + Unpin,
@@ -439,6 +480,7 @@ where
         prompt,
         mcp_runtime,
         trace_sender,
+        local_models,
     ));
     let mut sequence = 2;
     let result = loop {
@@ -543,13 +585,52 @@ where
     Ok(())
 }
 
+/// Decide what actually serves a run, given the stored provider and whether a
+/// local model is loaded. Returns `Err` with `(code, message)` when there is
+/// genuinely nothing to run on.
+///
+/// The local fallback is the point: loading a model is itself a choice of
+/// provider, so "download, load, chat" must not additionally require a trip
+/// through Settings. The synthesized config carries no endpoint or key because
+/// a local run never reads them.
+fn resolve_run_provider(
+    stored: Option<&ProviderConfig>,
+    local_model_loaded: bool,
+) -> Result<ProviderConfig, (&'static str, &'static str)> {
+    if let Some(config) = stored {
+        // A stored *local* provider whose model has since been unloaded is
+        // caught by the caller's not-loaded check, which has a more specific
+        // remedy than "no provider configured".
+        return Ok(config.clone());
+    }
+    if local_model_loaded {
+        return Ok(ProviderConfig {
+            endpoint: String::new(),
+            api_key: String::new(),
+            model: "local".into(),
+            reasoning_effort: default_reasoning_effort(),
+            kind: ProviderKind::Local,
+        });
+    }
+    Err((
+        "provider_not_configured",
+        "Load a local model or connect a provider in Settings before starting a run.",
+    ))
+}
+
 async fn call_openai_compatible(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
     prompt: &str,
     mcp_runtime: &McpRuntime,
     trace_sender: mpsc::Sender<ToolTraceEvent>,
+    local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
 ) -> Result<AgentResult, String> {
+    // A local model short-circuits every HTTP path: there is no endpoint to
+    // call and no Responses API, so the gpt-5 branch must not be reached.
+    if config.is_local() {
+        return call_local_model(config, workspace_root, prompt, mcp_runtime, trace_sender, local_models).await;
+    }
     if config.model.to_ascii_lowercase().starts_with("gpt-5") {
         return call_responses_api(config, workspace_root, prompt, mcp_runtime, trace_sender).await;
     }
@@ -679,6 +760,210 @@ async fn call_chat_with_tools(
         }
     }
     Err("provider exceeded the maximum tool-call turns".into())
+}
+
+/// Maximum assistant turns in one local run. Each turn is a full re-decode of
+/// the growing conversation, so this bounds latency rather than correctness.
+const LOCAL_MAX_TURNS: usize = 8;
+
+/// Tokens requested per local turn before `resolve_max_tokens` shrinks it to the
+/// room the prompt leaves. Deliberately modest: a 1.5B model at 4k tokens on CPU
+/// is minutes of work, and the tool loop re-decodes the history every turn.
+const LOCAL_MAX_TOKENS: u32 = 1024;
+
+#[derive(Debug, PartialEq)]
+struct ParsedToolCall {
+    name: String,
+    arguments: serde_json::Value,
+}
+
+/// Extract `<tool_call>{...}</tool_call>` blocks and return them alongside the
+/// prose with the blocks removed.
+///
+/// Two details matter for small models. First, several shapes exist in the wild
+/// for the arguments key (`arguments`, `parameters`, `input`, or a bare object),
+/// so all are accepted. Second, prose around a tool call must survive, so blocks
+/// are cut out of the reply rather than the whole reply being discarded. The
+/// two passes share one scan: the first collects calls, the second strips the
+/// blocks, so they can never disagree about which blocks were recognised.
+fn parse_local_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
+    const OPEN: &str = "<tool_call>";
+    const CLOSE: &str = "</tool_call>";
+    let mut calls = Vec::new();
+    let mut prose = String::with_capacity(text.len());
+    let mut scan = text;
+    // Each iteration consumes one well-formed block, emitting the text before it
+    // and skipping past the block itself.
+    while let Some(start) = scan.find(OPEN) {
+        let after_open = &scan[start + OPEN.len()..];
+        // An unterminated block means the model stopped mid-call; keep the
+        // remainder as prose instead of dropping the reply.
+        let Some(end) = after_open.find(CLOSE) else {
+            prose.push_str(scan);
+            return (prose.trim().to_owned(), calls);
+        };
+        let raw = after_open[..end].trim();
+        if let Some(call) = parse_one_local_tool_call(raw) {
+            calls.push(call);
+        }
+        prose.push_str(&scan[..start]);
+        scan = &after_open[end + CLOSE.len()..];
+    }
+    prose.push_str(scan);
+    (prose.trim().to_owned(), calls)
+}
+
+fn parse_one_local_tool_call(raw: &str) -> Option<ParsedToolCall> {
+    let candidate: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let name = candidate
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())?
+        .to_owned();
+    let arguments = candidate
+        .get("arguments")
+        .or_else(|| candidate.get("parameters"))
+        .or_else(|| candidate.get("input"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    // Small models often emit the arguments as a JSON *string* containing the
+    // object. Unwrap that instead of failing the run over a quoting slip.
+    let arguments = match arguments {
+        serde_json::Value::String(ref inner) => {
+            serde_json::from_str(inner).unwrap_or(arguments)
+        }
+        other => other,
+    };
+    Some(ParsedToolCall { name, arguments })
+}
+
+/// Tool instructions for a local model, appended to the coding-agent prompt.
+///
+/// The curated GGUFs are general-purpose instruction models without a native
+/// tool-call template, so the protocol is stated explicitly. `<tool_call>` is the
+/// Hermes/Qwen convention these checkpoints were tuned on, which is why it is
+/// used here instead of inventing a new one.
+fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition]) -> String {
+    let mut text = String::from(
+        "\n\nYou can call tools. To call exactly one, reply with this and nothing else:\n<tool_call>{\"name\": \"TOOL_NAME\", \"arguments\": {}}</tool_call>\n\nAvailable tools:\n",
+    );
+    for definition in definitions {
+        let name = definition.name.clone();
+        let description = definition.description.clone();
+        let parameters = serde_json::to_string(&definition.parameters)
+            .unwrap_or_else(|_| "{}".to_owned());
+        text.push_str(&format!("- {name}: {description}\n  arguments: {parameters}\n"));
+    }
+    text.push_str(
+        "\nCall one tool per reply and wait for its result. When you have the final \
+         answer, reply with plain prose and no tool_call block.\n",
+    );
+    text
+}
+
+async fn call_local_model(
+    // Kept for symmetry with the other `call_*` backends; a local run uses the
+    // loaded GGUF rather than anything in the provider config.
+    _config: &ProviderConfig,
+    workspace_root: &std::path::Path,
+    prompt: &str,
+    mcp_runtime: &McpRuntime,
+    trace_sender: mpsc::Sender<ToolTraceEvent>,
+    local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
+) -> Result<AgentResult, String> {
+    let definitions = mcp_runtime.tool_definitions().await;
+    let system = format!(
+        "{}{}",
+        coding_agent_system_prompt(),
+        local_tool_instructions(&definitions)
+    );
+    let mut messages = vec![
+        crate::local_model::ChatMessage {
+            role: "system".into(),
+            content: system,
+        },
+        crate::local_model::ChatMessage {
+            role: "user".into(),
+            content: prompt.to_owned(),
+        },
+    ];
+    let mut final_text = String::new();
+    for turn in 0..LOCAL_MAX_TURNS {
+        // Generation is blocking C, so it runs on the blocking pool. The future
+        // is awaited directly: nothing else in this task needs the executor, and
+        // a dropped run would otherwise leave a context mid-decode.
+        let request = messages.clone();
+        let runtime = local_models.clone();
+        // Run-scoped stop flag. `CancelRun` cannot reach it yet (see the note at
+        // call site), so it is currently always false; passing it explicitly
+        // keeps the generate contract intact for when cancellation is wired.
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let text = tokio::task::spawn_blocking(move || {
+            runtime.generate(&request, LOCAL_MAX_TOKENS, &cancel, |_delta| {})
+        })
+        .await
+        .map_err(|error| format!("local inference worker failed: {error}"))??;
+        let (prose, tool_calls) = parse_local_tool_calls(&text);
+        if !prose.is_empty() {
+            final_text = prose.clone();
+        }
+        if tool_calls.is_empty() {
+            return Ok(AgentResult {
+                output: if final_text.is_empty() {
+                    text
+                } else {
+                    final_text
+                },
+            });
+        }
+        // Record the assistant turn so the model can see what it asked for.
+        messages.push(crate::local_model::ChatMessage {
+            role: "assistant".into(),
+            content: text,
+        });
+        for (index, call) in tool_calls.iter().enumerate() {
+            let call_id = format!("local-{turn}-{index}");
+            let payload = serde_json::json!({
+                "call_id": call_id,
+                "name": call.name,
+                "arguments": call.arguments,
+            });
+            trace_sender
+                .send(ToolTraceEvent::Started(payload.clone()))
+                .await
+                .map_err(|_| "tool lifecycle stream closed")?;
+            let result = execute_tool(
+                workspace_root,
+                mcp_runtime,
+                &call.name,
+                call.arguments.clone(),
+                Some(ToolOutputStream {
+                    call_id: call_id.clone(),
+                    trace_sender: trace_sender.clone(),
+                }),
+            )
+            .await;
+            let (ok, output) = match result {
+                Ok(output) => (true, output),
+                Err(error) => (false, format!("tool error: {error}")),
+            };
+            trace_sender
+                .send(ToolTraceEvent::Completed(ToolTrace {
+                    call: payload,
+                    name: call.name.clone(),
+                    output: output.clone(),
+                    ok,
+                }))
+                .await
+                .map_err(|_| "tool lifecycle stream closed")?;
+            messages.push(crate::local_model::ChatMessage {
+                role: "tool".into(),
+                content: format!("Result from {}: {output}", call.name),
+            });
+        }
+    }
+    Err("local model exceeded the maximum tool-call turns".into())
 }
 
 async fn call_responses_api(
@@ -993,7 +1278,10 @@ fn envelope(run_id: &str, session_id: &str, sequence: u64, event: RigaEvent) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{ClientMessage, ProviderConfig, ServerMessage};
+    use super::{
+        ClientMessage, ParsedToolCall, ProviderConfig, ProviderKind, ServerMessage,
+        parse_local_tool_calls, resolve_run_provider,
+    };
     use riga_kernel::events::RigaEvent;
 
     #[test]
@@ -1092,5 +1380,187 @@ mod tests {
         .unwrap();
         assert!(dispatch.contains("\"name\": \"build\""));
         assert!(dispatch.contains("Create an Express health server"));
+    }
+
+    #[test]
+    fn a_loaded_local_model_serves_a_run_without_any_saved_provider() {
+        // The reported bug: download a model, load it, send a message, and the
+        // run was refused with provider_not_configured because nothing had been
+        // saved through Settings yet. Loading a model is itself a provider
+        // choice, so it must be enough.
+        let resolved = resolve_run_provider(None, true).expect("a loaded model must serve the run");
+        assert_eq!(resolved.kind, ProviderKind::Local);
+        // A local run reads neither of these, and inheriting a stale remote
+        // endpoint here would be misleading.
+        assert!(resolved.endpoint.is_empty());
+        assert!(resolved.api_key.is_empty());
+        assert!(resolved.reasoning_effort == "low");
+    }
+
+    #[test]
+    fn nothing_loaded_and_nothing_saved_still_reports_a_missing_provider() {
+        let (code, message) = resolve_run_provider(None, false).expect_err("must refuse");
+        assert_eq!(code, "provider_not_configured");
+        // The remedy has to mention both options, since either one unblocks it.
+        assert!(
+            message.contains("local model") && message.contains("Settings"),
+            "unhelpful message: {message}"
+        );
+    }
+
+    #[test]
+    fn a_stored_provider_wins_over_the_local_fallback() {
+        // An explicit remote choice must not be silently replaced by whatever
+        // model happens to be resident in memory.
+        let stored = ProviderConfig {
+            endpoint: "https://api.example/v1".into(),
+            api_key: "k".into(),
+            model: "opencode-go".into(),
+            reasoning_effort: "high".into(),
+            kind: ProviderKind::Remote,
+        };
+        let resolved = resolve_run_provider(Some(&stored), true).expect("stored provider must win");
+        assert_eq!(resolved.kind, ProviderKind::Remote);
+        assert_eq!(resolved.model, "opencode-go");
+        assert_eq!(resolved.reasoning_effort, "high");
+    }
+
+    #[test]
+    fn a_stored_local_provider_is_passed_through_unchanged() {
+        // Preserved so the caller's not-loaded check can produce the specific
+        // "load a model" error instead of the generic one.
+        let stored = ProviderConfig {
+            endpoint: String::new(),
+            api_key: String::new(),
+            model: "local".into(),
+            reasoning_effort: "medium".into(),
+            kind: ProviderKind::Local,
+        };
+        let resolved = resolve_run_provider(Some(&stored), false).expect("passed through");
+        assert_eq!(resolved.kind, ProviderKind::Local);
+        assert_eq!(resolved.reasoning_effort, "medium");
+    }
+
+    #[test]
+    fn provider_kind_defaults_to_remote_for_older_clients() {
+        // A client written before local models existed omits `kind` entirely; it
+        // must keep working rather than deserialising into a local run.
+        let message: ClientMessage = serde_json::from_str(
+            r#"{"type":"configure_provider","endpoint":"https://api.example/v1","api_key":"k","model":"opencode-go"}"#,
+        )
+        .unwrap();
+        let ClientMessage::ConfigureProvider(config) = message else {
+            panic!("expected configure_provider");
+        };
+        assert_eq!(config.kind, ProviderKind::Remote);
+        assert!(!config.is_local());
+    }
+
+    #[test]
+    fn provider_kind_round_trips_local() {
+        let config: ProviderConfig = serde_json::from_str(
+            r#"{"endpoint":"","api_key":"","model":"local","kind":"local"}"#,
+        )
+        .unwrap();
+        assert!(config.is_local());
+        // It must survive the round trip the secure store performs, since that
+        // JSON is what a reconnecting client reads back.
+        let stored = serde_json::to_string(&config).unwrap();
+        assert!(stored.contains("\"kind\":\"local\""), "got {stored}");
+        assert_eq!(
+            serde_json::from_str::<ProviderConfig>(&stored).unwrap().kind,
+            ProviderKind::Local
+        );
+    }
+
+    #[test]
+    fn a_single_tool_call_is_extracted_and_prose_is_kept() {
+        let (prose, calls) = parse_local_tool_calls(
+            "Let me look.\n<tool_call>{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}</tool_call>",
+        );
+        assert_eq!(prose, "Let me look.");
+        assert_eq!(
+            calls,
+            vec![ParsedToolCall {
+                name: "read_file".into(),
+                arguments: serde_json::json!({ "path": "a.txt" }),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_pure_tool_call_leaves_no_empty_prose() {
+        let (prose, calls) =
+            parse_local_tool_calls("<tool_call>{\"name\":\"list_files\",\"arguments\":{}}</tool_call>");
+        assert_eq!(prose, "", "the protocol block must not leak into the reply");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "list_files");
+    }
+
+    #[test]
+    fn several_tool_calls_in_one_reply_are_all_returned_in_order() {
+        let (prose, calls) = parse_local_tool_calls(
+            "<tool_call>{\"name\":\"a\",\"arguments\":{}}</tool_call> then <tool_call>{\"name\":\"b\",\"arguments\":{}}</tool_call>",
+        );
+        assert_eq!(prose, "then");
+        assert_eq!(
+            calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+    }
+
+    #[test]
+    fn arguments_shapes_and_quoting_slips_are_tolerated() {
+        // Small models emit the arguments key inconsistently, and sometimes wrap
+        // the object in a JSON string. Both must still reach the tool executor.
+        // Each case states its expected arguments explicitly: a substring
+        // heuristic would silently mis-read the escaped-string case.
+        let one = serde_json::json!({ "x": 1 });
+        let cases: [(&str, serde_json::Value); 5] = [
+            (r#"{"name":"t","arguments":{"x":1}}"#, one.clone()),
+            (r#"{"name":"t","parameters":{"x":1}}"#, one.clone()),
+            (r#"{"name":"t","input":{"x":1}}"#, one.clone()),
+            (
+                r#"{"name":"t","arguments":"{\"x\":1}"}"#,
+                one.clone(),
+            ),
+            (r#"{"name":"t"}"#, serde_json::json!({})),
+        ];
+        for (raw, expected) in cases {
+            let (prose, calls) =
+                parse_local_tool_calls(&format!("<tool_call>{raw}</tool_call>"));
+            assert_eq!(calls.len(), 1, "no call parsed from {raw}");
+            assert_eq!(calls[0].name, "t", "for {raw}");
+            assert_eq!(calls[0].arguments, expected, "for {raw}");
+            assert!(prose.is_empty(), "protocol block leaked for {raw}");
+        }
+    }
+
+    #[test]
+    fn malformed_blocks_do_not_destroy_the_reply() {
+        // Unparseable or unterminated JSON must not cost the user their answer.
+        for reply in [
+            "Here is the answer.\n<tool_call>{not json}</tool_call>",
+            "Here is the answer.\n<tool_call>{\"name\":\"a\"",
+            "no protocol here at all",
+        ] {
+            let (prose, calls) = parse_local_tool_calls(reply);
+            assert!(calls.is_empty(), "unexpected call in {reply:?}");
+            assert!(
+                prose.contains("Here is the answer.") || prose == "no protocol here at all",
+                "prose lost for {reply:?}, got {prose:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_with_no_name_is_rejected_rather_than_executed() {
+        // An unnamed call cannot be dispatched, and guessing a tool would be
+        // worse than ignoring it.
+        let (_, calls) =
+            parse_local_tool_calls("<tool_call>{\"arguments\":{}}</tool_call>");
+        assert!(calls.is_empty());
+        let (_, calls) = parse_local_tool_calls("<tool_call>{\"name\":\"  \"}</tool_call>");
+        assert!(calls.is_empty());
     }
 }

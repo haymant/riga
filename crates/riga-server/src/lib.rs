@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 pub mod catalog;
+pub mod local_model;
 pub mod mcp;
 pub mod secure_store;
 pub mod ws;
@@ -40,6 +41,10 @@ pub struct ServerState {
     pub(crate) secure_store: Option<Arc<secure_store::SecureStore>>,
     pub(crate) mcp_registry: Arc<RwLock<Vec<catalog::McpServerRecord>>>,
     pub(crate) mcp_runtime: mcp::McpRuntime,
+    /// Local GGUF download/inference runtime. Cheap to construct: the llama.cpp
+    /// backend is only initialized on the first model load, and the process-wide
+    /// singleton is shared, so this stays inert until a model is actually used.
+    pub(crate) local_models: Arc<local_model::LocalModelRuntime>,
 }
 
 impl Default for ServerState {
@@ -71,6 +76,7 @@ impl Default for ServerState {
             secure_store,
             mcp_registry: Arc::new(RwLock::new(mcp_registry)),
             mcp_runtime: mcp::McpRuntime::new(),
+            local_models: Arc::new(local_model::LocalModelRuntime::default()),
         }
     }
 }
@@ -101,6 +107,16 @@ pub fn router(state: ServerState) -> Router {
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/runs/{run_id}/events", get(stream_events))
         .route("/ws", get(ws_upgrade))
+        .route(
+            "/local-models",
+            get(list_local_models).post(local_model_action),
+        )
+        .route("/local-models/catalog", get(local_model_catalog))
+        .route("/local-models/downloads", get(local_model_downloads))
+        .route(
+            "/local-models/downloads/events",
+            get(local_model_download_events),
+        )
         .with_state(state)
 }
 
@@ -122,7 +138,13 @@ async fn ws_upgrade(
                 api_key: None,
             });
             runtime.connect_records(&records).await;
-            ws::upgrade(socket, state.workspace_root.clone(), runtime).await;
+            ws::upgrade(
+                socket,
+                state.workspace_root.clone(),
+                runtime,
+                state.local_models.clone(),
+            )
+            .await;
         }
     })
 }
@@ -133,6 +155,161 @@ async fn health() -> Json<HealthResponse> {
         adapter: ADAPTER_NAME,
         persistence_backend: secure_store::database_backend(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Local GGUF model manager
+// ---------------------------------------------------------------------------
+
+/// Everything the model-picker UI needs to render in one round trip: the closed
+/// curated list, what is on disk, what is loaded, and which accelerator this
+/// build can actually use. Reporting the accelerator matters because a binary
+/// built without `cuda` silently falls back to the CPU, and a user waiting on a
+/// slow first token deserves to know that before they blame the model.
+async fn list_local_models(State(state): State<ServerState>) -> Json<LocalModelOverview> {
+    Json(LocalModelOverview {
+        accelerator: local_model::accelerator_label(),
+        catalog: state.local_models.curated_catalog(),
+        installed: state.local_models.list_installed().unwrap_or_default(),
+        loaded: state.local_models.loaded_file_name(),
+    })
+}
+
+async fn local_model_catalog(State(state): State<ServerState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!(state.local_models.curated_catalog()))
+}
+
+/// Polled by the picker to render download progress. A poll rather than a push
+/// stream keeps the browser build free of an EventSource dependency, and
+/// download progress is coarse-grained enough that polling costs nothing.
+async fn local_model_downloads(State(state): State<ServerState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "models_dir": state.local_models.models_dir_public(),
+        "accelerator": local_model::accelerator_label(),
+    }))
+}
+
+/// Server-sent events for download progress and terminal download state.
+/// Subscribing before POSTing `/local-models` avoids missing the first event.
+async fn local_model_download_events(
+    State(state): State<ServerState>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let mut receiver = state.local_models.subscribe();
+    let stream = async_stream::stream! {
+        // Comment frames defeat proxy/browser idle buffering, which otherwise
+        // holds the first progress event until enough bytes accumulate.
+        yield Ok(Event::default().comment("stream-open"));
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".into());
+                    yield Ok(Event::default().event("local-model").data(payload));
+                }
+                // A lagging reader dropped events; the UI re-syncs from the
+                // installed list, so this is not fatal.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    yield Ok(Event::default().comment("lagged"));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocalModelOverview {
+    pub accelerator: &'static str,
+    pub catalog: Vec<local_model::CuratedModelEntry>,
+    pub installed: Vec<local_model::InstalledModel>,
+    pub loaded: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LocalModelRequest {
+    /// One of `download`, `cancel`, `load`, `unload`.
+    pub action: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+async fn local_model_action(
+    State(state): State<ServerState>,
+    Json(request): Json<LocalModelRequest>,
+) -> impl IntoResponse {
+    let bad = |message: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": message })),
+        )
+            .into_response()
+    };
+    match request.action.as_str() {
+        "download" => {
+            let Some(model_id) = request.model_id.as_deref().map(str::trim).filter(|id| !id.is_empty())
+            else {
+                return bad("model_id is required to download a model");
+            };
+            let model_id = model_id.to_owned();
+            let runtime = state.local_models.clone();
+            // Reject unknown ids and duplicates here rather than in the spawned
+            // task: the task's error is only logged, so a bad id would answer
+            // 202 "started" and the picker would wait on a bar that never moves.
+            if let Some(blocker) = runtime.download_blocker(&model_id) {
+                return bad(&blocker);
+            }
+            let for_task = model_id.clone();
+            // The transfer outlives the request, so it runs detached and reports
+            // through the event stream rather than holding the connection open
+            // for the length of a multi-gigabyte download.
+            tokio::spawn(async move {
+                if let Err(error) = runtime.start_download(&for_task).await {
+                    tracing::error!(model_id = %for_task, %error, "local model download failed");
+                }
+            });
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "started": model_id })),
+            )
+                .into_response()
+        }
+        "cancel" => {
+            let Some(model_id) = request.model_id.as_deref().map(str::trim).filter(|id| !id.is_empty())
+            else {
+                return bad("model_id is required to cancel a download");
+            };
+            match state.local_models.cancel_download(model_id) {
+                Ok(()) => StatusCode::ACCEPTED.into_response(),
+                Err(error) => bad(&error),
+            }
+        }
+        "load" => {
+            let Some(path) = request.path.as_deref().map(str::trim).filter(|path| !path.is_empty())
+            else {
+                return bad("path is required to load a model");
+            };
+            match state.local_models.load_model(path).await {
+                Ok(()) => Json(serde_json::json!({ "loaded": state.local_models.loaded_file_name() }))
+                    .into_response(),
+                Err(error) => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({ "error": error })),
+                )
+                    .into_response(),
+            }
+        }
+        "unload" => match state.local_models.unload_model() {
+            Ok(()) => Json(serde_json::json!({ "loaded": Option::<String>::None })).into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response(),
+        },
+        other => bad(&format!("unknown local model action: {other}")),
+    }
 }
 
 async fn tool_catalog(

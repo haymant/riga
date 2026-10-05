@@ -15,6 +15,10 @@ export default defineConfig({
       "/mcp": { target: "http://127.0.0.1:8787" },
       "/attachments": { target: "http://127.0.0.1:8787" },
       "/sessions": { target: "http://127.0.0.1:8787" },
+      // Covers /local-models and all of its sub-paths, including the download
+      // event stream. Without this the SPA fallback answers with index.html and
+      // the model manager silently sees HTML instead of JSON.
+      "/local-models": { target: "http://127.0.0.1:8787" },
     },
   },
   build: { target: "es2022", outDir: "dist" },
