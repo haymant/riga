@@ -874,6 +874,35 @@ async fn call_chat_with_tools(
     trace_sender: mpsc::Sender<ToolTraceEvent>,
     history: &[ConversationTurn],
 ) -> Result<AgentResult, String> {
+    run_chat_loop(
+        config,
+        workspace_root,
+        &coding_agent_system_prompt(),
+        None,
+        prompt,
+        mcp_runtime,
+        trace_sender,
+        history,
+        0,
+    )
+    .await
+}
+
+/// The tool-using chat loop. `system_prompt` and `allowed_tools` differ between
+/// the orchestrator (all tools) and a dispatched subagent (a restricted set);
+/// `depth` bounds subagent nesting.
+#[allow(clippy::too_many_arguments)]
+async fn run_chat_loop(
+    config: &ProviderConfig,
+    workspace_root: &std::path::Path,
+    system_prompt: &str,
+    allowed_tools: Option<&[String]>,
+    prompt: &str,
+    mcp_runtime: &McpRuntime,
+    trace_sender: mpsc::Sender<ToolTraceEvent>,
+    history: &[ConversationTurn],
+    depth: usize,
+) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
         .trim_end_matches('/')
@@ -887,9 +916,23 @@ async fn call_chat_with_tools(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
+    // Resolve the tool list once. The MCP definitions are async and were
+    // previously refetched on every turn of the loop.
+    let tools = {
+        let mut merged =
+            crate::mcp::merge_tool_schemas(tool_schemas(), mcp_runtime.tool_definitions().await);
+        if let Some(allowed) = allowed_tools {
+            merged.retain(|tool| {
+                tool.pointer("/function/name")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|name| allowed.iter().any(|allowed| allowed == name))
+            });
+        }
+        merged
+    };
     let mut messages = vec![serde_json::json!({
         "role": "system",
-        "content": coding_agent_system_prompt()
+        "content": system_prompt
     })];
     messages.extend(
         history
@@ -900,10 +943,10 @@ async fn call_chat_with_tools(
     for _ in 0..24 {
         let mut request = client
             .post(&endpoint)
-            .json(&completion_request_body_with_messages(
+            .json(&completion_request_body_with_tools(
                 &config.model,
                 &messages,
-                &mcp_runtime.tool_definitions().await,
+                tools.clone(),
             ));
         if !config.api_key.trim().is_empty() {
             request = request.bearer_auth(&config.api_key);
@@ -966,17 +1009,29 @@ async fn call_chat_with_tools(
                 .send(ToolTraceEvent::Started(call.clone()))
                 .await
                 .map_err(|_| "tool lifecycle stream closed")?;
-            let result = execute_tool(
-                workspace_root,
-                mcp_runtime,
-                name,
-                input.clone(),
-                Some(ToolOutputStream {
-                    call_id: call_id.to_owned(),
-                    trace_sender: trace_sender.clone(),
-                }),
-            )
-            .await;
+            let result = if name == "task" && is_subagent_dispatch(&input) {
+                Box::pin(dispatch_subagent(
+                    config,
+                    workspace_root,
+                    &input,
+                    mcp_runtime,
+                    &trace_sender,
+                    depth,
+                ))
+                .await
+            } else {
+                execute_tool(
+                    workspace_root,
+                    mcp_runtime,
+                    name,
+                    input.clone(),
+                    Some(ToolOutputStream {
+                        call_id: call_id.to_owned(),
+                        trace_sender: trace_sender.clone(),
+                    }),
+                )
+                .await
+            };
             let (ok, output) = match result {
                 Ok(output) => (true, output),
                 Err(error) => (false, format!("tool error: {error}")),
@@ -1002,6 +1057,157 @@ async fn call_chat_with_tools(
         }
     }
     Err("provider exceeded the maximum tool-call turns".into())
+}
+
+/// True when a `task` call is asking to run a subagent rather than to list or
+/// create a durable task record.
+fn is_subagent_dispatch(input: &serde_json::Value) -> bool {
+    matches!(
+        input.get("action").and_then(serde_json::Value::as_str),
+        Some("dispatch") | Some("agent")
+    ) && input
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|agent| !agent.trim().is_empty())
+}
+
+/// Process-wide counter for subagent task ids.
+static TASK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Run a subagent to completion and return its result as the tool result.
+///
+/// The child gets its own context (empty history), the profile's system prompt,
+/// and a restricted tool set, so its file reads never enter the orchestrator's
+/// window — only the summary does. `TaskStarted`/`TaskCompleted` frames let the
+/// UI render the delegation.
+async fn dispatch_subagent(
+    config: &ProviderConfig,
+    workspace_root: &std::path::Path,
+    input: &serde_json::Value,
+    mcp_runtime: &McpRuntime,
+    trace_sender: &mpsc::Sender<ToolTraceEvent>,
+    depth: usize,
+) -> Result<String, String> {
+    if depth + 1 > riga_kernel::task::MAX_TASK_DEPTH {
+        return Err(format!(
+            "subagents may not nest beyond {} levels",
+            riga_kernel::task::MAX_TASK_DEPTH
+        ));
+    }
+    let agent = input
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("task dispatch requires an agent name")?;
+    let prompt = input
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("task dispatch requires a prompt")?;
+    let profile = crate::catalog::find_agent_profile(agent)
+        .ok_or_else(|| format!("unknown agent `{agent}`"))?;
+    let task_id = format!(
+        "task-{}",
+        TASK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let description: String = input
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(prompt)
+        .chars()
+        .take(120)
+        .collect();
+    let started = riga_kernel::task::TaskRecord {
+        id: task_id.clone(),
+        parent_id: Some(format!("depth-{depth}")),
+        agent: profile.name.clone(),
+        description: description.clone(),
+        model: config.model.clone(),
+        state: riga_kernel::task::TaskState::Running,
+        started_at: "now".into(),
+        result: None,
+    };
+    let _ = trace_sender
+        .send(ToolTraceEvent::Ui(
+            riga_kernel::events::RigaEvent::TaskStarted {
+                task: Box::new(started),
+            },
+        ))
+        .await;
+
+    let allowed = allowed_tools_for(&profile);
+    let outcome = Box::pin(run_chat_loop(
+        config,
+        workspace_root,
+        &subagent_system_prompt(&profile),
+        Some(&allowed),
+        prompt,
+        mcp_runtime,
+        trace_sender.clone(),
+        &[],
+        depth + 1,
+    ))
+    .await;
+
+    let (ok, result) = match outcome {
+        Ok(result) => (true, result.output),
+        Err(error) => (false, error),
+    };
+    let _ = trace_sender
+        .send(ToolTraceEvent::Ui(
+            riga_kernel::events::RigaEvent::TaskCompleted {
+                task_id,
+                ok,
+                result: result.clone(),
+            },
+        ))
+        .await;
+    if ok {
+        Ok(format!("[{} subagent result]\n{result}", profile.name))
+    } else {
+        Err(format!("{} subagent failed: {result}", profile.name))
+    }
+}
+
+/// The system prompt for a dispatched subagent, built from its profile rules and
+/// expected output sections.
+fn subagent_system_prompt(profile: &crate::catalog::AgentProfile) -> String {
+    let mut prompt = format!(
+        "You are the RIGA `{}` subagent. {}\n\nRules:\n",
+        profile.name, profile.purpose
+    );
+    for rule in &profile.system_rules {
+        prompt.push_str(&format!("- {rule}\n"));
+    }
+    prompt.push_str(
+        "\nYou were dispatched by the orchestrator: work autonomously, do not ask the user questions, and return a concise result it can use.\n",
+    );
+    if !profile.output_format.is_empty() {
+        prompt.push_str("Use these sections:\n");
+        for section in &profile.output_format {
+            prompt.push_str(&format!("- {section}\n"));
+        }
+    }
+    prompt
+}
+
+/// The tools a subagent may call. A read-only profile never gets write, shell,
+/// or nested dispatch, so it cannot exceed its remit by accident.
+fn allowed_tools_for(profile: &crate::catalog::AgentProfile) -> Vec<String> {
+    let mut allowed = vec!["update_plan".to_owned(), "update_todos".to_owned()];
+    if profile.read_only {
+        allowed.extend(["read", "glob", "grep", "skill"].map(str::to_owned));
+        return allowed;
+    }
+    for tool in &profile.tools {
+        let base = tool.split('(').next().unwrap_or(tool).trim();
+        if !base.is_empty() {
+            allowed.push(base.to_owned());
+        }
+    }
+    allowed
 }
 
 /// Maximum assistant turns in one local run. Each turn is a full re-decode of
@@ -1421,17 +1627,19 @@ fn responses_tool_schemas(mcp: &[rig_core::completion::ToolDefinition]) -> Vec<s
     crate::mcp::merge_response_tool_schemas(tool_schemas(), mcp.to_vec())
 }
 
-fn completion_request_body_with_messages(
+/// Build a chat request from an already-resolved tool list, so a subagent can
+/// run with a restricted subset.
+fn completion_request_body_with_tools(
     model: &str,
     messages: &[serde_json::Value],
-    mcp: &[rig_core::completion::ToolDefinition],
+    tools: Vec<serde_json::Value>,
 ) -> serde_json::Value {
     serde_json::json!({
         "model": model,
         "messages": messages,
         "stream": false,
         "max_completion_tokens": 2048,
-        "tools": crate::mcp::merge_tool_schemas(tool_schemas(), mcp.to_vec()),
+        "tools": tools,
         "tool_choice": "auto",
     })
 }
@@ -1470,8 +1678,8 @@ fn tool_schemas() -> Vec<serde_json::Value> {
         ),
         function_schema(
             "task",
-            "List, inspect, create, or update durable tasks; list or dispatch explore, plan, build, and review agents",
-            serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list","inspect","create","update","agents","agent_list","dispatch","agent"]},"agent":{"type":"string","enum":["explore","plan","build","review","scout","planner","executor","worker","reviewer"]},"name":{"type":"string"},"prompt":{"type":"string"},"title":{"type":"string"},"description":{"type":"string"},"status":{"type":"string"},"task_id":{"type":"string"}},"required":[]}),
+            "Run a specialized subagent to completion and return its result. Use action \"dispatch\" with an agent (explore, plan, build, review) and a prompt; action \"agents\" lists them.",
+            serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list","inspect","create","update","agents","agent_list","dispatch","agent"]},"agent":{"type":"string","enum":["explore","plan","build","review","scout","planner","executor","worker","reviewer"]},"prompt":{"type":"string"},"description":{"type":"string"},"name":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"task_id":{"type":"string"}},"required":[]}),
         ),
         function_schema(
             "skill",
@@ -1664,10 +1872,10 @@ mod tests {
 
     #[test]
     fn completion_request_uses_strict_max_completion_tokens() {
-        let body = super::completion_request_body_with_messages(
+        let body = super::completion_request_body_with_tools(
             "gpt-5-nano",
             &[serde_json::json!({"role": "user", "content": "hello"})],
-            &[],
+            Vec::new(),
         );
         assert_eq!(body["max_completion_tokens"], 2048);
         assert!(body.get("max_tokens").is_none());
@@ -2039,5 +2247,58 @@ mod tests {
             error.contains("update_plan arguments are invalid"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn subagent_dispatch_is_detected_from_the_task_arguments() {
+        assert!(super::is_subagent_dispatch(
+            &serde_json::json!({"action": "dispatch", "agent": "explore", "prompt": "find it"})
+        ));
+        assert!(super::is_subagent_dispatch(
+            &serde_json::json!({"action": "agent", "agent": "build", "prompt": "do it"})
+        ));
+        // Listing agents, or a dispatch with no agent, is not a subagent run.
+        assert!(!super::is_subagent_dispatch(
+            &serde_json::json!({"action": "agents"})
+        ));
+        assert!(!super::is_subagent_dispatch(
+            &serde_json::json!({"action": "dispatch", "prompt": "no agent"})
+        ));
+    }
+
+    #[test]
+    fn read_only_profiles_cannot_write_or_dispatch() {
+        let explore = crate::catalog::find_agent_profile("explore").expect("explore profile");
+        let allowed = super::allowed_tools_for(&explore);
+        for forbidden in ["write", "bash", "task"] {
+            assert!(
+                !allowed.iter().any(|tool| tool == forbidden),
+                "explore must not be allowed `{forbidden}`: {allowed:?}"
+            );
+        }
+        assert!(allowed.iter().any(|tool| tool == "read"));
+        assert!(allowed.iter().any(|tool| tool == "glob"));
+    }
+
+    #[test]
+    fn build_profile_may_write_and_dispatch() {
+        let build = crate::catalog::find_agent_profile("build").expect("build profile");
+        let allowed = super::allowed_tools_for(&build);
+        for expected in ["read", "write", "bash", "task"] {
+            assert!(
+                allowed.iter().any(|tool| tool == expected),
+                "build should be allowed `{expected}`: {allowed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_prompt_carries_the_profile_rules_and_sections() {
+        let review = crate::catalog::find_agent_profile("review").expect("review profile");
+        let prompt = super::subagent_system_prompt(&review);
+        assert!(prompt.contains("`review` subagent"), "{prompt}");
+        assert!(prompt.contains("Never modify files"), "{prompt}");
+        assert!(prompt.contains("Findings"), "{prompt}");
+        assert!(prompt.contains("do not ask the user"), "{prompt}");
     }
 }

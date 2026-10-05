@@ -399,7 +399,7 @@ fn agent_profile(
     }
 }
 
-fn find_agent_profile(name: &str) -> Option<AgentProfile> {
+pub fn find_agent_profile(name: &str) -> Option<AgentProfile> {
     let normalized = name.trim().to_ascii_lowercase();
     agent_profiles().into_iter().find(|profile| {
         profile.name == normalized || profile.aliases.iter().any(|alias| alias == &normalized)

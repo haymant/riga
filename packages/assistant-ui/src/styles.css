@@ -527,3 +527,4 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 .agent-step.todo-cancelled { opacity: .5; }
 .agent-step.todo-cancelled .agent-step-label { text-decoration: line-through; }
 @media (max-width: 760px) { .agent-work { margin-left: 0; } }
+.agent-tasks { border: 1px solid var(--border); border-radius: 12px; background: var(--surface-raised); padding: 11px 13px; }

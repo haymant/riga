@@ -58,6 +58,7 @@ type AgentPlanState = { title: string; steps: PlanStep[]; active_index: number }
 type TodoStatus = "pending" | "active" | "done" | "failed" | "cancelled";
 type TodoItemState = { id: string; text: string; description?: string; status: TodoStatus; reason?: string };
 type TodoListState = { title?: string; revision?: number; items: TodoItemState[] };
+type AgentTaskView = { id: string; agent: string; description: string; state: "running" | "done" | "failed"; result?: string };
 
 const initialSessions: Session[] = [
   { id: "riga", title: "RIGA desktop shell", meta: "Today · 14 messages", active: true },
@@ -139,6 +140,7 @@ export function AssistantUI({
   // scrolls, and durable across turns until the agent rewrites them.
   const [agentPlan, setAgentPlan] = useState<AgentPlanState | null>(null);
   const [agentTodos, setAgentTodos] = useState<TodoListState | null>(null);
+  const [agentTasks, setAgentTasks] = useState<AgentTaskView[]>([]);
   const [theme, setTheme] = useState<"dark" | "light">(() => loadLocal("riga.theme.v1", "dark"));
   const [fullWidthEnabled, setFullWidthEnabled] = useState(initialFullWidth);
   const [transportStatus, setTransportStatus] = useState<"connecting" | "connected" | "closed" | "error">("connecting");
@@ -323,6 +325,12 @@ export function AssistantUI({
           setAgentPlan((event as { PlanUpdated: { plan: AgentPlanState } }).PlanUpdated.plan);
         } else if (typeof event === "object" && event !== null && "TodoUpdated" in event) {
           setAgentTodos((event as { TodoUpdated: { list: TodoListState } }).TodoUpdated.list);
+        } else if (typeof event === "object" && event !== null && "TaskStarted" in event) {
+          const task = (event as { TaskStarted: { task: { id: string; agent: string; description: string } } }).TaskStarted.task;
+          setAgentTasks((current) => [...current.filter((item) => item.id !== task.id), { id: task.id, agent: task.agent, description: task.description, state: "running" }]);
+        } else if (typeof event === "object" && event !== null && "TaskCompleted" in event) {
+          const done = (event as { TaskCompleted: { task_id: string; ok: boolean; result: string } }).TaskCompleted;
+          setAgentTasks((current) => current.map((item) => item.id === done.task_id ? { ...item, state: done.ok ? "done" : "failed", result: done.result } : item));
         }
       },
     });
@@ -598,7 +606,7 @@ export function AssistantUI({
 
           {approval && <div className="approval-card"><div className="approval-icon"><ShieldCheck size={19} /></div><div className="approval-copy"><div className="approval-title"><strong>Approval required</strong><span>workspace mutation</span></div><p>Allow RIGA to write the transport adapter boundary in <code>crates/</code> and update the event journal contract?</p><div className="approval-details"><span><FolderOpen size={13} /> 3 files</span><span><GitBranch size={13} /> reversible change</span><span><Clock3 size={13} /> requested now</span></div></div><div className="approval-actions"><button className="deny-button" onClick={deny}>Decline</button><button className="approve-button" onClick={approve}><Check size={15} /> Approve</button></div></div>}
 
-          {(agentPlan || agentTodos) && <div className="agent-work"><AgentPlanCard plan={agentPlan} /><AgentTodoList list={agentTodos} /></div>}
+          {(agentPlan || agentTodos || agentTasks.length > 0) && <div className="agent-work"><AgentPlanCard plan={agentPlan} /><AgentTodoList list={agentTodos} /><AgentTaskList tasks={agentTasks} /></div>}
           <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" value={providerKind === "local" ? LOCAL_MODEL_VALUE : providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{localModels?.loaded && <option value={LOCAL_MODEL_VALUE}>Local · {localModels.loaded}</option>}{Array.from(new Set([providerModel, "gpt-5-nano", "gpt-5-mini", "gpt-5-codex"])).filter(Boolean).map((model) => <option key={model} value={model}>{model}</option>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setCatalogOpen((value) => !value); setManualCatalog(true); setCatalogLayer("root"); setCatalogQuery(""); }}><Plus size={17} /></button><textarea value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${isRunning ? "stop-ready" : draft.trim() ? "send-ready" : ""}`} aria-label={isRunning ? "Stop run" : "Send message"} onClick={isRunning ? stopRun : sendMessage}>{isRunning ? <CircleStop size={16} /> : <Send size={16} />}</button></div>{catalogOpen && <div className="catalog-menu" ref={catalogRef} role="listbox">
               <div className="catalog-menu-header">{catalogLayer === "connectors" && <button className="catalog-back" aria-label="Back to insert menu" onClick={() => setCatalogLayer("root")}><ChevronLeft size={14} /></button>}<strong>{activeTrigger ? `${activeTrigger.char === "@" ? "Mention" : "Command"} suggestions` : catalogLayer === "root" ? "Insert into composer" : "Connectors"}</strong><button className="catalog-close" aria-label="Close insert menu" onClick={() => setCatalogOpen(false)}><X size={14} /></button></div>
               <input className="catalog-search" autoFocus={catalogOpen} value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder={activeTrigger ? `Filter ${activeTrigger.char === "@" ? "files or agents" : "tools and skills"}…` : "Search tools, skills, connectors…"} aria-label="Search composer insert menu" />
@@ -733,6 +741,34 @@ function todoIcon(status: TodoStatus): string {
     case "cancelled": return "–";
     default: return "○";
   }
+}
+
+/** The subagents dispatched during this run. Mirrors the assistant-ui
+ * SubagentList: one row per worker with its state, plus the summary it
+ * returned. */
+function AgentTaskList({ tasks }: { tasks: AgentTaskView[] }) {
+  if (tasks.length === 0) return null;
+  const done = tasks.filter((task) => task.state !== "running").length;
+  const failed = tasks.filter((task) => task.state === "failed").length;
+  return (
+    <section className="agent-tasks" aria-label="Agent subagents">
+      <div className="agent-card-head">
+        <strong>Subagents</strong>
+        <span>{done}/{tasks.length}{failed ? ` · ${failed} failed` : ""}</span>
+      </div>
+      <ul className="agent-steps">
+        {tasks.map((task) => (
+          <li key={task.id} className={`agent-step todo-${task.state === "running" ? "active" : task.state === "done" ? "done" : "failed"}`}>
+            <span className="agent-step-icon" aria-hidden>{task.state === "running" ? "•" : task.state === "done" ? "✓" : "✕"}</span>
+            <span>
+              <span className="agent-step-label">{task.agent} · {task.description}</span>
+              {task.result ? <span className="agent-step-desc">{task.result.split("\n")[0]}</span> : null}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
 }
 
 export default AssistantUI;
