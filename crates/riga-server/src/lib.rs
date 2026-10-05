@@ -29,6 +29,7 @@ pub mod catalog;
 pub mod local_model;
 pub mod mcp;
 pub mod secure_store;
+pub mod workspace;
 pub mod ws;
 
 pub const ADAPTER_NAME: &str = "riga-server";

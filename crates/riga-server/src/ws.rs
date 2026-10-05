@@ -562,12 +562,33 @@ pub async fn upgrade(
                             let guard = transcripts.read().await;
                             trim_history(guard.get(&session_id).map(Vec::as_slice).unwrap_or(&[]))
                         };
+                        // Each session edits its own worktree on a
+                        // `riga/<session>` branch forked from HEAD, so a new app
+                        // cannot collide with an existing one and the base
+                        // checkout is untouched.
+                        let run_root =
+                            match crate::workspace::ensure_worktree(&workspace_root, &session_id)
+                                .await
+                            {
+                                Ok(root) => root,
+                                Err(error) => {
+                                    let _ = send(
+                                        &mut sender,
+                                        ServerMessage::Error {
+                                            code: "workspace_unavailable".into(),
+                                            message: error,
+                                        },
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            };
                         match send_provider_events(
                             &mut sender,
                             &mut receiver,
                             &broker,
                             &config,
-                            &workspace_root,
+                            &run_root,
                             &run_id,
                             &session_id,
                             &prompt,
@@ -1186,7 +1207,7 @@ async fn call_chat_with_tools(
     run_chat_loop(
         config,
         workspace_root,
-        &coding_agent_system_prompt(),
+        &coding_agent_system_prompt(workspace_root),
         None,
         prompt,
         mcp_runtime,
@@ -1805,7 +1826,7 @@ async fn call_local_model(
     run_local_loop(
         config,
         workspace_root,
-        &coding_agent_system_prompt(),
+        &coding_agent_system_prompt(workspace_root),
         None,
         prompt,
         mcp_runtime,
@@ -2000,7 +2021,7 @@ async fn call_responses_api(
     // the list when there is history so prior turns are not lost.
     let current = format!(
         "{}\n\nUser request:\n{}",
-        coding_agent_system_prompt(),
+        coding_agent_system_prompt(workspace_root),
         prompt
     );
     let mut input = if history.is_empty() {
@@ -2279,8 +2300,8 @@ fn content_text(content: &serde_json::Value) -> Option<String> {
 }
 
 /// The system prompt, built per run.
-fn coding_agent_system_prompt() -> String {
-    let workspace = crate::catalog::workspace_root();
+fn coding_agent_system_prompt(workspace_root: &std::path::Path) -> String {
+    let workspace = workspace_root;
     let mut prompt = String::from(
         "You are RIGA, a coding agent operating inside the configured workspace. \
 For requests that create, modify, inspect, run, or validate software, use the available tools instead of only describing commands or code. \
@@ -2458,7 +2479,7 @@ mod tests {
 
     #[test]
     fn coding_agent_prompt_requires_tools_for_implementation_requests() {
-        let prompt = super::coding_agent_system_prompt();
+        let prompt = super::coding_agent_system_prompt(std::path::Path::new("/tmp"));
         assert!(prompt.contains("use the available tools"));
         assert!(prompt.contains("Never claim a file or command succeeded"));
     }
@@ -2467,7 +2488,7 @@ mod tests {
     fn coding_agent_prompt_states_capabilities_and_agent_mentions() {
         // The model knows writes/shell pause for approval and that `@agent`
         // addresses a dispatchable subagent.
-        let prompt = super::coding_agent_system_prompt();
+        let prompt = super::coding_agent_system_prompt(std::path::Path::new("/tmp"));
         assert!(prompt.contains("pause for the user's approval"), "{prompt}");
         assert!(prompt.contains("@explore"), "{prompt}");
         assert!(prompt.contains("task"), "{prompt}");

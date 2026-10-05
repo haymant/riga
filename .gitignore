@@ -10,3 +10,7 @@ test-results/
 .DS_Store
 *.log
 tmp/riga-attachments/
+# Per-session git worktrees and other local RIGA state. Kept out of git so the
+# main checkout stays clean, and out of the workspace tools so grep/glob never
+# descend into another session's working tree.
+.riga/

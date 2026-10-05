@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncReadExt, process::Command, sync::mpsc};
 
 /// Directories that never hold agent-relevant source and would otherwise swamp
-/// a result: dependency trees, build output, and VCS internals.
-const IGNORED_DIRECTORIES: [&str; 3] = [".git", "node_modules", "target"];
+/// a result: dependency trees, build output, VCS internals, and the per-session
+/// worktrees the workspace module creates.
+const IGNORED_DIRECTORIES: [&str; 4] = [".git", "node_modules", "target", ".riga"];
 
 /// Hard cap on any single tool result handed back to the model. Without it one
 /// `glob` or `grep` can consume most of the context window before the model
