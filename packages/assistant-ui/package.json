@@ -4,12 +4,13 @@
   "private": false,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./styles.css": "./src/styles.css"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
-  "description": "Shared assistant UI contracts for RIGA-compatible clients.",
+  "description": "Reusable assistant chat surface (transcript, tool timeline, composer, model manager) for RIGA-compatible clients.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -20,6 +21,16 @@
     "url": "https://github.com/haymant/riga/issues"
   },
   "homepage": "https://github.com/haymant/riga#readme",
+  "dependencies": {
+    "@haymant/transport-http": "file:../transport-http",
+    "lucide-react": "^1.52.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
   "files": [
     "src"
   ]

@@ -22,8 +22,8 @@ The workspace is a **single Git repository and a multi-language monorepo**. It d
 - `crates/riga-kernel` — transport-free agent kernel, state, events, policy, and persistence abstractions.
 - `crates/riga-server` — authenticated HTTP/WebSocket adapter, provider loop, tools, encrypted store, and temporary attachments.
 - `crates/riga-cli` — command-line adapter boundary.
-- `apps/riga` — React/Vite desktop UI and Tauri shell.
-- `packages/assistant-ui` — shared assistant UI primitives and design contracts.
+- `apps/riga` — thin Vite entry that mounts `@haymant/assistant-ui` inside a Tauri shell.
+- `packages/assistant-ui` — the assistant chat surface (transcript, tool timeline, composer, settings, model manager) and its stylesheet.
 - `packages/transport-http` — browser WebSocket transport client.
 - `packages/transport-tauri` — Tauri transport boundary.
 

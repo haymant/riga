@@ -13,15 +13,9 @@
   },
   "dependencies": {
     "@haymant/assistant-ui": "file:../../packages/assistant-ui",
-    "@haymant/transport-http": "file:../../packages/transport-http",
-    "@riga/assistant-ui": "file:../../packages/assistant-ui",
-    "@riga/transport-http": "file:../../packages/transport-http",
     "@tauri-apps/api": "^2.12.1",
-    "lucide-react": "^1.52.0",
     "react": "^19.3.0",
-    "react-dom": "^19.3.0",
-    "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "react-dom": "^19.3.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.1",
