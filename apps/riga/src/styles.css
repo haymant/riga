@@ -298,3 +298,16 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 [data-theme="light"] .tool-timeline > summary::after,
 [data-theme="light"] .tool-card summary::after { color: #98a2b3; }
 [data-theme="light"] .composer-footer kbd { border: 0; background: #eef1f6; }
+
+
+/* final composer controls and light tool-symbol corrections */
+.composer-model select,
+.composer-model select:last-child { border: 0 !important; box-shadow: none !important; outline: 0; }
+.composer-model select:focus { outline: 0; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent) !important; }
+.catalog-inline-actions .catalog-category { display: grid; grid-template-columns: 1fr auto; align-items: center; width: 100%; color: var(--text); background: transparent; border: 0; }
+.catalog-inline-actions .catalog-category:hover { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+.connector-form { color: var(--text); background: transparent; }
+.connector-form-actions .approve-button { border: 0; }
+[data-theme="light"] .timeline-rail .tool-symbol,
+[data-theme="light"] .tool-symbol { color: #6950c9; background: #eeeafe; }
+[data-theme="light"] .timeline-rail .tool-card::before { background: var(--green); }
