@@ -59,6 +59,42 @@ fn default_reasoning_effort() -> String {
     "low".into()
 }
 
+/// One completed exchange kept for context.
+///
+/// Persisted per session so a follow-up like "go ahead" arrives with the plan
+/// it refers to instead of starting a cold run that asks for the goal again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurn {
+    pub role: String,
+    pub content: String,
+}
+
+/// How many prior turns are replayed to the model, and the total character
+/// budget across them. Bounded so a long session cannot crowd out the request.
+pub const MAX_HISTORY_TURNS: usize = 16;
+pub const MAX_HISTORY_CHARS: usize = 24_000;
+
+/// Keep the most recent turns that fit both budgets, dropping the oldest first.
+pub fn trim_history(turns: &[ConversationTurn]) -> Vec<ConversationTurn> {
+    let mut kept: Vec<ConversationTurn> = turns
+        .iter()
+        .rev()
+        .take(MAX_HISTORY_TURNS)
+        .cloned()
+        .collect();
+    kept.reverse();
+    let mut total = 0usize;
+    let mut start = 0usize;
+    for (index, turn) in kept.iter().enumerate().rev() {
+        total += turn.content.chars().count();
+        if total > MAX_HISTORY_CHARS {
+            start = index + 1;
+            break;
+        }
+    }
+    kept.split_off(start)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
@@ -139,6 +175,10 @@ pub async fn upgrade(
     workspace_root: PathBuf,
     mcp_runtime: McpRuntime,
     local_models: std::sync::Arc<crate::local_model::LocalModelRuntime>,
+    transcripts: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Vec<ConversationTurn>>>,
+    >,
+    secure_store: Option<std::sync::Arc<crate::secure_store::SecureStore>>,
 ) {
     let (mut sender, mut receiver) = socket.split();
     let mut provider: Option<ProviderConfig> =
@@ -302,7 +342,11 @@ pub async fn upgrade(
                             let _ = send(&mut sender, ServerMessage::Error { code: "local_model_not_loaded".into(), message: "Load a local model in the model manager before starting a run.".into() }).await;
                             continue;
                         }
-                        if send_provider_events(
+                        let history = {
+                            let guard = transcripts.read().await;
+                            trim_history(guard.get(&session_id).map(Vec::as_slice).unwrap_or(&[]))
+                        };
+                        match send_provider_events(
                             &mut sender,
                             &config,
                             &workspace_root,
@@ -311,11 +355,44 @@ pub async fn upgrade(
                             &prompt,
                             &mcp_runtime,
                             &local_models,
+                            &history,
                         )
                         .await
-                        .is_err()
                         {
-                            return;
+                            Ok(Some(output)) => {
+                                append_turns(
+                                    &transcripts,
+                                    &secure_store,
+                                    &session_id,
+                                    &[
+                                        ConversationTurn {
+                                            role: "user".into(),
+                                            content: prompt.clone(),
+                                        },
+                                        ConversationTurn {
+                                            role: "assistant".into(),
+                                            content: output,
+                                        },
+                                    ],
+                                )
+                                .await;
+                            }
+                            // The run failed. Keep the user's turn so the session
+                            // still has context, but do not invent a reply.
+                            Ok(None) => {
+                                append_turns(
+                                    &transcripts,
+                                    &secure_store,
+                                    &session_id,
+                                    &[ConversationTurn {
+                                        role: "user".into(),
+                                        content: prompt.clone(),
+                                    }],
+                                )
+                                .await;
+                            }
+                            // A socket error means the client is gone; stop.
+                            Err(_) => return,
                         }
                     }
                     Err(error) => {
@@ -508,7 +585,8 @@ async fn send_provider_events<S>(
     prompt: &str,
     mcp_runtime: &McpRuntime,
     local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
-) -> Result<(), S::Error>
+    history: &[ConversationTurn],
+) -> Result<Option<String>, S::Error>
 where
     S: SinkExt<Message> + Unpin,
 {
@@ -527,6 +605,7 @@ where
         mcp_runtime,
         trace_sender,
         local_models,
+        history,
     ));
     let mut sequence = 2;
     let result = loop {
@@ -558,6 +637,7 @@ where
                 },
             )
             .await?;
+            let output = result.output;
             send(
                 sender,
                 ServerMessage::Event {
@@ -566,12 +646,13 @@ where
                         session_id,
                         sequence + 1,
                         RigaEvent::RunCompleted {
-                            output: result.output,
+                            output: output.clone(),
                         },
                     ),
                 },
             )
-            .await
+            .await?;
+            Ok(Some(output))
         }
         Err(error) => {
             send(
@@ -585,8 +666,35 @@ where
                     ),
                 },
             )
-            .await
+            .await?;
+            Ok(None)
         }
+    }
+}
+
+/// Append turns to a session's history and persist the whole map.
+///
+/// Persisting the map (rather than appending to a log) mirrors how sessions and
+/// the MCP registry are stored, so the durable-workflow work can replace this
+/// with a per-turn journal without changing callers.
+async fn append_turns(
+    transcripts: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Vec<ConversationTurn>>>,
+    >,
+    secure_store: &Option<std::sync::Arc<crate::secure_store::SecureStore>>,
+    session_id: &str,
+    new_turns: &[ConversationTurn],
+) {
+    let snapshot = {
+        let mut guard = transcripts.write().await;
+        guard
+            .entry(session_id.to_owned())
+            .or_default()
+            .extend(new_turns.iter().cloned());
+        guard.clone()
+    };
+    if let Some(store) = secure_store {
+        let _ = store.save("transcripts", &snapshot);
     }
 }
 
@@ -673,6 +781,7 @@ async fn call_openai_compatible(
     mcp_runtime: &McpRuntime,
     trace_sender: mpsc::Sender<ToolTraceEvent>,
     local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
+    history: &[ConversationTurn],
 ) -> Result<AgentResult, String> {
     // A local model short-circuits every HTTP path: there is no endpoint to
     // call and no Responses API, so the API shape must not be consulted.
@@ -684,15 +793,32 @@ async fn call_openai_compatible(
             mcp_runtime,
             trace_sender,
             local_models,
+            history,
         )
         .await;
     }
     match config.api {
         ProviderApi::Responses => {
-            call_responses_api(config, workspace_root, prompt, mcp_runtime, trace_sender).await
+            call_responses_api(
+                config,
+                workspace_root,
+                prompt,
+                mcp_runtime,
+                trace_sender,
+                history,
+            )
+            .await
         }
         ProviderApi::Chat => {
-            call_chat_with_tools(config, workspace_root, prompt, mcp_runtime, trace_sender).await
+            call_chat_with_tools(
+                config,
+                workspace_root,
+                prompt,
+                mcp_runtime,
+                trace_sender,
+                history,
+            )
+            .await
         }
     }
 }
@@ -702,6 +828,7 @@ async fn call_chat_with_tools(
     prompt: &str,
     mcp_runtime: &McpRuntime,
     trace_sender: mpsc::Sender<ToolTraceEvent>,
+    history: &[ConversationTurn],
 ) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
@@ -716,10 +843,16 @@ async fn call_chat_with_tools(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut messages = vec![
-        serde_json::json!({ "role": "system", "content": coding_agent_system_prompt() }),
-        serde_json::json!({ "role": "user", "content": prompt }),
-    ];
+    let mut messages = vec![serde_json::json!({
+        "role": "system",
+        "content": coding_agent_system_prompt()
+    })];
+    messages.extend(
+        history
+            .iter()
+            .map(|turn| serde_json::json!({ "role": turn.role, "content": turn.content })),
+    );
+    messages.push(serde_json::json!({ "role": "user", "content": prompt }));
     for _ in 0..24 {
         let mut request = client
             .post(&endpoint)
@@ -814,9 +947,14 @@ async fn call_chat_with_tools(
                 .send(ToolTraceEvent::Completed(trace))
                 .await
                 .map_err(|_| "tool lifecycle stream closed")?;
-            messages.push(
-                serde_json::json!({ "role": "tool", "tool_call_id": call_id, "content": output }),
-            );
+            // The raw result is bounded before it enters the model's context: a
+            // single glob or read can otherwise consume the window. The full
+            // output still went to the UI through the trace above.
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": crate::catalog::truncate_tool_result(output, crate::catalog::MAX_TOOL_RESULT_CHARS),
+            }));
         }
     }
     Err("provider exceeded the maximum tool-call turns".into())
@@ -931,6 +1069,7 @@ async fn call_local_model(
     mcp_runtime: &McpRuntime,
     trace_sender: mpsc::Sender<ToolTraceEvent>,
     local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
+    history: &[ConversationTurn],
 ) -> Result<AgentResult, String> {
     let definitions = mcp_runtime.tool_definitions().await;
     let system = format!(
@@ -938,16 +1077,18 @@ async fn call_local_model(
         coding_agent_system_prompt(),
         local_tool_instructions(&definitions)
     );
-    let mut messages = vec![
-        crate::local_model::ChatMessage {
-            role: "system".into(),
-            content: system,
-        },
-        crate::local_model::ChatMessage {
-            role: "user".into(),
-            content: prompt.to_owned(),
-        },
-    ];
+    let mut messages = vec![crate::local_model::ChatMessage {
+        role: "system".into(),
+        content: system,
+    }];
+    messages.extend(history.iter().map(|turn| crate::local_model::ChatMessage {
+        role: turn.role.clone(),
+        content: turn.content.clone(),
+    }));
+    messages.push(crate::local_model::ChatMessage {
+        role: "user".into(),
+        content: prompt.to_owned(),
+    });
     let mut final_text = String::new();
     for turn in 0..LOCAL_MAX_TURNS {
         // Generation is blocking C, so it runs on the blocking pool. The future
@@ -1019,7 +1160,14 @@ async fn call_local_model(
                 .map_err(|_| "tool lifecycle stream closed")?;
             messages.push(crate::local_model::ChatMessage {
                 role: "tool".into(),
-                content: format!("Result from {}: {output}", call.name),
+                content: format!(
+                    "Result from {}: {}",
+                    call.name,
+                    crate::catalog::truncate_tool_result(
+                        output,
+                        crate::catalog::MAX_TOOL_RESULT_CHARS
+                    )
+                ),
             });
         }
     }
@@ -1032,6 +1180,7 @@ async fn call_responses_api(
     prompt: &str,
     mcp_runtime: &McpRuntime,
     trace_sender: mpsc::Sender<ToolTraceEvent>,
+    history: &[ConversationTurn],
 ) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
@@ -1050,11 +1199,23 @@ async fn call_responses_api(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut input = serde_json::json!(format!(
+    // The Responses API accepts `input` as a string or a list of messages. Build
+    // the list when there is history so prior turns are not lost.
+    let current = format!(
         "{}\n\nUser request:\n{}",
         coding_agent_system_prompt(),
         prompt
-    ));
+    );
+    let mut input = if history.is_empty() {
+        serde_json::json!(current)
+    } else {
+        let mut items: Vec<serde_json::Value> = history
+            .iter()
+            .map(|turn| serde_json::json!({ "role": turn.role, "content": turn.content }))
+            .collect();
+        items.push(serde_json::json!({ "role": "user", "content": current }));
+        serde_json::json!(items)
+    };
     let mut previous_response_id: Option<String> = None;
     for _ in 0..24 {
         let mut body = serde_json::json!({
@@ -1308,8 +1469,46 @@ fn content_text(content: &serde_json::Value) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn coding_agent_system_prompt() -> &'static str {
-    "You are RIGA, a coding agent operating inside the configured workspace. For requests that create, modify, inspect, run, or validate software, use the available tools instead of only describing commands or code. Work in small observable steps: inspect first, then write files, install dependencies only when needed, run the service, and validate the requested endpoint. Never claim a file or command succeeded unless a tool result confirms it. When the user names a specific MCP server, prefer its qualified tool alias beginning with mcp_ (for example, use mcp_riga_health_stdio_health or mcp_rig_health_stdio_health for the riga-health-stdio health server) instead of substituting glob, read, or another built-in tool. Keep the final response concise and summarize the actual files and validation results."
+/// The system prompt, built per run so it can describe the capabilities that
+/// are actually enabled. A model told to write files when writes are disabled
+/// will plan work it cannot do and then stall asking for a goal; stating the
+/// real capability set turns that into an immediate, actionable blocker.
+fn coding_agent_system_prompt() -> String {
+    let writes = std::env::var("RIGA_ENABLE_WRITES").ok().as_deref() == Some("1");
+    let shell = std::env::var("RIGA_ENABLE_SHELL").ok().as_deref() == Some("1");
+    let workspace = crate::catalog::workspace_root();
+    let mut prompt = String::from(
+        "You are RIGA, a coding agent operating inside the configured workspace. \
+For requests that create, modify, inspect, run, or validate software, use the available tools instead of only describing commands or code. \
+Work in small observable steps: inspect first, then make the smallest change, then validate. \
+Never claim a file or command succeeded unless a tool result confirms it.\n\n\
+Tools:\n\
+- `glob` takes a real glob pattern relative to the workspace (`src/**/*.ts`, `apps/*/package.json`). Dependency and build directories are already ignored.\n\
+- `grep` searches file contents; `read` reads one file. Read a file before editing it.\n\
+- `task` dispatches a specialized subagent. Its `action: \"agents\"` form lists them. \
+When the user addresses an agent with `@explore`, `@plan`, `@build`, or `@review`, dispatch that agent with the `task` tool and the matching `agent` argument rather than doing the work yourself when the profile's remit fits.\n\
+- When the user names a specific MCP server, prefer its qualified tool alias beginning with `mcp_` (for example `mcp_riga_health_stdio_health`) over a built-in.\n\n",
+    );
+    prompt.push_str(&format!("Workspace root: {}\n", workspace.display()));
+    prompt.push_str(&format!(
+        "Workspace writes are {}.\n",
+        if writes { "ENABLED" } else { "DISABLED" }
+    ));
+    prompt.push_str(&format!(
+        "Shell execution is {}.\n",
+        if shell { "ENABLED" } else { "DISABLED" }
+    ));
+    if !writes || !shell {
+        prompt.push_str(
+            "If a task needs a capability that is disabled, do not retry it and do not ask the user to approve it in chat: \
+stop and state the exact blocker once, naming the capability (for example, \"workspace writes are disabled\"), \
+then summarize what you completed. Do not describe commands you cannot run as if you ran them.\n",
+        );
+    }
+    prompt.push_str(
+        "Keep the final response concise and summarize the actual files and validation results.",
+    );
+    prompt
 }
 
 fn redact_body(body: &str) -> String {
@@ -1423,6 +1622,53 @@ mod tests {
         let prompt = super::coding_agent_system_prompt();
         assert!(prompt.contains("use the available tools"));
         assert!(prompt.contains("Never claim a file or command succeeded"));
+    }
+
+    #[test]
+    fn coding_agent_prompt_states_capabilities_and_agent_mentions() {
+        // The model plans against the sandbox it is actually in, and knows that
+        // `@agent` addresses a dispatchable subagent.
+        let prompt = super::coding_agent_system_prompt();
+        assert!(prompt.contains("Workspace writes are"), "{prompt}");
+        assert!(prompt.contains("Shell execution is"), "{prompt}");
+        assert!(prompt.contains("@explore"), "{prompt}");
+        assert!(prompt.contains("task"), "{prompt}");
+    }
+
+    #[test]
+    fn trim_history_keeps_the_most_recent_turns_within_budget() {
+        let turns: Vec<super::ConversationTurn> = (0..40)
+            .map(|index| super::ConversationTurn {
+                role: if index % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!("turn-{index}"),
+            })
+            .collect();
+        let trimmed = super::trim_history(&turns);
+        assert_eq!(trimmed.len(), super::MAX_HISTORY_TURNS);
+        assert_eq!(trimmed.last().unwrap().content, "turn-39");
+        assert_eq!(trimmed.first().unwrap().content, "turn-24");
+    }
+
+    #[test]
+    fn trim_history_drops_oldest_when_over_the_character_budget() {
+        let long = "x".repeat(20_000);
+        let turns = vec![
+            super::ConversationTurn {
+                role: "user".into(),
+                content: long.clone(),
+            },
+            super::ConversationTurn {
+                role: "assistant".into(),
+                content: long.clone(),
+            },
+            super::ConversationTurn {
+                role: "user".into(),
+                content: "latest".into(),
+            },
+        ];
+        let trimmed = super::trim_history(&turns);
+        assert_eq!(trimmed.len(), 2, "the oldest turn should be dropped");
+        assert_eq!(trimmed.last().unwrap().content, "latest");
     }
 
     #[test]

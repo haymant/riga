@@ -41,6 +41,10 @@ pub struct ServerState {
     pub(crate) secure_store: Option<Arc<secure_store::SecureStore>>,
     pub(crate) mcp_registry: Arc<RwLock<Vec<catalog::McpServerRecord>>>,
     pub(crate) mcp_runtime: mcp::McpRuntime,
+    /// Per-session conversation history, keyed by session id. Fed back to the
+    /// model on the next turn so a follow-up has the context it refers to.
+    pub(crate) transcripts:
+        Arc<RwLock<std::collections::HashMap<String, Vec<ws::ConversationTurn>>>>,
     /// Local GGUF download/inference runtime. Cheap to construct: the llama.cpp
     /// backend is only initialized on the first model load, and the process-wide
     /// singleton is shared, so this stays inert until a model is actually used.
@@ -55,6 +59,17 @@ impl Default for ServerState {
             .and_then(|store| store.load::<Vec<Session>>("sessions").ok().flatten())
             .unwrap_or_default();
         let workspace_root = catalog::workspace_root();
+        let transcripts = secure_store
+            .as_ref()
+            .and_then(|store| {
+                store
+                    .load::<std::collections::HashMap<String, Vec<ws::ConversationTurn>>>(
+                        "transcripts",
+                    )
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_default();
         let mcp_registry = secure_store
             .as_ref()
             .and_then(|store| {
@@ -76,6 +91,7 @@ impl Default for ServerState {
             secure_store,
             mcp_registry: Arc::new(RwLock::new(mcp_registry)),
             mcp_runtime: mcp::McpRuntime::new(),
+            transcripts: Arc::new(RwLock::new(transcripts)),
             local_models: Arc::new(local_model::LocalModelRuntime::default()),
         }
     }
@@ -143,6 +159,8 @@ async fn ws_upgrade(
                 state.workspace_root.clone(),
                 runtime,
                 state.local_models.clone(),
+                state.transcripts.clone(),
+                state.secure_store.clone(),
             )
             .await;
         }

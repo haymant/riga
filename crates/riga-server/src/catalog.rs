@@ -8,6 +8,44 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::{io::AsyncReadExt, process::Command, sync::mpsc};
 
+/// Directories that never hold agent-relevant source and would otherwise swamp
+/// a result: dependency trees, build output, and VCS internals.
+const IGNORED_DIRECTORIES: [&str; 3] = [".git", "node_modules", "target"];
+
+/// Hard cap on any single tool result handed back to the model. Without it one
+/// `glob` or `grep` can consume most of the context window before the model
+/// sees anything useful.
+pub const MAX_TOOL_RESULT_CHARS: usize = 24_000;
+/// A single file read is capped a little higher, but still capped; a generated
+/// or minified file must not exhaust the window in one call.
+const MAX_READ_CHARS: usize = 40_000;
+const MAX_GLOB_MATCHES: usize = 300;
+const MAX_GREP_MATCHES: usize = 200;
+const MAX_GREP_FILE_BYTES: u64 = 1_048_576;
+
+/// True for a directory the tools must not descend into.
+///
+/// Depth 0 is the workspace root itself, which is never ignored: only a nested
+/// `.git`/`node_modules`/`target` is pruned.
+fn is_ignored_entry(entry: &walkdir::DirEntry) -> bool {
+    entry.depth() > 0
+        && entry.file_type().is_dir()
+        && IGNORED_DIRECTORIES.contains(&entry.file_name().to_string_lossy().as_ref())
+}
+
+/// Bound a tool result before it enters the model context, marking the cut so
+/// the model knows the result was shortened rather than complete.
+pub fn truncate_tool_result(text: String, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text;
+    }
+    let mut kept: String = text.chars().take(limit).collect();
+    kept.push_str(&format!(
+        "\n… truncated: result exceeded {limit} characters"
+    ));
+    kept
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogItem {
     pub id: String,
@@ -152,10 +190,7 @@ pub fn load_skills(root: &Path) -> Vec<SkillSummary> {
 pub fn load_workspace_files(root: &Path) -> Vec<FileCandidate> {
     walkdir::WalkDir::new(root)
         .into_iter()
-        .filter_entry(|entry| {
-            let name = entry.file_name().to_string_lossy();
-            !matches!(name.as_ref(), ".git" | "node_modules" | "target")
-        })
+        .filter_entry(|entry| !is_ignored_entry(entry))
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
         .filter_map(|entry| {
@@ -497,9 +532,10 @@ fn safe_path(root: &Path, requested: &str) -> Result<PathBuf, String> {
 
 pub async fn execute_read(root: &Path, path: &str) -> Result<String, String> {
     let path = safe_path(root, path)?;
-    tokio::fs::read_to_string(path)
+    let text = tokio::fs::read_to_string(path)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(truncate_tool_result(text, MAX_READ_CHARS))
 }
 
 pub async fn execute_write(root: &Path, path: &str, content: &str) -> Result<String, String> {
@@ -622,54 +658,82 @@ async fn append_shell_output(
 }
 
 pub fn execute_glob(root: &Path, pattern: &str) -> Result<String, String> {
-    let pattern = pattern.trim_start_matches("**/");
-    let matches = walkdir::WalkDir::new(root)
+    let pattern = pattern.trim();
+    let matcher = glob::Pattern::new(pattern)
+        .map_err(|error| format!("invalid glob pattern `{pattern}`: {error}"))?;
+    let mut matches = Vec::new();
+    let mut truncated = false;
+    for entry in walkdir::WalkDir::new(root)
         .into_iter()
+        .filter_entry(|entry| !is_ignored_entry(entry))
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
-        .filter_map(|entry| {
-            let relative = entry
-                .path()
-                .strip_prefix(root)
-                .ok()?
-                .to_string_lossy()
-                .replace('\\', "/");
-            if relative.ends_with(pattern)
-                || (pattern.starts_with('*') && relative.ends_with(pattern.trim_start_matches('*')))
-            {
-                Some(relative)
-            } else {
-                None
+    {
+        let relative = match entry.path().strip_prefix(root) {
+            Ok(path) => path.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        if matcher.matches(&relative) {
+            matches.push(relative);
+            if matches.len() >= MAX_GLOB_MATCHES {
+                truncated = true;
+                break;
             }
-        })
-        .take(500)
-        .collect::<Vec<_>>();
-    Ok(matches.join("\n"))
+        }
+    }
+    if matches.is_empty() {
+        return Ok(format!(
+            "no files matched `{pattern}` (ignoring {})",
+            IGNORED_DIRECTORIES.join(", ")
+        ));
+    }
+    let mut output = matches.join("\n");
+    if truncated {
+        output.push_str(&format!("\n… truncated at {MAX_GLOB_MATCHES} matches"));
+    }
+    Ok(output)
 }
 
 pub async fn execute_grep(root: &Path, query: &str) -> Result<String, String> {
     let mut matches = Vec::new();
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
+        .filter_entry(|entry| !is_ignored_entry(entry))
         .filter_map(Result::ok)
         .filter(|entry| entry.file_type().is_file())
-        .take(2_000)
     {
-        if let Ok(text) = tokio::fs::read_to_string(entry.path()).await {
-            for (line_number, line) in text.lines().enumerate() {
-                if line.contains(query) {
-                    let relative = entry
-                        .path()
-                        .strip_prefix(root)
-                        .unwrap_or(entry.path())
-                        .display();
-                    matches.push(format!("{relative}:{}:{line}", line_number + 1));
-                    if matches.len() >= 500 {
-                        return Ok(matches.join("\n"));
-                    }
+        if entry
+            .metadata()
+            .map(|metadata| metadata.len() > MAX_GREP_FILE_BYTES)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Ok(text) = tokio::fs::read_to_string(entry.path()).await else {
+            continue;
+        };
+        for (line_number, line) in text.lines().enumerate() {
+            if line.contains(query) {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap_or(entry.path())
+                    .display();
+                matches.push(format!("{relative}:{}:{line}", line_number + 1));
+                if matches.len() >= MAX_GREP_MATCHES {
+                    return Ok(format!(
+                        "{}\n… truncated at {MAX_GREP_MATCHES} matches",
+                        matches.join("\n")
+                    ));
                 }
             }
         }
+    }
+    if matches.is_empty() {
+        return Ok(format!(
+            "no matches for `{query}` (ignoring {})",
+            IGNORED_DIRECTORIES.join(", ")
+        ));
     }
     Ok(matches.join("\n"))
 }
@@ -749,5 +813,82 @@ mod tests {
             .expect("output append should succeed");
         assert_eq!(output.chars().count(), 20_000);
         assert!(output.ends_with('a'));
+    }
+
+    fn scratch_workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("apps/riga")).unwrap();
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/some-dep")).unwrap();
+        std::fs::write(root.join("apps/riga/package.json"), "{}").unwrap();
+        std::fs::write(root.join("scripts/run.sh"), "#!/bin/sh\nprobe_marker\n").unwrap();
+        std::fs::write(root.join("node_modules/some-dep/package.json"), "{}").unwrap();
+        std::fs::write(
+            root.join("node_modules/some-dep/index.js"),
+            "probe_marker\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn glob_matches_real_patterns_and_ignores_dependencies() {
+        // Reported bug: `**/*` was a suffix match that filled up with
+        // node_modules, and `apps/*/package.json` matched nothing.
+        let workspace = scratch_workspace();
+        let root = workspace.path();
+
+        let everything = super::execute_glob(root, "**/*").unwrap();
+        assert!(
+            everything.contains("apps/riga/package.json"),
+            "{everything}"
+        );
+        assert!(everything.contains("scripts/run.sh"), "{everything}");
+        assert!(!everything.contains("node_modules"), "{everything}");
+
+        let targeted = super::execute_glob(root, "apps/*/package.json").unwrap();
+        assert_eq!(targeted, "apps/riga/package.json");
+
+        let missing = super::execute_glob(root, "packages/*/package.json").unwrap();
+        assert!(missing.contains("no files matched"), "{missing}");
+    }
+
+    #[test]
+    fn glob_reports_an_invalid_pattern_instead_of_matching_nothing() {
+        let workspace = scratch_workspace();
+        let error = super::execute_glob(workspace.path(), "[unclosed").unwrap_err();
+        assert!(error.contains("invalid glob pattern"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn grep_ignores_dependency_directories() {
+        let workspace = scratch_workspace();
+        let output = super::execute_grep(workspace.path(), "probe_marker")
+            .await
+            .unwrap();
+        assert!(output.contains("scripts/run.sh"), "{output}");
+        assert!(!output.contains("node_modules"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn read_is_capped_and_marks_the_cut() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("big.txt");
+        std::fs::write(&path, "x".repeat(super::MAX_READ_CHARS + 1_000)).unwrap();
+        let output = super::execute_read(workspace.path(), "big.txt")
+            .await
+            .unwrap();
+        assert!(output.contains("… truncated"), "read result was not capped");
+    }
+
+    #[test]
+    fn truncate_tool_result_leaves_short_results_untouched() {
+        let short = "hello".to_owned();
+        assert_eq!(super::truncate_tool_result(short.clone(), 100), short);
+        let long = "a".repeat(200);
+        let capped = super::truncate_tool_result(long, 100);
+        assert!(capped.contains("… truncated"));
+        assert_eq!(capped.lines().next().unwrap().chars().count(), 100);
     }
 }
