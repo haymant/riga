@@ -1603,6 +1603,7 @@ async fn call_openai_compatible(
                 mcp_runtime,
                 trace_sender,
                 history,
+                evidence,
             )
             .await
         }
@@ -2533,6 +2534,7 @@ async fn call_responses_api(
     mcp_runtime: &McpRuntime,
     trace_sender: mpsc::Sender<ToolTraceEvent>,
     history: &[ConversationTurn],
+    evidence: &RunEvidence,
 ) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
@@ -2573,9 +2575,14 @@ async fn call_responses_api(
         let mut body = serde_json::json!({
             "model": config.model,
             "input": input,
-            "max_output_tokens": 1024,
+            // The old 1024 cut a long answer off mid-sentence. Reasoning tokens
+            // count toward this too, so give a normal turn real room.
+            "max_output_tokens": 4096,
             "reasoning": { "effort": effort },
             "tools": responses_tool_schemas(&mcp_runtime.tool_definitions().await),
+            // Stream so the assistant's prose reaches the client as it is
+            // produced, the same way the chat-completions path does.
+            "stream": true,
         });
         if let Some(id) = &previous_response_id {
             body["previous_response_id"] = serde_json::Value::String(id.clone());
@@ -2589,15 +2596,29 @@ async fn call_responses_api(
             .await
             .map_err(|e| format!("provider connection failed: {e}"))?;
         let status = response.status();
-        let raw = response.text().await.map_err(|e| e.to_string())?;
         if !status.is_success() {
+            let raw = response.text().await.map_err(|e| e.to_string())?;
             return Err(format!(
                 "provider Responses API returned HTTP {status}: {}",
                 redact_body(&raw)
             ));
         }
-        let response: serde_json::Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("invalid provider Responses API response: {e}"))?;
+        // A streaming provider answers with server-sent events whose terminal
+        // `response.completed` frame carries the same object the non-streaming
+        // call returns. A provider that ignores `stream` still returns one JSON
+        // body, which is read the old way.
+        let streaming = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("text/event-stream"));
+        let response: serde_json::Value = if streaming {
+            read_responses_stream(response, &trace_sender, evidence).await?
+        } else {
+            let raw = response.text().await.map_err(|e| e.to_string())?;
+            serde_json::from_str(&raw)
+                .map_err(|e| format!("invalid provider Responses API response: {e}"))?
+        };
         let calls = response
             .get("output")
             .and_then(serde_json::Value::as_array)
@@ -2671,6 +2692,80 @@ async fn call_responses_api(
         input = serde_json::Value::Array(outputs);
     }
     Err("provider exceeded the maximum Responses tool-call turns".into())
+}
+
+/// Read a Responses API event stream to its terminal `response.completed` frame,
+/// forwarding assistant text as it arrives.
+///
+/// The completed frame carries the whole response object — the same shape the
+/// non-streaming call returns — so the tool loop downstream is unchanged. Text
+/// deltas are emitted as they arrive so the prose is not held until the end.
+async fn read_responses_stream(
+    response: reqwest::Response,
+    trace_sender: &mpsc::Sender<ToolTraceEvent>,
+    evidence: &RunEvidence,
+) -> Result<serde_json::Value, String> {
+    let mut chunks = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut completed: Option<serde_json::Value> = None;
+    let mut failure: Option<String> = None;
+    'stream: while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|e| format!("provider stream failed: {e}"))?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(newline) = buffer.find('\n') {
+            let line = buffer[..newline].trim_end_matches('\r').to_owned();
+            buffer.drain(..=newline);
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                break 'stream;
+            }
+            let value: serde_json::Value = serde_json::from_str(data)
+                .map_err(|e| format!("invalid provider Responses stream frame: {e}"))?;
+            match value.get("type").and_then(serde_json::Value::as_str) {
+                Some("response.output_text.delta") => {
+                    if let Some(delta) = value.get("delta").and_then(serde_json::Value::as_str)
+                        && !delta.is_empty()
+                    {
+                        evidence.mark_streamed();
+                        let _ = trace_sender
+                            .send(ToolTraceEvent::Ui(RigaEvent::TextDelta {
+                                delta: delta.to_owned(),
+                            }))
+                            .await;
+                    }
+                }
+                Some("response.completed") => {
+                    completed = value.get("response").cloned();
+                    break 'stream;
+                }
+                Some("response.failed") | Some("response.error") => {
+                    failure = value
+                        .get("response")
+                        .and_then(|frame| frame.get("error"))
+                        .and_then(|error| error.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            value
+                                .get("message")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        });
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(message) = failure {
+        return Err(format!("provider Responses API failed: {message}"));
+    }
+    completed.ok_or_else(|| "provider Responses stream ended without a response".to_owned())
 }
 
 fn extract_response_text(response: &serde_json::Value) -> Result<String, String> {
