@@ -303,6 +303,7 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 /* final composer controls and light tool-symbol corrections */
 .composer-model select,
 .composer-model select:last-child { border: 0 !important; box-shadow: none !important; outline: 0; }
+.composer-model select { appearance: none; -webkit-appearance: none; padding-right: 24px; background-image: linear-gradient(45deg, transparent 50%, currentColor 50%), linear-gradient(135deg, currentColor 50%, transparent 50%); background-position: calc(100% - 13px) 50%, calc(100% - 8px) 50%; background-size: 5px 5px; background-repeat: no-repeat; }
 .composer-model select:focus { outline: 0; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent) !important; }
 .catalog-inline-actions .catalog-category { display: grid; grid-template-columns: 1fr auto; align-items: center; width: 100%; color: var(--text); background: transparent; border: 0; }
 .catalog-inline-actions .catalog-category:hover { background: color-mix(in srgb, var(--accent) 9%, transparent); }
