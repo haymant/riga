@@ -56,7 +56,11 @@ function CodeBlock({ children, className }: { children?: ReactNode; className?: 
   // react-markdown hands the already-stringified code as a single child here.
   const text = typeof children === "string" ? children : "";
   const copy = useCallback(() => {
-    void navigator.clipboard
+    // `navigator.clipboard` is secure-context only too: undefined on a phone
+    // reaching the dev server over plain http, where touching it would throw.
+    const clipboard = navigator.clipboard;
+    if (!clipboard) return;
+    void clipboard
       .writeText(text.replace(/\n$/, ""))
       .then(() => {
         setCopied(true);

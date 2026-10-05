@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
+import { Component, useEffect, useMemo, useRef, useState, type ReactNode, type SetStateAction } from "react";
 import { RigaWebSocketClient, LocalModelClient, formatBytes, reduceDownloadState, type DownloadState, type LocalModelOverview, type RigaEventEnvelope } from "@haymant/transport-http";
 import {
   Bot,
@@ -37,6 +37,31 @@ const localModelClient = new LocalModelClient("");
 // Sentinel for the composer's local-model entry. Distinct from any remote model
 // id so selecting it is unambiguous.
 const LOCAL_MODEL_VALUE = "__local_model__";
+
+let idCounter = 0;
+
+/**
+ * A unique id that works outside a secure context.
+ *
+ * `crypto.randomUUID` is only defined over HTTPS or localhost. A phone opening
+ * the dev server at `http://<lan-ip>:1420` gets `undefined`, and calling it
+ * throws — which blanked the whole app the moment a message was sent.
+ * `getRandomValues` is available in insecure contexts; the counter is the last
+ * resort for a browser that has no WebCrypto at all.
+ */
+function newId(): string {
+  const webCrypto = globalThis.crypto;
+  if (typeof webCrypto?.randomUUID === "function") return webCrypto.randomUUID();
+  if (typeof webCrypto?.getRandomValues === "function") {
+    const bytes = webCrypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  }
+  idCounter += 1;
+  return `id-${Date.now().toString(36)}-${idCounter.toString(36)}`;
+}
 
 type Role = "user" | "assistant" | "system";
 type Session = { id: string; title: string; meta: string; active?: boolean };
@@ -104,7 +129,7 @@ function loadLocal<T>(key: string, fallback: T): T {
 
 export type AssistantUIProps = AssistantUiOptions;
 
-export function AssistantUI({
+function AssistantUIInner({
   showSessionHistoryButton = DEFAULT_ASSISTANT_UI_OPTIONS.showSessionHistoryButton,
   fullWidth: initialFullWidth = DEFAULT_ASSISTANT_UI_OPTIONS.fullWidth,
 }: AssistantUIProps = {}) {
@@ -295,7 +320,7 @@ export function AssistantUI({
         activeRunIdRef.current = null;
         setIsRunning(false);
         if (code === "provider_persist_failed") setToast(message);
-        setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "system", text: `${code}: ${message}`, time: "now" }]);
+        setTranscript((current) => [...current, { id: newId(), role: "system", text: `${code}: ${message}`, time: "now" }]);
       },
       onEvent: (envelope: RigaEventEnvelope) => {
         const event = envelope.event;
@@ -431,7 +456,7 @@ export function AssistantUI({
       ? `\n\nAttached files are available to read from the workspace: ${attachments.map((attachment) => attachment.path).join(", ")}`
       : "";
     const prompt = `${text}${attachmentContext}`;
-    setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "user", text: prompt, time: "now" }]);
+    setTranscript((current) => [...current, { id: newId(), role: "user", text: prompt, time: "now" }]);
     setComposerHistory((current) => [...current.filter((entry) => entry !== text), text]);
     setHistoryIndex(-1);
     setDraft("");
@@ -439,7 +464,7 @@ export function AssistantUI({
     setIsRunning(true);
     setPendingApproval(null);
     if (transportRef.current && transportStatus === "connected") {
-      const runId = crypto.randomUUID();
+      const runId = newId();
       activeRunIdRef.current = runId;
       void transportRef.current.startRun(runId, activeSession.id, prompt).catch(() => {
         activeRunIdRef.current = null;
@@ -449,7 +474,7 @@ export function AssistantUI({
       return;
     }
     setIsRunning(false);
-    setTranscript((current) => [...current, { id: crypto.randomUUID(), role: "system", text: "WebSocket is not connected. Configure a provider and wait for the connection before sending.", time: "now" }]);
+    setTranscript((current) => [...current, { id: newId(), role: "system", text: "WebSocket is not connected. Configure a provider and wait for the connection before sending.", time: "now" }]);
   }
 
   function stopRun() {
@@ -801,6 +826,45 @@ function AgentTaskList({ tasks, toolRuns }: { tasks: AgentTaskView[]; toolRuns: 
         })}
       </ul>
     </section>
+  );
+}
+
+/**
+ * Catches a render/lifecycle error and shows it.
+ *
+ * Without this, any uncaught error unmounts the tree and leaves a blank page —
+ * which is exactly what a phone showed with no way to open a console. Rendering
+ * the message inline at least says what happened.
+ */
+class AssistantUIErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: Error | null }
+> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ minHeight: "100dvh", padding: 24, font: "13px/1.6 system-ui, sans-serif", color: "#e9edf5", background: "#11151d" }}>
+          <h2 style={{ margin: "0 0 8px", fontSize: 16 }}>RIGA hit an error</h2>
+          <p style={{ margin: "0 0 14px", opacity: 0.8 }}>{String(this.state.error.message || this.state.error)}</p>
+          <button type="button" onClick={() => window.location.reload()}>Reload</button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export function AssistantUI(props: AssistantUIProps = {}) {
+  return (
+    <AssistantUIErrorBoundary>
+      <AssistantUIInner {...props} />
+    </AssistantUIErrorBoundary>
   );
 }
 
