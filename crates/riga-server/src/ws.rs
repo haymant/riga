@@ -1283,72 +1283,158 @@ async fn run_chat_loop(
             });
         }
         messages.push(message);
-        for tool_call in tool_calls {
-            let call_id = tool_call
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("tool-call");
-            let function = tool_call
-                .get("function")
-                .ok_or("provider returned malformed tool call")?;
-            let name = function
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .ok_or("provider tool call has no name")?;
-            let arguments = function
-                .get("arguments")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("{}");
-            let input: serde_json::Value = serde_json::from_str(arguments)
-                .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
-            let call = serde_json::json!({"call_id": call_id, "name": name, "arguments": input});
+        // Parse every call first so the order of results does not depend on the
+        // order of execution.
+        struct ParsedCall {
+            call_id: String,
+            name: String,
+            input: serde_json::Value,
+            call: serde_json::Value,
+        }
+        let parsed: Vec<ParsedCall> = tool_calls
+            .iter()
+            .map(|tool_call| -> Result<ParsedCall, String> {
+                let call_id = tool_call
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("tool-call")
+                    .to_owned();
+                let function = tool_call
+                    .get("function")
+                    .ok_or("provider returned malformed tool call")?;
+                let name = function
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("provider tool call has no name")?
+                    .to_owned();
+                let arguments = function
+                    .get("arguments")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("{}");
+                let input: serde_json::Value = serde_json::from_str(arguments)
+                    .map_err(|error| format!("invalid arguments for {name}: {error}"))?;
+                let call = serde_json::json!({
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": input,
+                });
+                Ok(ParsedCall {
+                    call_id,
+                    name,
+                    input,
+                    call,
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        for call in &parsed {
             trace_sender
-                .send(ToolTraceEvent::Started(call.clone()))
+                .send(ToolTraceEvent::Started(call.call.clone()))
                 .await
                 .map_err(|_| "tool lifecycle stream closed")?;
-            let permitted = authorize_tool(broker, &trace_sender, call_id, name, &input).await;
-            let result = match permitted {
-                // A denied gated call never reaches the tool; the model gets a
-                // clear refusal it can adapt to.
-                Err(message) => Err(message),
-                Ok(()) if name == "task" && is_subagent_dispatch(&input) => {
-                    let agent = input
-                        .get("agent")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("subagent");
-                    Box::pin(dispatch_subagent(
-                        config,
-                        workspace_root,
-                        &input,
-                        mcp_runtime,
-                        &trace_sender,
-                        depth,
-                        broker,
-                    ))
-                    .await
-                    .map(|output| format!("[{agent} subagent result]\n{output}"))
+        }
+        let mut results: Vec<Option<(bool, String)>> = (0..parsed.len()).map(|_| None).collect();
+        // Sibling subagent dispatches run concurrently, so a fan-out is actually
+        // parallel and the UI can show the workers progressing together.
+        let dispatch_indices: Vec<usize> = parsed
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call.name == "task" && is_subagent_dispatch(&call.input))
+            .map(|(index, _)| index)
+            .collect();
+        if dispatch_indices.len() > 1 {
+            let futures = dispatch_indices.iter().map(|&index| {
+                let call = &parsed[index];
+                let trace = trace_sender.clone();
+                let broker = broker.clone();
+                let agent = call
+                    .input
+                    .get("agent")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("subagent")
+                    .to_owned();
+                async move {
+                    let permitted =
+                        authorize_tool(&broker, &trace, &call.call_id, "task", &call.input).await;
+                    let result = match permitted {
+                        Err(message) => Err(message),
+                        Ok(()) => dispatch_subagent(
+                            config,
+                            workspace_root,
+                            &call.input,
+                            mcp_runtime,
+                            &trace,
+                            depth,
+                            &broker,
+                        )
+                        .await
+                        .map(|output| format!("[{agent} subagent result]\n{output}")),
+                    };
+                    (index, result)
                 }
-                Ok(()) => {
-                    execute_tool(
-                        workspace_root,
-                        mcp_runtime,
-                        name,
-                        input.clone(),
-                        Some(ToolOutputStream {
-                            call_id: call_id.to_owned(),
-                            trace_sender: trace_sender.clone(),
-                        }),
-                    )
-                    .await
+            });
+            for (index, result) in futures_util::future::join_all(futures).await {
+                results[index] = Some(match result {
+                    Ok(output) => (true, output),
+                    Err(error) => (false, format!("tool error: {error}")),
+                });
+            }
+        }
+        for (index, call) in parsed.iter().enumerate() {
+            let (ok, output) = if let Some(done) = results[index].take() {
+                done
+            } else {
+                let permitted = authorize_tool(
+                    broker,
+                    &trace_sender,
+                    &call.call_id,
+                    &call.name,
+                    &call.input,
+                )
+                .await;
+                let result = match permitted {
+                    // A denied gated call never reaches the tool; the model gets
+                    // a clear refusal it can adapt to.
+                    Err(message) => Err(message),
+                    Ok(()) if call.name == "task" && is_subagent_dispatch(&call.input) => {
+                        let agent = call
+                            .input
+                            .get("agent")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("subagent");
+                        Box::pin(dispatch_subagent(
+                            config,
+                            workspace_root,
+                            &call.input,
+                            mcp_runtime,
+                            &trace_sender,
+                            depth,
+                            broker,
+                        ))
+                        .await
+                        .map(|output| format!("[{agent} subagent result]\n{output}"))
+                    }
+                    Ok(()) => {
+                        execute_tool(
+                            workspace_root,
+                            mcp_runtime,
+                            &call.name,
+                            call.input.clone(),
+                            Some(ToolOutputStream {
+                                call_id: call.call_id.clone(),
+                                trace_sender: trace_sender.clone(),
+                            }),
+                        )
+                        .await
+                    }
+                };
+                match result {
+                    Ok(output) => (true, output),
+                    Err(error) => (false, format!("tool error: {error}")),
                 }
-            };
-            let (ok, output) = match result {
-                Ok(output) => (true, output),
-                Err(error) => (false, format!("tool error: {error}")),
             };
             let trace = ToolTrace {
-                call,
-                name: name.into(),
+                call: call.call.clone(),
+                name: call.name.clone(),
                 output: output.clone(),
                 ok,
             };
@@ -1361,7 +1447,7 @@ async fn run_chat_loop(
             // output still went to the UI through the trace above.
             messages.push(serde_json::json!({
                 "role": "tool",
-                "tool_call_id": call_id,
+                "tool_call_id": call.call_id,
                 "content": crate::catalog::truncate_tool_result(output, crate::catalog::MAX_TOOL_RESULT_CHARS),
             }));
         }
