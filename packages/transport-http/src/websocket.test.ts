@@ -173,6 +173,37 @@ describe("RigaWebSocketClient", () => {
     await second;
     expect(sockets).toHaveLength(2);
   });
+
+  it("reconnects when the socket opens but never becomes ready", async () => {
+    // A kernel still building, or a proxy that accepted the upgrade but never
+    // delivered `ready`, used to leave the status at "connecting" forever.
+    vi.useFakeTimers();
+    try {
+      const sockets: FakeSocket[] = [];
+      const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, onEvent: vi.fn() });
+      void client.connect().catch(() => undefined);
+      sockets[0]?.open();
+      await vi.advanceTimersByTimeAsync(8_000); // handshake timeout
+      await vi.advanceTimersByTimeAsync(1_000); // reconnect delay
+      expect(sockets.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reconnects after an error even when no close event follows", async () => {
+    vi.useFakeTimers();
+    try {
+      const sockets: FakeSocket[] = [];
+      const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, onEvent: vi.fn() });
+      void client.connect().catch(() => undefined);
+      sockets[0]?.fail();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sockets.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 it("restores provider metadata, kind and api without a credential", async () => {

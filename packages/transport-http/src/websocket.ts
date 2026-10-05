@@ -2,6 +2,9 @@ import type { RigaEventEnvelope } from "./index";
 
 export type ProviderKind = "remote" | "local";
 
+/** How long to wait for the server's `ready` frame before giving up and retrying. */
+const HANDSHAKE_TIMEOUT_MS = 8_000;
+
 /**
  * Which remote API shape to call. `chat` is the OpenAI-compatible
  * `/chat/completions` contract; `responses` is OpenAI's `/responses` API.
@@ -97,12 +100,35 @@ export class RigaWebSocketClient {
     return new Promise<void>((resolve, reject) => {
       const socket = this.makeSocket(this.url);
       this.socket = socket;
+      let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+      const clearHandshake = () => {
+        if (handshakeTimer !== null) {
+          clearTimeout(handshakeTimer);
+          handshakeTimer = null;
+        }
+      };
+      // A socket can open and then never receive `ready` — a kernel still
+      // building, or a proxy that accepted the upgrade but never delivered the
+      // frame. Without this the status sits at "connecting" forever, which is
+      // exactly what a phone showed after a restart.
+      handshakeTimer = setTimeout(() => {
+        clearHandshake();
+        if (this.closedByUser) return;
+        try {
+          socket.close();
+        } catch {
+          // The socket may already be gone; the reconnect below still runs.
+        }
+        reject(new Error("RIGA WebSocket handshake timed out"));
+        if (!this.closedByUser) this.scheduleReconnect();
+      }, HANDSHAKE_TIMEOUT_MS);
       socket.onopen = () => {
         this.send({ type: "hello", client_version: "0.1.0" });
       };
       socket.onmessage = (message) => {
         const parsed = JSON.parse(message.data) as RigaWebSocketServerMessage;
         if (parsed.type === "ready") {
+          clearHandshake();
           this.onStatus("connected");
           this.reconnectAttempts = 0;
           resolve();
@@ -124,10 +150,15 @@ export class RigaWebSocketClient {
         }
       };
       socket.onerror = () => {
+        clearHandshake();
         this.onStatus("error");
         reject(new Error("RIGA WebSocket connection failed"));
+        // Retry here as well as on close: some browsers fire `error` without a
+        // following `close`, which would otherwise leave the client dead.
+        if (!this.closedByUser) this.scheduleReconnect();
       };
       socket.onclose = () => {
+        clearHandshake();
         this.onStatus("closed");
         // An unexpected drop reconnects with backoff; an explicit close does not.
         if (!this.closedByUser) this.scheduleReconnect();
