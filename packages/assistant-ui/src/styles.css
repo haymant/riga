@@ -540,3 +540,17 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 .agent-task-tool code { color: var(--accent); font: 10px 'DM Mono', monospace; }
 .agent-task-tool span { opacity: .8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-task-tool.error code { color: var(--amber); }
+
+/* The model name is the only free-form option in the composer, and a local GGUF
+   file name can be 40+ characters. Cap the closed control so it cannot stretch
+   the rail, and truncate with an ellipsis; the native option list still sizes
+   itself to the full names when opened. */
+.composer-model select.composer-model-name {
+  max-width: 168px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+@media (max-width: 760px) {
+  .composer-model select.composer-model-name { max-width: 128px; }
+}
