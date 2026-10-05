@@ -71,6 +71,30 @@ describe("RigaWebSocketClient", () => {
     expect(JSON.parse(socket.sent.at(-1)!)).toEqual({ type: "resume_run", run_id: "run-1", after_sequence: 4 });
   });
 
+  it("reconnects after a drop and resumes the interrupted run", async () => {
+    vi.useFakeTimers();
+    try {
+      const sockets: FakeSocket[] = [];
+      const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, onEvent: vi.fn() });
+      const first = client.connect();
+      sockets[0]?.open();
+      sockets[0]?.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
+      await first;
+      await client.startRun("run-1", "session-1", "do it");
+      // A mid-run event, then the socket drops.
+      sockets[0]?.receive({ type: "event", envelope: { ...envelope, sequence: 5 } });
+      sockets[0]?.close();
+      await vi.advanceTimersByTimeAsync(1_000);
+      sockets[1]?.open();
+      sockets[1]?.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
+      await vi.advanceTimersByTimeAsync(0);
+      const resumed = sockets[1]?.sent.map((value) => JSON.parse(value)).find((message) => message.type === "resume_run");
+      expect(resumed).toEqual({ type: "resume_run", run_id: "run-1", after_sequence: 5 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("sends provider endpoint, key, and model only in the live socket frame", async () => {
     const socket = new FakeSocket();
     const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn() });

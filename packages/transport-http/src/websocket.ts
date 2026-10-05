@@ -78,11 +78,23 @@ export class RigaWebSocketClient {
   }
 
   private readonly url: string;
+  /** Set for the duration of a run so a reconnect can resume it. */
+  private activeRunId: string | null = null;
+  private lastSequence = 0;
+  private reconnectAttempts = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private closedByUser = false;
 
   connect(): Promise<void> {
     if (this.ready) return this.ready;
+    this.closedByUser = false;
+    this.ready = this.openSocket();
+    return this.ready;
+  }
+
+  private openSocket(): Promise<void> {
     this.onStatus("connecting");
-    this.ready = new Promise<void>((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       const socket = this.makeSocket(this.url);
       this.socket = socket;
       socket.onopen = () => {
@@ -92,8 +104,15 @@ export class RigaWebSocketClient {
         const parsed = JSON.parse(message.data) as RigaWebSocketServerMessage;
         if (parsed.type === "ready") {
           this.onStatus("connected");
+          this.reconnectAttempts = 0;
           resolve();
+          // A run that was interrupted by the drop is caught up from the
+          // server's journal without re-running the agent.
+          if (this.activeRunId) {
+            void this.resumeRun(this.activeRunId, this.lastSequence).catch(() => undefined);
+          }
         } else if (parsed.type === "event") {
+          this.trackRun(parsed.envelope);
           this.onEvent(parsed.envelope);
         } else if (parsed.type === "provider_configured") {
           // Older servers omit `kind`/`api`; a client written before those
@@ -108,13 +127,44 @@ export class RigaWebSocketClient {
         this.onStatus("error");
         reject(new Error("RIGA WebSocket connection failed"));
       };
-      socket.onclose = () => this.onStatus("closed");
+      socket.onclose = () => {
+        this.onStatus("closed");
+        // An unexpected drop reconnects with backoff; an explicit close does not.
+        if (!this.closedByUser) this.scheduleReconnect();
+      };
     });
-    return this.ready;
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer !== null) return;
+    this.ready = null;
+    const delay = Math.min(1_000 * 2 ** this.reconnectAttempts, 10_000);
+    this.reconnectAttempts += 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.closedByUser) return;
+      this.ready = this.openSocket();
+      void this.ready.catch(() => undefined);
+    }, delay);
+  }
+
+  /** Track the active run and its last sequence, so a reconnect can resume it. */
+  private trackRun(envelope: RigaEventEnvelope): void {
+    this.lastSequence = Math.max(this.lastSequence, envelope.sequence);
+    const event: unknown = envelope.event;
+    const settled = event === "RunCompleted"
+      || event === "RunFailed"
+      || (typeof event === "object" && event !== null && ("RunCompleted" in event || "RunFailed" in event));
+    if (settled && this.activeRunId === envelope.run_id) {
+      this.activeRunId = null;
+      this.lastSequence = 0;
+    }
   }
 
   async startRun(runId: string, sessionId: string, prompt: string): Promise<void> {
     await this.connect();
+    this.activeRunId = runId;
+    this.lastSequence = 0;
     this.send({ type: "start_run", run_id: runId, session_id: sessionId, prompt });
   }
 
@@ -145,6 +195,12 @@ export class RigaWebSocketClient {
   }
 
   close(): void {
+    this.closedByUser = true;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.activeRunId = null;
     this.socket?.close();
     this.socket = null;
     this.ready = null;
