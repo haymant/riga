@@ -806,7 +806,7 @@ fn content_text(content: &serde_json::Value) -> Option<String> {
 }
 
 fn coding_agent_system_prompt() -> &'static str {
-    "You are RIGA, a coding agent operating inside the configured workspace. For requests that create, modify, inspect, run, or validate software, use the available tools instead of only describing commands or code. Work in small observable steps: inspect first, then write files, install dependencies only when needed, run the service, and validate the requested endpoint. Never claim a file or command succeeded unless a tool result confirms it. Keep the final response concise and summarize the actual files and validation results."
+    "You are RIGA, a coding agent operating inside the configured workspace. For requests that create, modify, inspect, run, or validate software, use the available tools instead of only describing commands or code. Work in small observable steps: inspect first, then write files, install dependencies only when needed, run the service, and validate the requested endpoint. Never claim a file or command succeeded unless a tool result confirms it. When the user names a specific MCP server, prefer its qualified tool alias beginning with mcp_ (for example, use mcp_riga_health_stdio_health or mcp_rig_health_stdio_health for the riga-health-stdio health server) instead of substituting glob, read, or another built-in tool. Keep the final response concise and summarize the actual files and validation results."
 }
 
 fn redact_body(body: &str) -> String {

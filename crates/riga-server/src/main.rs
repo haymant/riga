@@ -37,7 +37,7 @@ async fn run_health_stdio() {
             .unwrap_or(serde_json::Value::Null);
         let result = match method {
             "initialize" => {
-                json!({ "protocolVersion": "2025-03-26", "serverInfo": { "name": "riga-health-stdio", "version": env!("CARGO_PKG_VERSION") } })
+                json!({ "protocolVersion": "2025-03-26", "capabilities": { "tools": {} }, "serverInfo": { "name": "riga-health-stdio", "version": env!("CARGO_PKG_VERSION") } })
             }
             "tools/list" => {
                 json!({ "tools": [{ "name": "health", "description": "Return RIGA agent kernel health", "inputSchema": { "type": "object", "properties": {} } }] })

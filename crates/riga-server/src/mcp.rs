@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use rig_agent::tool::{ToolContext, server::ToolServer, server::ToolServerHandle};
 use rig_rmcp::{McpClientHandler, rmcp};
@@ -14,6 +14,7 @@ use crate::catalog::McpServerRecord;
 pub struct McpRuntime {
     tools: ToolServerHandle,
     connected: Arc<RwLock<Vec<String>>>,
+    aliases: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl McpRuntime {
@@ -21,6 +22,7 @@ impl McpRuntime {
         Self {
             tools: ToolServer::new().owner("riga-mcp").run(),
             connected: Arc::new(RwLock::new(Vec::new())),
+            aliases: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -93,6 +95,18 @@ impl McpRuntime {
                 return;
             }
         };
+        {
+            let mut aliases = self.aliases.write().await;
+            for tool in &record.summary.tools {
+                aliases.insert(
+                    qualified_tool_name(&record.summary.name, tool),
+                    tool.clone(),
+                );
+                if record.summary.name == "riga-health-stdio" {
+                    aliases.insert(qualified_tool_name("rig-health-stdio", tool), tool.clone());
+                }
+            }
+        }
         connected.write().await.push(name.clone());
         tokio::spawn(async move {
             match waiting.await {
@@ -108,15 +122,35 @@ impl McpRuntime {
     }
 
     pub async fn tool_definitions(&self) -> Vec<rig_core::completion::ToolDefinition> {
-        self.tools.tool_defs(None).await.unwrap_or_default()
+        let definitions = self.tools.tool_defs(None).await.unwrap_or_default();
+        let aliases = self.aliases.read().await;
+        let mut result = definitions.clone();
+        for (alias, target) in aliases.iter() {
+            if let Some(definition) = definitions.iter().find(|item| &item.name == target) {
+                let mut alias_definition = definition.clone();
+                alias_definition.name = alias.clone();
+                alias_definition.description = format!(
+                    "MCP server tool alias for {target}; use this when the user explicitly requests the corresponding MCP server"
+                );
+                result.push(alias_definition);
+            }
+        }
+        result
     }
 
     pub async fn execute(&self, name: &str, input: &serde_json::Value) -> Result<String, String> {
+        let actual_name = self
+            .aliases
+            .read()
+            .await
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_owned());
         let mut context = ToolContext::new();
         let result = self
             .tools
             .execute(
-                name,
+                &actual_name,
                 &serde_json::to_string(input).map_err(|error| error.to_string())?,
                 &mut context,
             )
@@ -136,6 +170,27 @@ impl Default for McpRuntime {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn qualified_tool_name(server: &str, tool: &str) -> String {
+    format!(
+        "mcp_{}_{}",
+        sanitize_tool_segment(server),
+        sanitize_tool_segment(tool)
+    )
+}
+
+fn sanitize_tool_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 pub fn definition_to_openai(

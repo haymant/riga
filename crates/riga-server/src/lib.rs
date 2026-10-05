@@ -283,7 +283,7 @@ async fn mcp_health_http(
             serde_json::json!({ "content": [{ "type": "text", "text": format!("RIGA kernel healthy · protocol {} · persistence {}", riga_kernel::PROTOCOL_VERSION, secure_store::database_backend()) }] })
         }
         "initialize" => {
-            serde_json::json!({ "protocolVersion": "2025-03-26", "serverInfo": { "name": ADAPTER_NAME, "version": env!("CARGO_PKG_VERSION") } })
+            serde_json::json!({ "protocolVersion": "2025-03-26", "capabilities": { "tools": {} }, "serverInfo": { "name": ADAPTER_NAME, "version": env!("CARGO_PKG_VERSION") } })
         }
         _ => serde_json::json!({ "error": { "code": -32601, "message": "method not found" } }),
     };
