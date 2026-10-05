@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use riga_kernel::events::{RigaEvent, RigaEventEnvelope};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tokio::sync::mpsc;
 
 use crate::mcp::McpRuntime;
 
@@ -324,6 +325,7 @@ async fn execute_tool(
     }
 }
 
+#[derive(Clone)]
 struct ToolTrace {
     call: serde_json::Value,
     name: String,
@@ -331,9 +333,13 @@ struct ToolTrace {
     ok: bool,
 }
 
+enum ToolTraceEvent {
+    Started(serde_json::Value),
+    Completed(ToolTrace),
+}
+
 struct AgentResult {
     output: String,
-    traces: Vec<ToolTrace>,
 }
 
 async fn send_provider_events<S>(
@@ -355,32 +361,30 @@ where
         },
     )
     .await?;
-    match call_openai_compatible(config, workspace_root, prompt, mcp_runtime).await {
-        Ok(result) => {
-            let mut sequence = 2;
-            for trace in result.traces {
-                let call_id = trace
-                    .call
-                    .get("call_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("tool-call")
-                    .to_owned();
-                send(
-                    sender,
-                    ServerMessage::Event {
-                        envelope: envelope(
-                            run_id,
-                            session_id,
-                            sequence,
-                            RigaEvent::ToolCallStarted { call: trace.call },
-                        ),
-                    },
-                )
-                .await?;
-                sequence += 1;
-                send(sender, ServerMessage::Event { envelope: envelope(run_id, session_id, sequence, RigaEvent::ToolResult { result: serde_json::json!({"call_id": call_id, "name": trace.name, "output": trace.output, "ok": trace.ok}) }) }).await?;
-                sequence += 1;
+    let (trace_sender, mut trace_receiver) = mpsc::unbounded_channel();
+    let mut provider_call = Box::pin(call_openai_compatible(
+        config,
+        workspace_root,
+        prompt,
+        mcp_runtime,
+        trace_sender,
+    ));
+    let mut sequence = 2;
+    let result = loop {
+        tokio::select! {
+            trace = trace_receiver.recv() => {
+                if let Some(trace) = trace {
+                    send_tool_event(sender, run_id, session_id, &mut sequence, trace).await?;
+                }
             }
+            result = &mut provider_call => break result,
+        }
+    };
+    while let Ok(trace) = trace_receiver.try_recv() {
+        send_tool_event(sender, run_id, session_id, &mut sequence, trace).await?;
+    }
+    match result {
+        Ok(result) => {
             send(
                 sender,
                 ServerMessage::Event {
@@ -427,23 +431,64 @@ where
     }
 }
 
+async fn send_tool_event<S>(
+    sender: &mut S,
+    run_id: &str,
+    session_id: &str,
+    sequence: &mut u64,
+    event: ToolTraceEvent,
+) -> Result<(), S::Error>
+where
+    S: SinkExt<Message> + Unpin,
+{
+    let event = match event {
+        ToolTraceEvent::Started(call) => RigaEvent::ToolCallStarted { call },
+        ToolTraceEvent::Completed(trace) => {
+            let call_id = trace
+                .call
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool-call")
+                .to_owned();
+            RigaEvent::ToolResult {
+                result: serde_json::json!({
+                    "call_id": call_id,
+                    "name": trace.name,
+                    "output": trace.output,
+                    "ok": trace.ok
+                }),
+            }
+        }
+    };
+    send(
+        sender,
+        ServerMessage::Event {
+            envelope: envelope(run_id, session_id, *sequence, event),
+        },
+    )
+    .await?;
+    *sequence += 1;
+    Ok(())
+}
+
 async fn call_openai_compatible(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
     prompt: &str,
     mcp_runtime: &McpRuntime,
+    trace_sender: mpsc::UnboundedSender<ToolTraceEvent>,
 ) -> Result<AgentResult, String> {
     if config.model.to_ascii_lowercase().starts_with("gpt-5") {
-        return call_responses_api(config, workspace_root, prompt, mcp_runtime).await;
+        return call_responses_api(config, workspace_root, prompt, mcp_runtime, trace_sender).await;
     }
-    call_chat_with_tools(config, workspace_root, prompt, mcp_runtime).await
+    call_chat_with_tools(config, workspace_root, prompt, mcp_runtime, trace_sender).await
 }
-
 async fn call_chat_with_tools(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
     prompt: &str,
     mcp_runtime: &McpRuntime,
+    trace_sender: mpsc::UnboundedSender<ToolTraceEvent>,
 ) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
@@ -462,7 +507,6 @@ async fn call_chat_with_tools(
         serde_json::json!({ "role": "system", "content": coding_agent_system_prompt() }),
         serde_json::json!({ "role": "user", "content": prompt }),
     ];
-    let mut traces = Vec::new();
     for _ in 0..24 {
         let mut request = client
             .post(&endpoint)
@@ -506,7 +550,6 @@ async fn call_chat_with_tools(
                     .get("content")
                     .and_then(content_text)
                     .ok_or_else(|| "provider returned no assistant text".to_owned())?,
-                traces,
             });
         }
         messages.push(message);
@@ -528,17 +571,20 @@ async fn call_chat_with_tools(
                 .unwrap_or("{}");
             let input: serde_json::Value = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
+            let call = serde_json::json!({"call_id": call_id, "name": name, "arguments": input});
+            let _ = trace_sender.send(ToolTraceEvent::Started(call.clone()));
             let result = execute_tool(workspace_root, mcp_runtime, name, input.clone()).await;
             let (ok, output) = match result {
                 Ok(output) => (true, output),
                 Err(error) => (false, format!("tool error: {error}")),
             };
-            traces.push(ToolTrace {
-                call: serde_json::json!({"call_id": call_id, "name": name, "arguments": input}),
+            let trace = ToolTrace {
+                call,
                 name: name.into(),
                 output: output.clone(),
                 ok,
-            });
+            };
+            let _ = trace_sender.send(ToolTraceEvent::Completed(trace));
             messages.push(
                 serde_json::json!({ "role": "tool", "tool_call_id": call_id, "content": output }),
             );
@@ -552,6 +598,7 @@ async fn call_responses_api(
     workspace_root: &std::path::Path,
     prompt: &str,
     mcp_runtime: &McpRuntime,
+    trace_sender: mpsc::UnboundedSender<ToolTraceEvent>,
 ) -> Result<AgentResult, String> {
     let endpoint = if config
         .endpoint
@@ -576,7 +623,6 @@ async fn call_responses_api(
         prompt
     ));
     let mut previous_response_id: Option<String> = None;
-    let mut traces = Vec::new();
     for _ in 0..24 {
         let mut body = serde_json::json!({
             "model": config.model,
@@ -618,7 +664,6 @@ async fn call_responses_api(
         if calls.is_empty() {
             return Ok(AgentResult {
                 output: extract_response_text(&response)?,
-                traces,
             });
         }
         previous_response_id = Some(
@@ -640,16 +685,25 @@ async fn call_responses_api(
                 .unwrap_or("{}");
             let input_value: serde_json::Value = serde_json::from_str(arguments)
                 .map_err(|e| format!("invalid arguments for {name}: {e}"))?;
+            let call_id = call
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool-call");
+            let call_json =
+                serde_json::json!({"call_id": call_id, "name": name, "arguments": input_value});
+            let _ = trace_sender.send(ToolTraceEvent::Started(call_json.clone()));
             let result = execute_tool(workspace_root, mcp_runtime, name, input_value.clone()).await;
             let (ok, output) = match result {
                 Ok(output) => (true, output),
                 Err(error) => (false, format!("tool error: {error}")),
             };
-            let call_id = call
-                .get("call_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("tool-call");
-            traces.push(ToolTrace { call: serde_json::json!({"call_id": call_id, "name": name, "arguments": input_value}), name: name.into(), output: output.clone(), ok });
+            let trace = ToolTrace {
+                call: call_json,
+                name: name.into(),
+                output: output.clone(),
+                ok,
+            };
+            let _ = trace_sender.send(ToolTraceEvent::Completed(trace));
             outputs.push(serde_json::json!({"type":"function_call_output", "call_id": call_id, "output": output}));
         }
         input = serde_json::Value::Array(outputs);
