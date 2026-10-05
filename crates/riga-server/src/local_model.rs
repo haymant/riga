@@ -168,6 +168,20 @@ fn resolve_context(trained: u32, wanted: u32) -> u32 {
     wanted.clamp(MIN_CONTEXT, ceiling)
 }
 
+/// The context a model is loaded with.
+///
+/// A curated entry carries its own window; `RIGA_LOCAL_CONTEXT` overrides it so
+/// a machine with a low memory ceiling — or a pressure-based OOM killer — can
+/// trade context for KV-cache headroom. The GGUF's trained window still clamps
+/// the result in `resolve_context`, so this can never exceed what the weights
+/// support.
+fn requested_context(curated_max: Option<u32>, override_value: Option<&str>) -> u32 {
+    override_value
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| curated_max.unwrap_or(DEFAULT_CONTEXT))
+}
+
 /// Clamp a requested completion to the room the prompt leaves behind.
 ///
 /// Auto-shrinking rather than rejecting is what keeps the guarantee the batch
@@ -581,7 +595,10 @@ impl LocalModelRuntime {
             // a starting point that gets clamped by it.
             let context_size = resolve_context(
                 model.n_ctx_train(),
-                curated.map_or(DEFAULT_CONTEXT, |entry| entry.max_context),
+                requested_context(
+                    curated.map(|entry| entry.max_context),
+                    std::env::var("RIGA_LOCAL_CONTEXT").ok().as_deref(),
+                ),
             );
             let loaded = LoadedModel {
                 model,
@@ -870,8 +887,31 @@ fn _now_epoch() -> u64 {
 mod tests {
     use super::{
         CATALOG, DEFAULT_CONTEXT, LocalModelRuntime, MAX_CONTEXT, MAX_DECODE_BATCH, MIN_CONTEXT,
-        accelerator_label, resolve_context, resolve_max_tokens,
+        accelerator_label, requested_context, resolve_context, resolve_max_tokens,
     };
+
+    #[test]
+    fn context_is_the_curated_window_unless_overridden() {
+        // Curated model: its own window.
+        assert_eq!(requested_context(Some(32_768), None), 32_768);
+        // Non-curated model: the safe default.
+        assert_eq!(requested_context(None, None), DEFAULT_CONTEXT);
+        // An explicit override wins, and resolve_context still clamps it to the
+        // GGUF's trained window.
+        assert_eq!(requested_context(Some(32_768), Some("4096")), 4_096);
+        assert_eq!(
+            resolve_context(131_072, requested_context(Some(32_768), Some("4096"))),
+            4_096
+        );
+        // Junk or zero falls back rather than panicking in `clamp`.
+        assert_eq!(requested_context(Some(32_768), Some("nonsense")), 32_768);
+        assert_eq!(requested_context(Some(32_768), Some("0")), 32_768);
+        // An override below the floor is clamped up, not accepted as-is.
+        assert_eq!(
+            resolve_context(131_072, requested_context(None, Some("1"))),
+            MIN_CONTEXT
+        );
+    }
 
     #[test]
     fn curated_catalog_has_unique_fully_hashed_entries() {

@@ -45,6 +45,8 @@ The preview is served on port `1420`. The kernel adapter listens on `8787` and t
 
 Writes and shell commands are **approval-gated by the kernel's tool policy**, not by environment variables. The first time a run wants to write a file or run a shell command, it pauses and the UI shows an approval card with **Allow once**, **Always allow**, and **Decline**. "Always allow" is scoped to the session. Read-only tools run without asking; destructive tools are denied outright.
 
+The local GGUF context window is capped at `32768` tokens (the KV cache is sized from it). On a machine with limited memory headroom, set `RIGA_LOCAL_CONTEXT` to a smaller value — for example `8192` — to shrink the KV cache; the GGUF's own trained window still clamps the result.
+
 Never commit `.env.local`, provider keys, `RIGA_TOKEN`, or uploaded files. The API key is encrypted at rest by the server store and is write-only from the browser.
 
 ### Desktop shell
