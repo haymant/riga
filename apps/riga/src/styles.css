@@ -202,3 +202,27 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 .attachment-chip { display: inline-flex; align-items: center; gap: 5px; max-width: 260px; padding: 5px 8px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-raised); color: var(--text-muted); font-size: 11px; }
 .attachment-chip > button { display: inline-flex; border: 0; background: transparent; color: var(--text-muted); padding: 0; cursor: pointer; }
 .attachment-chip > button:hover { color: var(--text); }
+
+/* assistant-ui tool-use vocabulary: tool group, timeline, terminal block, and lifecycle states */
+.tool-timeline { margin-left: 39px; max-width: 700px; border: 1px solid #303949; background: linear-gradient(145deg, #111722, #0e131b); border-radius: 12px; overflow: hidden; box-shadow: 0 12px 30px rgba(0,0,0,.14); }
+.timeline-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 11px 13px; border-bottom: 1px solid #27303d; background: rgba(33,39,52,.52); }
+.timeline-title { display: flex; align-items: center; gap: 8px; color: #c8d0dc; }
+.timeline-title svg { color: #a78bfa; }
+.timeline-title strong { font-size: 11px; }
+.timeline-title span { color: #778294; font: 10px 'DM Mono', monospace; }
+.timeline-status { color: var(--green); font: 10px 'DM Mono', monospace; }
+.timeline-status.running { color: var(--amber); }
+.timeline-status.error { color: #f29a9a; }
+.timeline-rail { position: relative; display: grid; gap: 7px; padding: 10px 12px 12px 24px; }
+.timeline-rail::before { content: ""; position: absolute; top: 0; bottom: 0; left: 13px; width: 1px; background: #343d4d; }
+.timeline-rail .tool-card { position: relative; margin: 0; max-width: none; border-radius: 8px; }
+.timeline-rail .tool-card::before { content: ""; position: absolute; z-index: 2; left: -16px; top: 17px; width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px #111722; }
+.timeline-rail .tool-card:has(.tool-status.running)::before { background: var(--amber); }
+.timeline-rail .tool-card:has(.tool-status.error)::before { background: #f29a9a; }
+.timeline-rail .tool-card-top { padding: 9px 11px; }
+.timeline-rail .tool-output { max-height: 180px; overflow: auto; }
+.terminal-output { color: #b9e6ce; background: #0a100f; border-top-color: #213b34; white-space: pre-wrap; }
+.tool-output-label { display: block; margin-bottom: 6px; color: #687587; text-transform: uppercase; letter-spacing: .08em; font-size: 9px; }
+.tool-status.error { color: #f29a9a !important; }
+.tool-status.error > span { background: #f29a9a; }
+@media (max-width: 760px) { .tool-timeline { margin-left: 0; }.timeline-rail { padding-left: 19px; }.timeline-rail::before { left: 9px; }.timeline-rail .tool-card::before { left: -14px; } }

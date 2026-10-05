@@ -451,7 +451,10 @@ async fn call_chat_with_tools(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut messages = vec![serde_json::json!({ "role": "user", "content": prompt })];
+    let mut messages = vec![
+        serde_json::json!({ "role": "system", "content": coding_agent_system_prompt() }),
+        serde_json::json!({ "role": "user", "content": prompt }),
+    ];
     let mut traces = Vec::new();
     for _ in 0..24 {
         let mut request = client
@@ -558,7 +561,11 @@ async fn call_responses_api(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
-    let mut input = serde_json::json!(prompt);
+    let mut input = serde_json::json!(format!(
+        "{}\n\nUser request:\n{}",
+        coding_agent_system_prompt(),
+        prompt
+    ));
     let mut previous_response_id: Option<String> = None;
     let mut traces = Vec::new();
     for _ in 0..24 {
@@ -791,6 +798,10 @@ fn content_text(content: &serde_json::Value) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
+fn coding_agent_system_prompt() -> &'static str {
+    "You are RIGA, a coding agent operating inside the configured workspace. For requests that create, modify, inspect, run, or validate software, use the available tools instead of only describing commands or code. Work in small observable steps: inspect first, then write files, install dependencies only when needed, run the service, and validate the requested endpoint. Never claim a file or command succeeded unless a tool result confirms it. Keep the final response concise and summarize the actual files and validation results."
+}
+
 fn redact_body(body: &str) -> String {
     body.chars().take(300).collect()
 }
@@ -852,6 +863,13 @@ mod tests {
         assert_eq!(body["max_completion_tokens"], 2048);
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["model"], "gpt-5-nano");
+    }
+
+    #[test]
+    fn coding_agent_prompt_requires_tools_for_implementation_requests() {
+        let prompt = super::coding_agent_system_prompt();
+        assert!(prompt.contains("use the available tools"));
+        assert!(prompt.contains("Never claim a file or command succeeded"));
     }
 
     #[test]

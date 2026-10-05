@@ -35,6 +35,7 @@ type Session = { id: string; title: string; meta: string; active?: boolean };
 type TranscriptItem =
   | { id: string; role: Role; text: string; time: string }
   | { id: string; role: "tool"; callId?: string; name: string; command: string; status: "running" | "done" | "error"; output: string; time: string };
+type TranscriptBlock = TranscriptItem | { id: string; role: "timeline"; items: Extract<TranscriptItem, { role: "tool" }>[] };
 type CatalogItem = { id: string; kind: string; description: string; insert_text: string; requires_approval: boolean };
 type SkillSummary = { name: string; description: string; path: string };
 type McpServerSummary = { name: string; command: string; tools: string[] };
@@ -158,7 +159,13 @@ function App() {
           setTranscript((current) => current.map((item) => item.role === "tool" && item.callId === result.call_id ? { ...item, status: result.ok ? "done" : "error", output: result.output ?? "" } : item));
         } else if (typeof event === "object" && event !== null && "TextDelta" in event) {
           const delta = (event as { TextDelta: { delta: string } }).TextDelta.delta;
-          setTranscript((current) => [...current, { id: envelope.event_id, role: "assistant", text: delta, time: "now" }]);
+          setTranscript((current) => {
+            const last = current.at(-1);
+            if (last?.role === "assistant" && last.id.startsWith("stream-")) {
+              return [...current.slice(0, -1), { ...last, text: `${last.text}${delta}` }];
+            }
+            return [...current, { id: `stream-${envelope.run_id}`, role: "assistant", text: delta, time: "now" }];
+          });
         } else if (typeof event === "object" && event !== null && "RunCompleted" in event) {
           setIsRunning(false);
         } else if (typeof event === "object" && event !== null && "RunFailed" in event) {
@@ -334,7 +341,7 @@ function App() {
           <div className="conversation-header"><div><p className="eyebrow">SESSION / {activeSession.id.toUpperCase()}</p><h1>Build with confidence.</h1><p className="subtitle">A durable, inspectable coding-agent workspace.</p></div><button className="outline-button"><TerminalSquare size={15} /> Open terminal</button></div>
           <div className="transcript" aria-live="polite">
             {transcript.length === 0 && <div className="empty-state"><div className="empty-icon"><Bot size={26} /></div><h2>Start a coding run</h2><p>Describe the change, then review every tool action before it touches your workspace.</p></div>}
-            {transcript.map((item) => <TranscriptItemView key={item.id} item={item} />)}
+            {groupTranscript(transcript).map((block) => block.role === "timeline" ? <ToolTimeline key={block.id} items={block.items} /> : <TranscriptItemView key={block.id} item={block} />)}
             {isRunning && <div className="typing-row"><div className="assistant-badge"><Bot size={15} /></div><div className="typing-bubble"><span /><span /><span /></div><small>RIGA is thinking</small></div>}
           </div>
 
@@ -348,15 +355,46 @@ function App() {
   );
 }
 
-function TranscriptItemView({ item }: { item: TranscriptItem }) {
-  if (item.role === "tool") return <details className={`tool-card ${item.name === "bash" || item.name === "shell" ? "terminal-tool" : ""}`} open={item.status === "running"}>
+function groupTranscript(items: TranscriptItem[]): TranscriptBlock[] {
+  const blocks: TranscriptBlock[] = [];
+  for (const item of items) {
+    if (item.role === "tool") {
+      const previous = blocks.at(-1);
+      if (previous?.role === "timeline") {
+        previous.items.push(item);
+      } else {
+        blocks.push({ id: `timeline-${item.id}`, role: "timeline", items: [item] });
+      }
+    } else {
+      blocks.push(item);
+    }
+  }
+  return blocks;
+}
+
+function ToolTimeline({ items }: { items: Extract<TranscriptItem, { role: "tool" }>[] }) {
+  const running = items.some((item) => item.status === "running");
+  const failed = items.some((item) => item.status === "error");
+  return <section className="tool-timeline" aria-label="Agent tool timeline">
+    <div className="timeline-header"><div className="timeline-title"><Clock3 size={14} /><strong>{running ? "Working through tools" : failed ? "Tool run failed" : "Tool timeline"}</strong><span>{items.length} {items.length === 1 ? "step" : "steps"}</span></div><span className={`timeline-status ${running ? "running" : failed ? "error" : "complete"}`}>{running ? "Running" : failed ? "Needs attention" : "Completed"}</span></div>
+    <div className="timeline-rail">{items.map((item) => <ToolCallView key={item.id} item={item} />)}</div>
+  </section>;
+}
+
+function ToolCallView({ item }: { item: Extract<TranscriptItem, { role: "tool" }> }) {
+  const terminal = item.name === "bash" || item.name === "shell";
+  return <details className={`tool-card ${terminal ? "terminal-tool" : ""}`} open={item.status !== "done"}>
     <summary className="tool-card-top">
       <div className="tool-symbol"><TerminalSquare size={15} /></div>
       <div><strong>{item.name}</strong><span>{item.command}</span></div>
       <span className={`tool-status ${item.status}`}><span /> {item.status === "running" ? "Running" : item.status === "error" ? "Failed" : "Completed"}</span>
     </summary>
-    <div className="tool-output"><span className="tool-output-label">{item.name === "bash" || item.name === "shell" ? "Terminal output" : "Tool result"}</span>{item.output}</div>
+    <div className={`tool-output ${terminal ? "terminal-output" : ""}`}><span className="tool-output-label">{terminal ? "Terminal output" : item.status === "error" ? "Tool error" : "Tool result"}</span>{item.output}</div>
   </details>;
+}
+
+function TranscriptItemView({ item }: { item: TranscriptItem }) {
+  if (item.role === "tool") return <ToolCallView item={item} />;
   return <article className={`message-row ${item.role}`}><div className="message-avatar">{item.role === "assistant" ? <Bot size={15} /> : item.role === "system" ? <ShieldCheck size={15} /> : "AM"}</div><div className="message-body"><div className="message-meta"><strong>{item.role === "assistant" ? "RIGA" : item.role === "system" ? "System" : "You"}</strong><span>{item.time}</span></div><p>{item.text}</p></div></article>;
 }
 
