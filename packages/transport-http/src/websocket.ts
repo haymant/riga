@@ -91,14 +91,47 @@ export class RigaWebSocketClient {
   connect(): Promise<void> {
     if (this.ready) return this.ready;
     this.closedByUser = false;
+    this.cancelReconnect();
     this.ready = this.openSocket();
     return this.ready;
+  }
+
+  /**
+   * Reconnect now if the connection is down, without waiting out a backoff timer.
+   *
+   * Call this when the page resumes: a phone that was locked, a tab that was
+   * backgrounded, or a network that just came back. While suspended, timers do
+   * not fire, so the scheduled reconnect can be arbitrarily far in the future;
+   * this restarts it immediately. A no-op when already connected or connecting.
+   */
+  wake(): void {
+    if (this.closedByUser || this.ready) return;
+    this.cancelReconnect();
+    this.ready = this.openSocket();
+    void this.ready.catch(() => undefined);
+  }
+
+  private cancelReconnect(): void {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
   }
 
   private openSocket(): Promise<void> {
     this.onStatus("connecting");
     return new Promise<void>((resolve, reject) => {
-      const socket = this.makeSocket(this.url);
+      let socket: RigaWebSocketLike;
+      try {
+        socket = this.makeSocket(this.url);
+      } catch (error) {
+        // A malformed URL (e.g. a missing host) must not throw out of `connect`
+        // and leave the client with no scheduled retry.
+        this.onStatus("error");
+        reject(error instanceof Error ? error : new Error("RIGA WebSocket could not be created"));
+        if (!this.closedByUser) this.scheduleReconnect();
+        return;
+      }
       this.socket = socket;
       let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
       const clearHandshake = () => {
@@ -123,10 +156,19 @@ export class RigaWebSocketClient {
         if (!this.closedByUser) this.scheduleReconnect();
       }, HANDSHAKE_TIMEOUT_MS);
       socket.onopen = () => {
+        // A socket that was already replaced (a fast reconnect) must not send
+        // its stale handshake into the new connection's state.
+        if (socket !== this.socket) return;
         this.send({ type: "hello", client_version: "0.1.0" });
       };
       socket.onmessage = (message) => {
-        const parsed = JSON.parse(message.data) as RigaWebSocketServerMessage;
+        if (socket !== this.socket) return;
+        let parsed: RigaWebSocketServerMessage;
+        try {
+          parsed = JSON.parse(message.data) as RigaWebSocketServerMessage;
+        } catch {
+          return;
+        }
         if (parsed.type === "ready") {
           clearHandshake();
           this.onStatus("connected");
@@ -150,6 +192,7 @@ export class RigaWebSocketClient {
         }
       };
       socket.onerror = () => {
+        if (socket !== this.socket) return;
         clearHandshake();
         this.onStatus("error");
         reject(new Error("RIGA WebSocket connection failed"));
@@ -159,6 +202,10 @@ export class RigaWebSocketClient {
       };
       socket.onclose = () => {
         clearHandshake();
+        // A superseded socket's close must not flap the status or schedule a
+        // second reconnect on top of the one already in flight.
+        if (socket !== this.socket) return;
+        this.socket = null;
         this.onStatus("closed");
         // An unexpected drop reconnects with backoff; an explicit close does not.
         if (!this.closedByUser) this.scheduleReconnect();

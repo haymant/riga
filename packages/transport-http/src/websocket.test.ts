@@ -95,6 +95,38 @@ describe("RigaWebSocketClient", () => {
     }
   });
 
+  it("wakes immediately after a suspend instead of waiting out the backoff", async () => {
+    vi.useFakeTimers();
+    try {
+      const sockets: FakeSocket[] = [];
+      const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, onEvent: vi.fn() });
+      const first = client.connect();
+      sockets[0]?.open();
+      sockets[0]?.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
+      await first;
+      sockets[0]?.close();
+      // A phone resumes before the (frozen) backoff timer fires.
+      client.wake();
+      expect(sockets).toHaveLength(2);
+      sockets[1]?.open();
+      const handed = sockets[1]?.sent.map((value) => JSON.parse(value)).some((message) => message.type === "hello");
+      expect(handed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ignores wake while a live connection is already open", async () => {
+    const sockets: FakeSocket[] = [];
+    const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => { const socket = new FakeSocket(); sockets.push(socket); return socket; }, onEvent: vi.fn() });
+    const first = client.connect();
+    sockets[0]?.open();
+    sockets[0]?.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
+    await first;
+    client.wake();
+    expect(sockets).toHaveLength(1);
+  });
+
   it("sends provider endpoint, key, and model only in the live socket frame", async () => {
     const socket = new FakeSocket();
     const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn() });

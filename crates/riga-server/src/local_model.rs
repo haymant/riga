@@ -206,7 +206,6 @@ struct LoadedModel {
     // Drop the model before its backend.
     model: LlamaModel,
     backend: Arc<LlamaBackend>,
-    file_name: String,
     /// The resolved window: the model's own maximum, capped by MAX_CONTEXT.
     /// Resolved once at load time so inference does not repeat the clamping.
     context_size: u32,
@@ -218,6 +217,11 @@ pub struct LocalModelRuntime {
     /// lazily here and shared across every model (re)load.
     backend: OnceLock<Arc<LlamaBackend>>,
     engine: Arc<Mutex<Option<LoadedModel>>>,
+    /// The loaded model's file name, mirrored here so status checks never have
+    /// to lock `engine`. A generation holds `engine` for its whole (minutes-long)
+    /// decode, and status checks run on async workers; locking there could park
+    /// one worker per check behind a running model.
+    loaded_name: Arc<Mutex<Option<String>>>,
     downloads: Arc<Mutex<HashMap<String, CancellationToken>>>,
     generations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// Broadcast sink for download progress and terminal download state.
@@ -314,10 +318,7 @@ impl LocalModelRuntime {
     }
 
     pub fn loaded_file_name(&self) -> Option<String> {
-        self.engine
-            .lock()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|loaded| loaded.file_name.clone()))
+        self.loaded_name.lock().ok().and_then(|guard| guard.clone())
     }
 
     /// Whether `model_id` names a curated entry, and whether it is already
@@ -573,6 +574,7 @@ impl LocalModelRuntime {
             }
         };
         let engine = self.engine.clone();
+        let loaded_name = self.loaded_name.clone();
         tokio::task::spawn_blocking(move || {
             // Offload every layer the build supports: with the `cuda` feature
             // this uses the GPU, otherwise it stays on the CPU and OpenMP still
@@ -603,12 +605,14 @@ impl LocalModelRuntime {
             let loaded = LoadedModel {
                 model,
                 backend,
-                file_name,
                 context_size,
             };
             *engine
                 .lock()
                 .map_err(|_| "Model engine state is unavailable")? = Some(loaded);
+            if let Ok(mut guard) = loaded_name.lock() {
+                *guard = Some(file_name);
+            }
             Ok::<(), String>(())
         })
         .await
@@ -621,6 +625,9 @@ impl LocalModelRuntime {
             .engine
             .lock()
             .map_err(|_| "Model engine state is unavailable")? = None;
+        if let Ok(mut guard) = self.loaded_name.lock() {
+            *guard = None;
+        }
         Ok(())
     }
 

@@ -79,9 +79,21 @@ struct RunEvidence {
     /// Set once any token was streamed to the client, so the final `RunCompleted`
     /// path does not resend the whole reply as one delta on top of it.
     streamed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the run is cancelled. Threaded through the whole run (including
+    /// subagents) so a cancellation reaches a model that is mid-decode, not just
+    /// the loop that spawned it. Carrying it here rather than as another
+    /// parameter keeps the dozens of loop call sites unchanged.
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RunEvidence {
+    fn with_cancel(cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        Self {
+            cancelled,
+            ..Self::default()
+        }
+    }
+
     /// Record a tool result. Only a *successful* mutating call counts; a failed
     /// write or a denied approval is not evidence of work.
     fn record(&self, tool: &str, ok: bool) {
@@ -102,6 +114,51 @@ impl RunEvidence {
     fn was_streamed(&self) -> bool {
         self.streamed.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    fn cancel_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.cancelled.clone()
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// How many run events a subscriber may fall behind before it is told it lagged
+/// and catches up from the journal instead.
+const RUN_EVENT_BUFFER: usize = 1024;
+
+/// A run that is currently executing on the server.
+#[derive(Clone)]
+pub(crate) struct RunHandle {
+    /// Live events. A socket subscribes to follow the run; the run outlives any
+    /// individual subscriber.
+    events: tokio::sync::broadcast::Sender<RigaEventEnvelope>,
+    /// Set on `CancelRun`; the event loops poll it, including mid-decode.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether this run uses the (single) local engine, so a second local run
+    /// can be refused with a clear message instead of blocking on the mutex.
+    local: bool,
+}
+
+/// The runs in flight, keyed by run id. Lives in server state so every socket
+/// sees the same runs.
+pub(crate) type RunRegistry =
+    std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, RunHandle>>>;
+
+/// A frame that is streamed but not worth persisting.
+fn is_ephemeral(event: &RigaEvent) -> bool {
+    matches!(
+        event,
+        RigaEvent::TextDelta { .. } | RigaEvent::ToolOutputDelta { .. }
+    )
+}
+
+fn is_terminal(event: &RigaEvent) -> bool {
+    matches!(
+        event,
+        RigaEvent::RunCompleted { .. } | RigaEvent::RunFailed { .. }
+    )
 }
 
 /// Forwards local-model tokens to the UI as they are decoded, without leaking
@@ -239,7 +296,7 @@ Do not repeat a claim you cannot back with a tool result.";
 /// when the `Approval` frame arrives. `always_allowed` persists across runs in
 /// the same session so "always allow" means exactly that.
 #[derive(Clone, Default)]
-struct ApprovalBroker {
+pub(crate) struct ApprovalBroker {
     waiters: std::sync::Arc<
         tokio::sync::Mutex<
             std::collections::HashMap<String, tokio::sync::oneshot::Sender<ApprovalReply>>,
@@ -507,7 +564,108 @@ pub enum ServerMessage {
     },
 }
 
-pub async fn upgrade(
+/// Stream one run's events to a socket until the run ends or the socket drops.
+///
+/// Replays the journal from `after_sequence` first, then follows the live
+/// broadcast, deduplicating by sequence. Returning does **not** stop the run:
+/// that is what lets a locked phone keep thinking and catch up on unlock.
+#[allow(clippy::too_many_arguments)]
+async fn forward_run<S>(
+    sender: &mut S,
+    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    mut upstream: tokio::sync::broadcast::Receiver<RigaEventEnvelope>,
+    run_id: &str,
+    after_sequence: u64,
+    broker: &ApprovalBroker,
+    runs: &RunRegistry,
+) where
+    S: SinkExt<Message> + Unpin,
+{
+    let mut last = after_sequence;
+    // Catch up on anything already journaled. The receiver was subscribed before
+    // this read, so live frames published meanwhile are buffered, not lost; the
+    // sequence guard below drops any that overlap the replay.
+    if let Ok(journal) = riga_kernel::persistence::EventJournal::open(run_journal_path(run_id)) {
+        for replay in journal.after_sequence(after_sequence) {
+            last = last.max(replay.sequence);
+            if send(sender, ServerMessage::Event { envelope: replay })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    }
+    loop {
+        tokio::select! {
+            event = upstream.recv() => {
+                match event {
+                    Ok(envelope) => {
+                        if envelope.sequence <= last {
+                            continue;
+                        }
+                        last = envelope.sequence;
+                        let terminal = is_terminal(&envelope.event);
+                        if send(sender, ServerMessage::Event { envelope }).await.is_err() {
+                            return;
+                        }
+                        if terminal {
+                            return;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // A slow socket missed frames; the journal is complete,
+                        // so replay from where the client was.
+                        if let Ok(journal) = riga_kernel::persistence::EventJournal::open(run_journal_path(run_id)) {
+                            for replay in journal.after_sequence(last) {
+                                last = replay.sequence;
+                                if send(sender, ServerMessage::Event { envelope: replay }).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+            message = receiver.next() => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<ClientMessage>(&text) {
+                            Ok(ClientMessage::Approval { approval_id, approved, option, .. }) => {
+                                let reply = ApprovalReply {
+                                    approved,
+                                    always: option.as_deref() == Some("always"),
+                                };
+                                broker.resolve(&approval_id, reply).await;
+                            }
+                            Ok(ClientMessage::Ping { nonce }) => {
+                                let _ = send(sender, ServerMessage::Pong { nonce }).await;
+                            }
+                            Ok(ClientMessage::CancelRun { run_id }) => {
+                                if let Some(handle) = runs.lock().await.get(&run_id) {
+                                    handle
+                                        .cancel
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                let _ = send(sender, ServerMessage::RunCancelled { run_id }).await;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = sender.send(Message::Pong(payload)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None => return,
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn upgrade(
     socket: WebSocket,
     workspace_root: PathBuf,
     mcp_runtime: McpRuntime,
@@ -516,9 +674,10 @@ pub async fn upgrade(
         tokio::sync::RwLock<std::collections::HashMap<String, Vec<ConversationTurn>>>,
     >,
     secure_store: Option<std::sync::Arc<crate::secure_store::SecureStore>>,
+    broker: ApprovalBroker,
+    runs: RunRegistry,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let broker = ApprovalBroker::default();
     let mut provider: Option<ProviderConfig> =
         match crate::secure_store::load_json("provider").await {
             Ok(value) => value,
@@ -636,36 +795,67 @@ pub async fn upgrade(
                         .await;
                     }
                     Ok(ClientMessage::CancelRun { run_id }) => {
+                        if let Some(handle) = runs.lock().await.get(&run_id) {
+                            handle
+                                .cancel
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                         let _ = send(&mut sender, ServerMessage::RunCancelled { run_id }).await;
                     }
                     Ok(ClientMessage::ResumeRun {
                         run_id,
                         after_sequence,
                     }) => {
-                        // Replay a run's journaled events from the client's
-                        // cursor, so a reconnect catches up without re-running.
-                        match riga_kernel::persistence::EventJournal::open(run_journal_path(
-                            &run_id,
-                        )) {
-                            Ok(journal) => {
-                                for replay in journal.after_sequence(after_sequence) {
-                                    if send(&mut sender, ServerMessage::Event { envelope: replay })
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                let _ = send(
+                        // A run that is still in flight is followed live after the
+                        // journal replay, so a reconnect sees the rest of it. A
+                        // finished run has only the journal, replayed from the
+                        // client's cursor without re-running the agent.
+                        let upstream = runs
+                            .lock()
+                            .await
+                            .get(&run_id)
+                            .map(|handle| handle.events.subscribe());
+                        match upstream {
+                            Some(upstream) => {
+                                forward_run(
                                     &mut sender,
-                                    ServerMessage::Error {
-                                        code: "run_resume_failed".into(),
-                                        message: error.message,
-                                    },
+                                    &mut receiver,
+                                    upstream,
+                                    &run_id,
+                                    after_sequence,
+                                    &broker,
+                                    &runs,
                                 )
                                 .await;
+                            }
+                            None => {
+                                match riga_kernel::persistence::EventJournal::open(
+                                    run_journal_path(&run_id),
+                                ) {
+                                    Ok(journal) => {
+                                        for replay in journal.after_sequence(after_sequence) {
+                                            if send(
+                                                &mut sender,
+                                                ServerMessage::Event { envelope: replay },
+                                            )
+                                            .await
+                                            .is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        let _ = send(
+                                            &mut sender,
+                                            ServerMessage::Error {
+                                                code: "run_resume_failed".into(),
+                                                message: error.message,
+                                            },
+                                        )
+                                        .await;
+                                    }
+                                }
                             }
                         }
                     }
@@ -745,56 +935,117 @@ pub async fn upgrade(
                                     continue;
                                 }
                             };
-                        match send_provider_events(
+                        // Register the run before spawning so a `resume_run` that
+                        // races the first frame still finds it, and refuse a
+                        // duplicate id or a second local run (there is one engine,
+                        // so the second would only block on its mutex).
+                        let (events, cancel) = {
+                            let mut guard = runs.lock().await;
+                            if guard.contains_key(&run_id) {
+                                drop(guard);
+                                let _ = send(
+                                    &mut sender,
+                                    ServerMessage::Error {
+                                        code: "run_already_active".into(),
+                                        message: "That run is already in progress.".into(),
+                                    },
+                                )
+                                .await;
+                                continue;
+                            }
+                            if config.is_local() && guard.values().any(|handle| handle.local) {
+                                drop(guard);
+                                let _ = send(
+                                    &mut sender,
+                                    ServerMessage::Error {
+                                        code: "local_run_in_progress".into(),
+                                        message: "A local model run is already in progress. Wait for it or stop it before starting another.".into(),
+                                    },
+                                )
+                                .await;
+                                continue;
+                            }
+                            let (events, _) = tokio::sync::broadcast::channel::<RigaEventEnvelope>(
+                                RUN_EVENT_BUFFER,
+                            );
+                            let cancel =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            guard.insert(
+                                run_id.clone(),
+                                RunHandle {
+                                    events: events.clone(),
+                                    cancel: cancel.clone(),
+                                    local: config.is_local(),
+                                },
+                            );
+                            (events, cancel)
+                        };
+                        // Subscribe before spawning so the run's opening frames are
+                        // buffered for this socket rather than lost.
+                        let upstream = events.subscribe();
+                        {
+                            let run_id_task = run_id.clone();
+                            let session_id_task = session_id.clone();
+                            let prompt_task = prompt.clone();
+                            let config_task = config.clone();
+                            let run_root_task = run_root.clone();
+                            let mcp_task = mcp_runtime.clone();
+                            let local_task = local_models.clone();
+                            let history_task = history.clone();
+                            let broker_task = broker.clone();
+                            let transcripts_task = transcripts.clone();
+                            let store_task = secure_store.clone();
+                            let runs_task = runs.clone();
+                            let events_task = events.clone();
+                            tokio::spawn(async move {
+                                let evidence = RunEvidence::with_cancel(cancel);
+                                let mut channel =
+                                    RunChannel::new(&run_id_task, &session_id_task, events_task);
+                                let output = run_provider(
+                                    &mut channel,
+                                    &broker_task,
+                                    &config_task,
+                                    &run_root_task,
+                                    &prompt_task,
+                                    &mcp_task,
+                                    &local_task,
+                                    &history_task,
+                                    &evidence,
+                                )
+                                .await;
+                                let mut turns = vec![ConversationTurn {
+                                    role: "user".into(),
+                                    content: prompt_task,
+                                }];
+                                if let Some(output) = output {
+                                    turns.push(ConversationTurn {
+                                        role: "assistant".into(),
+                                        content: output,
+                                    });
+                                }
+                                append_turns(
+                                    &transcripts_task,
+                                    &store_task,
+                                    &session_id_task,
+                                    &turns,
+                                )
+                                .await;
+                                runs_task.lock().await.remove(&run_id_task);
+                            });
+                        }
+                        // Follow the run from the start. If this socket drops,
+                        // only the follow ends; the run keeps going, and the next
+                        // `start_run`/`resume_run` catches up from the journal.
+                        forward_run(
                             &mut sender,
                             &mut receiver,
-                            &broker,
-                            &config,
-                            &run_root,
+                            upstream,
                             &run_id,
-                            &session_id,
-                            &prompt,
-                            &mcp_runtime,
-                            &local_models,
-                            &history,
+                            0,
+                            &broker,
+                            &runs,
                         )
-                        .await
-                        {
-                            Ok(Some(output)) => {
-                                append_turns(
-                                    &transcripts,
-                                    &secure_store,
-                                    &session_id,
-                                    &[
-                                        ConversationTurn {
-                                            role: "user".into(),
-                                            content: prompt.clone(),
-                                        },
-                                        ConversationTurn {
-                                            role: "assistant".into(),
-                                            content: output,
-                                        },
-                                    ],
-                                )
-                                .await;
-                            }
-                            // The run failed. Keep the user's turn so the session
-                            // still has context, but do not invent a reply.
-                            Ok(None) => {
-                                append_turns(
-                                    &transcripts,
-                                    &secure_store,
-                                    &session_id,
-                                    &[ConversationTurn {
-                                        role: "user".into(),
-                                        content: prompt.clone(),
-                                    }],
-                                )
-                                .await;
-                            }
-                            // A socket error means the client is gone; stop.
-                            Err(_) => return,
-                        }
+                        .await;
                     }
                     Err(error) => {
                         let _ = send(
@@ -1021,40 +1272,117 @@ struct AgentResult {
     output: String,
 }
 
-/// The per-run entrypoint for the provider loop. It threads the connection, the
-/// resolved provider, the workspace and the two runtimes together; bundling them
-/// into a struct would only move the same fields behind one more name.
+/// The server-side sink for one run.
+///
+/// Every event is appended to the run's durable journal and then broadcast, so
+/// a run keeps going whether or not a client is watching, and a client that
+/// reconnects can replay what it missed and then follow the run live. The
+/// journal is written first so a frame that reaches a subscriber is already
+/// durable.
+struct RunChannel {
+    journal: Option<riga_kernel::persistence::EventJournal>,
+    events: tokio::sync::broadcast::Sender<RigaEventEnvelope>,
+    run_id: String,
+    session_id: String,
+    sequence: u64,
+}
+
+impl RunChannel {
+    fn new(
+        run_id: &str,
+        session_id: &str,
+        events: tokio::sync::broadcast::Sender<RigaEventEnvelope>,
+    ) -> Self {
+        Self {
+            journal: riga_kernel::persistence::EventJournal::open(run_journal_path(run_id)).ok(),
+            events,
+            run_id: run_id.to_owned(),
+            session_id: session_id.to_owned(),
+            sequence: 1,
+        }
+    }
+
+    /// A channel that only broadcasts, for tests that must not touch the data
+    /// directory. Production always journals.
+    #[cfg(test)]
+    fn without_journal(
+        run_id: &str,
+        session_id: &str,
+        events: tokio::sync::broadcast::Sender<RigaEventEnvelope>,
+    ) -> Self {
+        Self {
+            journal: None,
+            events,
+            run_id: run_id.to_owned(),
+            session_id: session_id.to_owned(),
+            sequence: 1,
+        }
+    }
+
+    /// Broadcast one event, journaling it first unless it is ephemeral.
+    /// `RunStarted` owns sequence 1.
+    fn emit(&mut self, event: RigaEvent) {
+        let envelope = envelope(&self.run_id, &self.session_id, self.sequence, event);
+        self.sequence += 1;
+        // Token and tool-output deltas are high-frequency and reconstructible:
+        // the final reply and each tool result are durable, so journaling every
+        // delta would only rewrite the run file once per token. They are still
+        // broadcast, so a watching client sees them live.
+        if !is_ephemeral(&envelope.event)
+            && let Some(journal) = self.journal.as_mut()
+            && let Err(error) = journal.append(envelope.clone())
+        {
+            tracing::warn!(?error, "run event could not be journaled");
+        }
+        // No receiver just means nobody is watching right now; the journal holds
+        // the event for whichever client connects next.
+        let _ = self.events.send(envelope);
+    }
+
+    fn emit_trace(&mut self, trace: ToolTraceEvent) {
+        let event = match trace {
+            ToolTraceEvent::Started(call) => RigaEvent::ToolCallStarted { call },
+            ToolTraceEvent::Output { call_id, delta } => {
+                RigaEvent::ToolOutputDelta { call_id, delta }
+            }
+            ToolTraceEvent::Completed(trace) => RigaEvent::ToolResult {
+                result: serde_json::json!({
+                    "call_id": trace
+                        .call
+                        .get("call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("tool-call"),
+                    "name": trace.name,
+                    "output": trace.output,
+                    "ok": trace.ok,
+                    "task_id": trace.call.get("task_id").cloned(),
+                }),
+            },
+            ToolTraceEvent::Ui(event) => event,
+        };
+        self.emit(event);
+    }
+}
+
+/// Run one agent turn to completion, writing every event to `channel`.
+///
+/// This is the detached half of a run: it never touches a socket, so a client
+/// disconnecting does not interrupt it. Approvals arrive through the shared
+/// broker and cancellation through `evidence`, both independent of any socket.
 #[allow(clippy::too_many_arguments)]
-async fn send_provider_events<S>(
-    sender: &mut S,
-    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+async fn run_provider(
+    channel: &mut RunChannel,
     broker: &ApprovalBroker,
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
-    run_id: &str,
-    session_id: &str,
     prompt: &str,
     mcp_runtime: &McpRuntime,
     local_models: &std::sync::Arc<crate::local_model::LocalModelRuntime>,
     history: &[ConversationTurn],
-) -> Result<Option<String>, S::Error>
-where
-    S: SinkExt<Message> + Unpin,
-{
-    // Durable journal for this run. Reopened per run; appends are idempotent on
-    // `event_id`, so a retried frame cannot duplicate.
-    let mut journal = riga_kernel::persistence::EventJournal::open(run_journal_path(run_id)).ok();
-    emit_event(
-        sender,
-        &mut journal,
-        envelope(run_id, session_id, 1, RigaEvent::RunStarted),
-    )
-    .await?;
+    evidence: &RunEvidence,
+) -> Option<String> {
+    channel.emit(RigaEvent::RunStarted);
     let (trace_sender, mut trace_receiver) = mpsc::channel(1);
-    // Tracks whether any mutating tool succeeded anywhere in the run, including
-    // inside subagents. Used to reject a final answer that claims work the run
-    // never did.
-    let evidence = RunEvidence::default();
     // A leading `@agent` runs that subagent directly; otherwise the
     // orchestrator model decides what to do.
     let mut provider_call: std::pin::Pin<
@@ -1066,7 +1394,7 @@ where
         let trace = trace_sender.clone();
         let broker = broker.clone();
         let local_models = config.is_local().then(|| local_models.clone());
-        let evidence = evidence.clone();
+        let evidence = (*evidence).clone();
         Box::pin(async move {
             let input = serde_json::json!({
                 "action": "dispatch",
@@ -1098,71 +1426,24 @@ where
             local_models,
             history,
             broker,
-            &evidence,
+            evidence,
         ))
     };
-    let mut sequence = 2;
+    // Nothing is read from a socket here: approvals arrive through the shared
+    // broker and cancellation through `evidence`. A dropped client therefore
+    // cannot stop this loop.
     let result = loop {
         tokio::select! {
             trace = trace_receiver.recv() => {
                 if let Some(trace) = trace {
-                    send_tool_event(sender, &mut journal, run_id, session_id, &mut sequence, trace).await?;
-                }
-            }
-            // While the run is suspended on an approval, keep reading so the
-            // decision (or a cancellation or ping) is handled promptly instead
-            // of sitting in the socket buffer until the run finishes.
-            message = receiver.next() => {
-                match message {
-                    Some(Ok(Message::Text(text))) => {
-                        match serde_json::from_str::<ClientMessage>(&text) {
-                            Ok(ClientMessage::Approval { approval_id, approved, option, .. }) => {
-                                let reply = ApprovalReply {
-                                    approved,
-                                    always: option.as_deref() == Some("always"),
-                                };
-                                broker.resolve(&approval_id, reply).await;
-                            }
-                            Ok(ClientMessage::Ping { nonce }) => {
-                                let _ = send(sender, ServerMessage::Pong { nonce }).await;
-                            }
-                            Ok(ClientMessage::CancelRun { .. }) => {
-                                // Cancellation is wired in a later step; the
-                                // message is consumed here so it cannot be
-                                // mistaken for a protocol error mid-run.
-                            }
-                            Ok(ClientMessage::ResumeRun { run_id: resume_id, after_sequence }) => {
-                                // A client catching up mid-run: replay from the
-                                // journal it already has.
-                                if let Ok(existing) = riga_kernel::persistence::EventJournal::open(run_journal_path(&resume_id)) {
-                                    for replay in existing.after_sequence(after_sequence) {
-                                        let _ = send(sender, ServerMessage::Event { envelope: replay }).await;
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some(Ok(Message::Ping(payload))) => {
-                        let _ = sender.send(Message::Pong(payload)).await;
-                    }
-                    Some(Ok(Message::Close(_))) | None => return Ok(None),
-                    _ => {}
+                    channel.emit_trace(trace);
                 }
             }
             result = &mut provider_call => break result,
         }
     };
     while let Ok(trace) = trace_receiver.try_recv() {
-        send_tool_event(
-            sender,
-            &mut journal,
-            run_id,
-            session_id,
-            &mut sequence,
-            trace,
-        )
-        .await?;
+        channel.emit_trace(trace);
     }
     match result {
         Ok(result) => {
@@ -1173,7 +1454,7 @@ where
             // no tools at all.
             let output = if claims_work(&result.output) && !evidence.has_work() {
                 tracing::warn!(
-                    run_id,
+                    run_id = %channel.run_id,
                     "final answer claimed work but no mutating tool ran; annotating"
                 );
                 format!(
@@ -1187,48 +1468,18 @@ where
             // client; resending it as one delta would duplicate it. A provider
             // that answers in one piece still needs this delta.
             if !evidence.was_streamed() {
-                emit_event(
-                    sender,
-                    &mut journal,
-                    envelope(
-                        run_id,
-                        session_id,
-                        sequence,
-                        RigaEvent::TextDelta {
-                            delta: output.clone(),
-                        },
-                    ),
-                )
-                .await?;
+                channel.emit(RigaEvent::TextDelta {
+                    delta: output.clone(),
+                });
             }
-            emit_event(
-                sender,
-                &mut journal,
-                envelope(
-                    run_id,
-                    session_id,
-                    sequence + 1,
-                    RigaEvent::RunCompleted {
-                        output: output.clone(),
-                    },
-                ),
-            )
-            .await?;
-            Ok(Some(output))
+            channel.emit(RigaEvent::RunCompleted {
+                output: output.clone(),
+            });
+            Some(output)
         }
         Err(error) => {
-            emit_event(
-                sender,
-                &mut journal,
-                envelope(
-                    run_id,
-                    session_id,
-                    sequence,
-                    RigaEvent::RunFailed { message: error },
-                ),
-            )
-            .await?;
-            Ok(None)
+            channel.emit(RigaEvent::RunFailed { message: error });
+            None
         }
     }
 }
@@ -1257,49 +1508,6 @@ async fn append_turns(
     if let Some(store) = secure_store {
         let _ = store.save("transcripts", &snapshot);
     }
-}
-
-async fn send_tool_event<S>(
-    sender: &mut S,
-    journal: &mut Option<riga_kernel::persistence::EventJournal>,
-    run_id: &str,
-    session_id: &str,
-    sequence: &mut u64,
-    event: ToolTraceEvent,
-) -> Result<(), S::Error>
-where
-    S: SinkExt<Message> + Unpin,
-{
-    let event = match event {
-        ToolTraceEvent::Started(call) => RigaEvent::ToolCallStarted { call },
-        ToolTraceEvent::Output { call_id, delta } => RigaEvent::ToolOutputDelta { call_id, delta },
-        ToolTraceEvent::Completed(trace) => {
-            let call_id = trace
-                .call
-                .get("call_id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("tool-call")
-                .to_owned();
-            RigaEvent::ToolResult {
-                result: serde_json::json!({
-                    "call_id": call_id,
-                    "name": trace.name,
-                    "output": trace.output,
-                    "ok": trace.ok,
-                    "task_id": trace.call.get("task_id").cloned(),
-                }),
-            }
-        }
-        ToolTraceEvent::Ui(event) => event,
-    };
-    emit_event(
-        sender,
-        journal,
-        envelope(run_id, session_id, *sequence, event),
-    )
-    .await?;
-    *sequence += 1;
-    Ok(())
 }
 
 /// Decide what actually serves a run, given the stored provider and whether a
@@ -1478,6 +1686,11 @@ async fn run_chat_loop(
     messages.push(serde_json::json!({ "role": "user", "content": prompt }));
     let mut nudges = 0usize;
     for _ in 0..24 {
+        // Honour a cancellation between turns; an in-flight request cannot be
+        // interrupted, but the next one is not started.
+        if evidence.is_cancelled() {
+            return Err("run cancelled".into());
+        }
         let mut request = client
             .post(&endpoint)
             .json(&completion_request_body_with_tools(
@@ -2112,16 +2325,25 @@ async fn run_local_loop(
         // Run-scoped stop flag. `CancelRun` cannot reach it yet (see the note at
         // call site), so it is currently always false; passing it explicitly
         // keeps the generate contract intact for when cancellation is wired.
-        let cancel = std::sync::atomic::AtomicBool::new(false);
+        // A cancel that arrives while the model is mid-decode stops it at the
+        // next token instead of after the whole reply.
+        if evidence.is_cancelled() {
+            return Err("run cancelled".into());
+        }
+        let cancel = evidence.cancel_flag();
         // Stream this turn's tokens as they decode, keeping the tool-call block
         // out of the visible reply.
         let stream_sender = trace_sender.clone();
         let streamed_flag = evidence.streamed();
+        let worker_cancel = cancel.clone();
         let generated = tokio::task::spawn_blocking(move || {
             let mut stream = LocalDeltaStream::new(stream_sender, streamed_flag);
-            let result = runtime.generate(&request, LOCAL_MAX_TOKENS, &cancel, |delta| {
-                stream.push(delta)
-            });
+            let result = runtime.generate(
+                &request,
+                LOCAL_MAX_TOKENS,
+                worker_cancel.as_ref(),
+                |delta| stream.push(delta),
+            );
             stream.finish();
             result
         })
@@ -2660,25 +2882,6 @@ fn run_journal_path(run_id: &str) -> std::path::PathBuf {
     crate::secure_store::data_root()
         .join("runs")
         .join(format!("run-{}.json", sanitize_run_id(run_id)))
-}
-
-/// Send an event and, when a journal is open, durably record it first so a
-/// reconnect can replay it. A journal failure is logged, never fatal: losing
-/// durability is worse than losing the run, but not worse than losing the run.
-async fn emit_event<S>(
-    sender: &mut S,
-    journal: &mut Option<riga_kernel::persistence::EventJournal>,
-    envelope: RigaEventEnvelope,
-) -> Result<(), S::Error>
-where
-    S: SinkExt<Message> + Unpin,
-{
-    if let Some(journal) = journal.as_mut()
-        && let Err(error) = journal.append(envelope.clone())
-    {
-        tracing::warn!(?error, "run event could not be journaled");
-    }
-    send(sender, ServerMessage::Event { envelope }).await
 }
 
 #[cfg(test)]
@@ -3382,6 +3585,59 @@ mod tests {
         assert!(!evidence.has_work());
         evidence.record("bash", true);
         assert!(evidence.has_work());
+    }
+
+    #[test]
+    fn cancellation_reaches_every_clone_of_the_evidence() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let parent = super::RunEvidence::with_cancel(cancel.clone());
+        // A subagent gets a clone; cancelling the run must reach it too.
+        let child = parent.clone();
+        assert!(!child.is_cancelled());
+        cancel.store(true, Ordering::Relaxed);
+        assert!(parent.is_cancelled());
+        assert!(child.is_cancelled());
+    }
+
+    #[test]
+    fn only_completed_and_failed_events_end_a_follow() {
+        assert!(super::is_terminal(&RigaEvent::RunCompleted {
+            output: String::new()
+        }));
+        assert!(super::is_terminal(&RigaEvent::RunFailed {
+            message: String::new()
+        }));
+        assert!(!super::is_terminal(&RigaEvent::RunStarted));
+    }
+
+    #[test]
+    fn run_channel_broadcasts_sequential_events() {
+        let (events, mut receiver) = tokio::sync::broadcast::channel(8);
+        let mut channel = super::RunChannel::without_journal("run-1", "session-1", events);
+        channel.emit(RigaEvent::RunStarted);
+        channel.emit_trace(super::ToolTraceEvent::Ui(RigaEvent::TextDelta {
+            delta: "hi".into(),
+        }));
+        channel.emit(RigaEvent::RunCompleted {
+            output: "hi".into(),
+        });
+        let mut got = Vec::new();
+        while let Ok(envelope) = receiver.try_recv() {
+            got.push((envelope.sequence, envelope.run_id, envelope.session_id));
+        }
+        // Sequence starts at 1 and advances by one, which is what the client's
+        // dedupe cursor relies on.
+        assert_eq!(
+            got,
+            vec![
+                (1, "run-1".to_owned(), "session-1".to_owned()),
+                (2, "run-1".to_owned(), "session-1".to_owned()),
+                (3, "run-1".to_owned(), "session-1".to_owned()),
+            ]
+        );
     }
 
     #[test]

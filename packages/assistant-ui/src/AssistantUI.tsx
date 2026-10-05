@@ -397,6 +397,21 @@ function AssistantUIInner({
     return () => client.close();
   }, []);
 
+  // A phone that was locked, a tab that was backgrounded, or a network that just
+  // came back should reconnect at once rather than wait out a backoff timer that
+  // may have been frozen while the page was suspended.
+  useEffect(() => {
+    const wake = () => transportRef.current?.wake();
+    document.addEventListener("visibilitychange", wake);
+    window.addEventListener("online", wake);
+    window.addEventListener("focus", wake);
+    return () => {
+      document.removeEventListener("visibilitychange", wake);
+      window.removeEventListener("online", wake);
+      window.removeEventListener("focus", wake);
+    };
+  }, []);
+
   const refreshLocalModels = useMemo(() => async () => {
     try {
       setLocalModels(await localModelClient.overview());

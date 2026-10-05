@@ -50,6 +50,12 @@ pub struct ServerState {
     /// backend is only initialized on the first model load, and the process-wide
     /// singleton is shared, so this stays inert until a model is actually used.
     pub(crate) local_models: Arc<local_model::LocalModelRuntime>,
+    /// Pending tool approvals, shared across sockets so a run keeps waiting on an
+    /// approval even if the socket that requested it reconnects.
+    pub(crate) approvals: ws::ApprovalBroker,
+    /// Runs currently executing, so any socket can follow, cancel, or resume one
+    /// and a run survives the socket that started it.
+    pub(crate) runs: ws::RunRegistry,
 }
 
 impl Default for ServerState {
@@ -94,6 +100,8 @@ impl Default for ServerState {
             mcp_runtime: mcp::McpRuntime::new(),
             transcripts: Arc::new(RwLock::new(transcripts)),
             local_models: Arc::new(local_model::LocalModelRuntime::default()),
+            approvals: ws::ApprovalBroker::default(),
+            runs: ws::RunRegistry::default(),
         }
     }
 }
@@ -162,6 +170,8 @@ async fn ws_upgrade(
                 state.local_models.clone(),
                 state.transcripts.clone(),
                 state.secure_store.clone(),
+                state.approvals.clone(),
+                state.runs.clone(),
             )
             .await;
         }
