@@ -37,6 +37,7 @@ pub struct ServerState {
     next_id: Arc<AtomicU64>,
     pub(crate) workspace_root: PathBuf,
     pub(crate) secure_store: Option<Arc<secure_store::SecureStore>>,
+    pub(crate) mcp_registry: Arc<RwLock<Vec<catalog::McpServerRecord>>>,
 }
 
 impl Default for ServerState {
@@ -46,11 +47,27 @@ impl Default for ServerState {
             .as_ref()
             .and_then(|store| store.load::<Vec<Session>>("sessions").ok().flatten())
             .unwrap_or_default();
+        let workspace_root = catalog::workspace_root();
+        let mcp_registry = secure_store
+            .as_ref()
+            .and_then(|store| {
+                store
+                    .load::<Vec<catalog::McpServerRecord>>("mcp_registry")
+                    .ok()
+                    .flatten()
+            })
+            .or_else(|| {
+                std::fs::read_to_string(workspace_root.join(".riga-mcp-registry.json"))
+                    .ok()
+                    .and_then(|text| serde_json::from_str(&text).ok())
+            })
+            .unwrap_or_default();
         Self {
             sessions: Arc::new(RwLock::new(sessions)),
             next_id: Arc::new(AtomicU64::new(1)),
-            workspace_root: catalog::workspace_root(),
+            workspace_root,
             secure_store,
+            mcp_registry: Arc::new(RwLock::new(mcp_registry)),
         }
     }
 }
@@ -72,6 +89,11 @@ pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/catalog", get(tool_catalog))
+        .route(
+            "/mcp/registry",
+            get(list_mcp_registry).post(save_mcp_registry),
+        )
+        .route("/mcp/health", post(mcp_health_http))
         .route("/attachments", post(upload_attachment))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/runs/{run_id}/events", get(stream_events))
@@ -97,7 +119,157 @@ async fn health() -> Json<HealthResponse> {
 async fn tool_catalog(
     State(state): State<ServerState>,
 ) -> Json<std::collections::BTreeMap<String, serde_json::Value>> {
-    Json(catalog::catalog(&state.workspace_root))
+    let mut result = catalog::catalog(&state.workspace_root);
+    let mut mcp_servers = vec![
+        catalog::builtin_health_stdio(),
+        catalog::builtin_health_http(),
+    ];
+    mcp_servers.extend(
+        state
+            .mcp_registry
+            .read()
+            .await
+            .iter()
+            .map(|record| record.summary.clone()),
+    );
+    result.insert(
+        "mcp_servers".into(),
+        serde_json::to_value(mcp_servers).unwrap(),
+    );
+    Json(result)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct McpRegistryRequest {
+    pub name: String,
+    pub transport: String,
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub url: Option<String>,
+    pub api_key: Option<String>,
+}
+
+async fn list_mcp_registry(
+    State(state): State<ServerState>,
+) -> Json<Vec<catalog::McpServerSummary>> {
+    Json(
+        state
+            .mcp_registry
+            .read()
+            .await
+            .iter()
+            .map(|record| record.summary.clone())
+            .collect(),
+    )
+}
+
+async fn save_mcp_registry(
+    State(state): State<ServerState>,
+    Json(request): Json<McpRegistryRequest>,
+) -> impl IntoResponse {
+    let name = request.name.trim();
+    if name.is_empty() || !matches!(request.transport.as_str(), "stdio" | "http") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "name and transport (stdio or http) are required" })),
+        )
+            .into_response();
+    }
+    if request.transport == "http" && request.url.as_deref().unwrap_or("").trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "HTTP stream URL is required" })),
+        )
+            .into_response();
+    }
+    let summary = catalog::McpServerSummary {
+        name: name.into(),
+        command: request
+            .command
+            .clone()
+            .unwrap_or_else(|| "http-stream".into()),
+        args: request.args.clone(),
+        tools: if name.starts_with("riga-health-") {
+            vec!["health".into()]
+        } else {
+            Vec::new()
+        },
+        transport: Some(request.transport.clone()),
+        url: request.url.clone(),
+        api_key_configured: request
+            .api_key
+            .as_deref()
+            .is_some_and(|key| !key.is_empty()),
+    };
+    let record = catalog::McpServerRecord {
+        summary: summary.clone(),
+        api_key: request.api_key.filter(|key| !key.is_empty()),
+    };
+    let mut registry = state.mcp_registry.write().await;
+    registry.retain(|existing| existing.summary.name != summary.name);
+    registry.push(record);
+    let records = registry.clone();
+    drop(registry);
+    let persist_result = if let Some(store) = &state.secure_store {
+        store.save("mcp_registry", &records)
+    } else {
+        std::fs::write(
+            state.workspace_root.join(".riga-mcp-registry.json"),
+            serde_json::to_vec_pretty(&records).unwrap_or_default(),
+        )
+        .map_err(|error| error.to_string())
+    };
+    if let Err(error) = persist_result {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response();
+    }
+    (StatusCode::CREATED, Json(summary)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct McpJsonRpcRequest {
+    method: String,
+    #[serde(default)]
+    id: serde_json::Value,
+}
+
+async fn mcp_health_http(
+    State(_state): State<ServerState>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<McpJsonRpcRequest>,
+) -> impl IntoResponse {
+    if let Some(expected) = std::env::var("RIGA_MCP_HEALTH_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        && headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            != Some(&format!("Bearer {expected}"))
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid MCP API key" })),
+        )
+            .into_response();
+    }
+    let result = match request.method.as_str() {
+        "tools/list" => {
+            serde_json::json!({ "tools": [{ "name": "health", "description": "Return RIGA agent kernel health", "inputSchema": { "type": "object", "properties": {} } }] })
+        }
+        "tools/call" => {
+            serde_json::json!({ "content": [{ "type": "text", "text": format!("RIGA kernel healthy · protocol {} · persistence {}", riga_kernel::PROTOCOL_VERSION, secure_store::database_backend()) }] })
+        }
+        "initialize" => {
+            serde_json::json!({ "protocolVersion": "2025-03-26", "serverInfo": { "name": ADAPTER_NAME, "version": env!("CARGO_PKG_VERSION") } })
+        }
+        _ => serde_json::json!({ "error": { "code": -32601, "message": "method not found" } }),
+    };
+    Json(serde_json::json!({ "jsonrpc": "2.0", "id": request.id, "result": result }))
+        .into_response()
 }
 
 async fn upload_attachment(

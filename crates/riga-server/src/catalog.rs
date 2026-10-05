@@ -34,11 +34,46 @@ pub struct FileCandidate {
 pub struct McpServerSummary {
     pub name: String,
     pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
     pub tools: Vec<String>,
     #[serde(rename = "transport", skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    #[serde(default)]
+    pub api_key_configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerRecord {
+    pub summary: McpServerSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+pub fn builtin_health_stdio() -> McpServerSummary {
+    McpServerSummary {
+        name: "riga-health-stdio".into(),
+        command: "riga-server".into(),
+        args: vec!["mcp-health-stdio".into()],
+        tools: vec!["health".into()],
+        transport: Some("stdio".into()),
+        url: None,
+        api_key_configured: false,
+    }
+}
+
+pub fn builtin_health_http() -> McpServerSummary {
+    McpServerSummary {
+        name: "riga-health-http".into(),
+        command: "http-stream".into(),
+        args: Vec::new(),
+        tools: vec!["health".into()],
+        transport: Some("http".into()),
+        url: Some("http://127.0.0.1:8787/mcp/health".into()),
+        api_key_configured: false,
+    }
 }
 
 pub fn builtins() -> Vec<CatalogItem> {
@@ -166,6 +201,16 @@ pub fn load_mcp_servers(root: &Path) -> Vec<McpServerSummary> {
                             }
                         })
                         .into(),
+                    args: value
+                        .get("args")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|args| {
+                            args.iter()
+                                .filter_map(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     tools: Vec::new(),
                     transport: Some(
                         value
@@ -184,6 +229,10 @@ pub fn load_mcp_servers(root: &Path) -> Vec<McpServerSummary> {
                         .get("url")
                         .and_then(serde_json::Value::as_str)
                         .map(str::to_owned),
+                    api_key_configured: value
+                        .get("apiKey")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some(),
                 })
                 .collect()
         })
