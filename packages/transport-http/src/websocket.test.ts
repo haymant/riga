@@ -127,14 +127,28 @@ describe("RigaWebSocketClient", () => {
   });
 });
 
-it("restores provider metadata without receiving a credential", async () => {
+it("restores provider metadata and the active backend kind without a credential", async () => {
   const socket = new FakeSocket();
   const restored: string[] = [];
-  const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn(), onProviderConfigured: (endpoint, model) => restored.push(`${endpoint}|${model}`) });
+  const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn(), onProviderConfigured: (endpoint, model, _effort, kind) => restored.push(`${endpoint}|${model}|${kind}`) });
+  const ready = client.connect();
+  socket.open();
+  socket.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
+  await ready;
+  socket.receive({ type: "provider_configured", endpoint: "https://api.example/v1", model: "opencode-go", reasoning_effort: "low", kind: "local" });
+  expect(restored).toEqual(["https://api.example/v1|opencode-go|local"]);
+});
+
+it("treats a provider frame from an older server as remote", async () => {
+  // `kind` was added after the first release, so a server that omits it must not
+  // be read as local merely because the field is absent.
+  const socket = new FakeSocket();
+  let kind: string | undefined;
+  const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn(), onProviderConfigured: (_endpoint, _model, _effort, value) => { kind = value; } });
   const ready = client.connect();
   socket.open();
   socket.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
   await ready;
   socket.receive({ type: "provider_configured", endpoint: "https://api.example/v1", model: "opencode-go", reasoning_effort: "low" });
-  expect(restored).toEqual(["https://api.example/v1|opencode-go"]);
+  expect(kind).toBe("remote");
 });

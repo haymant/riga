@@ -34,6 +34,10 @@ import { DEFAULT_ASSISTANT_UI_OPTIONS, type AssistantUiOptions } from "./options
 // what lets the container's dev proxy forward it unchanged.
 const localModelClient = new LocalModelClient("");
 
+// Sentinel for the composer's local-model entry. Distinct from any remote model
+// id so selecting it is unambiguous.
+const LOCAL_MODEL_VALUE = "__local_model__";
+
 type Role = "user" | "assistant" | "system";
 type Session = { id: string; title: string; meta: string; active?: boolean };
 type TranscriptItem =
@@ -113,7 +117,11 @@ export function AssistantUI({
   const [providerApiKey, setProviderApiKey] = useState("");
   const [providerModel, setProviderModel] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("low");
+  // The settings tab the user is editing. Distinct from `providerKind`, which is
+  // the backend runs actually use: they diverge as soon as the user opens
+  // Settings while a local model is active.
   const [providerMode, setProviderMode] = useState<"remote" | "local">("remote");
+  const [providerKind, setProviderKind] = useState<"remote" | "local">("remote");
   const [localModels, setLocalModels] = useState<LocalModelOverview | null>(null);
   const [downloads, setDownloads] = useState<Record<string, DownloadState>>({});
   const [modelBusy, setModelBusy] = useState<string | null>(null);
@@ -248,10 +256,13 @@ export function AssistantUI({
     const client = new RigaWebSocketClient({
       url: `${protocol}//${window.location.host}/ws`,
       onStatus: setTransportStatus,
-      onProviderConfigured: (endpoint, model, effort) => {
+      onProviderConfigured: (endpoint, model, effort, kind) => {
+        // Endpoint and model are echoed even for a local provider so the remote
+        // form survives a switch to local. `kind` decides what runs use.
         setProviderEndpoint(endpoint);
         setProviderModel(model);
         setReasoningEffort(effort);
+        setProviderKind(kind);
       },
       onError: (code, message) => {
         activeRunIdRef.current = null;
@@ -320,6 +331,13 @@ export function AssistantUI({
     if (!settingsOpen || providerMode !== "local") return;
     void refreshLocalModels();
   }, [settingsOpen, providerMode, refreshLocalModels]);
+
+  // Also read the local model list once the transport is up, so the composer can
+  // offer the loaded model without the user having to open Settings first.
+  useEffect(() => {
+    if (transportStatus !== "connected") return;
+    void refreshLocalModels();
+  }, [transportStatus, refreshLocalModels]);
 
   useEffect(() => {
     const unsubscribe = localModelClient.subscribe((event) => {
@@ -446,9 +464,19 @@ export function AssistantUI({
   }
 
   function selectComposerModel(model: string) {
+    if (model === LOCAL_MODEL_VALUE) {
+      // Keep the stored endpoint and model so switching back to remote does not
+      // lose them; the server ignores both while `kind` is local.
+      setProviderKind("local");
+      if (transportStatus === "connected") {
+        void transportRef.current?.configureProvider(providerEndpoint.trim(), "", providerModel.trim(), reasoningEffort, "local");
+      }
+      return;
+    }
+    setProviderKind("remote");
     setProviderModel(model);
     if (model && providerEndpoint.trim() && transportStatus === "connected") {
-      void transportRef.current?.configureProvider(providerEndpoint.trim(), "", model, reasoningEffort);
+      void transportRef.current?.configureProvider(providerEndpoint.trim(), "", model, reasoningEffort, "remote");
     }
   }
 
@@ -505,13 +533,14 @@ export function AssistantUI({
 
   async function saveProvider() {
     if (providerMode === "local") {
-      // The endpoint and key are meaningless for an in-process GGUF, so they are
-      // sent empty rather than left over from a previous remote configuration.
+      // An in-process GGUF reads neither the endpoint nor the key, but they are
+      // sent through rather than blanked: the store keeps one config, and
+      // wiping the remote settings here would lose them on the way back.
       if (!localModels?.loaded) {
         setToast("Load a local model first");
         return;
       }
-      await transportRef.current?.configureProvider("", "", "local", reasoningEffort, "local");
+      await transportRef.current?.configureProvider(providerEndpoint.trim(), "", providerModel.trim(), reasoningEffort, "local");
       setSettingsOpen(false);
       setToast(`Local model ready: ${localModels.loaded}`);
       return;
@@ -551,7 +580,7 @@ export function AssistantUI({
 
           {approval && <div className="approval-card"><div className="approval-icon"><ShieldCheck size={19} /></div><div className="approval-copy"><div className="approval-title"><strong>Approval required</strong><span>workspace mutation</span></div><p>Allow RIGA to write the transport adapter boundary in <code>crates/</code> and update the event journal contract?</p><div className="approval-details"><span><FolderOpen size={13} /> 3 files</span><span><GitBranch size={13} /> reversible change</span><span><Clock3 size={13} /> requested now</span></div></div><div className="approval-actions"><button className="deny-button" onClick={deny}>Decline</button><button className="approve-button" onClick={approve}><Check size={15} /> Approve</button></div></div>}
 
-          <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" value={providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{Array.from(new Set([providerModel, "gpt-5-nano", "gpt-5-mini", "gpt-5-codex"])).filter(Boolean).map((model) => <option key={model} value={model}>{model}</option>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setCatalogOpen((value) => !value); setManualCatalog(true); setCatalogLayer("root"); setCatalogQuery(""); }}><Plus size={17} /></button><textarea value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${isRunning ? "stop-ready" : draft.trim() ? "send-ready" : ""}`} aria-label={isRunning ? "Stop run" : "Send message"} onClick={isRunning ? stopRun : sendMessage}>{isRunning ? <CircleStop size={16} /> : <Send size={16} />}</button></div>{catalogOpen && <div className="catalog-menu" ref={catalogRef} role="listbox">
+          <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" value={providerKind === "local" ? LOCAL_MODEL_VALUE : providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{localModels?.loaded && <option value={LOCAL_MODEL_VALUE}>Local · {localModels.loaded}</option>}{Array.from(new Set([providerModel, "gpt-5-nano", "gpt-5-mini", "gpt-5-codex"])).filter(Boolean).map((model) => <option key={model} value={model}>{model}</option>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setCatalogOpen((value) => !value); setManualCatalog(true); setCatalogLayer("root"); setCatalogQuery(""); }}><Plus size={17} /></button><textarea value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${isRunning ? "stop-ready" : draft.trim() ? "send-ready" : ""}`} aria-label={isRunning ? "Stop run" : "Send message"} onClick={isRunning ? stopRun : sendMessage}>{isRunning ? <CircleStop size={16} /> : <Send size={16} />}</button></div>{catalogOpen && <div className="catalog-menu" ref={catalogRef} role="listbox">
               <div className="catalog-menu-header">{catalogLayer === "connectors" && <button className="catalog-back" aria-label="Back to insert menu" onClick={() => setCatalogLayer("root")}><ChevronLeft size={14} /></button>}<strong>{activeTrigger ? `${activeTrigger.char === "@" ? "Mention" : "Command"} suggestions` : catalogLayer === "root" ? "Insert into composer" : "Connectors"}</strong><button className="catalog-close" aria-label="Close insert menu" onClick={() => setCatalogOpen(false)}><X size={14} /></button></div>
               <input className="catalog-search" autoFocus={catalogOpen} value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder={activeTrigger ? `Filter ${activeTrigger.char === "@" ? "files or agents" : "tools and skills"}…` : "Search tools, skills, connectors…"} aria-label="Search composer insert menu" />
               {editingConnector ? <div className="connector-form"><label>Name<input value={connectorDraft.name} onChange={(event) => setConnectorDraft({ ...connectorDraft, name: event.target.value })} placeholder="my-server" /></label><label>Transport<select value={connectorDraft.transport} onChange={(event) => setConnectorDraft({ ...connectorDraft, transport: event.target.value as "stdio" | "http" })}><option value="stdio">stdio process</option><option value="http">HTTP stream</option></select></label>{connectorDraft.transport === "stdio" ? <><label>Command<input value={connectorDraft.command} onChange={(event) => setConnectorDraft({ ...connectorDraft, command: event.target.value })} placeholder="riga-server" /></label><label>Arguments<input value={connectorDraft.args} onChange={(event) => setConnectorDraft({ ...connectorDraft, args: event.target.value })} placeholder="mcp-health-stdio" /></label></> : <><label>HTTP stream URL<input value={connectorDraft.url} onChange={(event) => setConnectorDraft({ ...connectorDraft, url: event.target.value })} placeholder="http://127.0.0.1:8787/mcp/health" /></label><label>API key<input type="password" value={connectorDraft.apiKey} onChange={(event) => setConnectorDraft({ ...connectorDraft, apiKey: event.target.value })} placeholder="RIGA_MCP_HEALTH_API_KEY (optional)" autoComplete="off" /></label></>}<div className="connector-form-actions"><button className="outline-button" onClick={() => setEditingConnector(null)}>Cancel</button><button className="approve-button" onClick={saveConnector}><Check size={14} /> Save connector</button></div></div> : <>{catalogLayer === "root" && !activeTrigger && !catalogQuery && <><small>Connectors</small><button className="catalog-category" onClick={() => setCatalogLayer("connectors")}><span><FolderOpen size={14} /> MCP connectors</span><em>{allConnectors.length} registered <ChevronDown size={13} /></em></button><small>Built-in tools</small></>}{(catalogLayer === "connectors" || catalogQuery || activeTrigger?.char === "/" || activeTrigger?.char === "@") && <>{catalogLayer === "connectors" && <div className="catalog-inline-actions"><button className="catalog-category" onClick={() => openConnectorEditor()}><span><Plus size={14} /> Add connector</span><em>stdio or HTTP stream</em></button></div>}{menuConnectors.map((server) => <button className="catalog-item" key={`connector-${server.name}`} onClick={() => insertCatalog(`Use MCP server ${server.name}: `)}><span>mcp/{server.name}</span><em>{server.transport === "http" ? server.url : server.command}<button type="button" className="catalog-edit" aria-label={`Edit ${server.name}`} onClick={(event) => { event.stopPropagation(); openConnectorEditor(server); }}><Pencil size={12} /></button></em></button>)}</>}{(catalogLayer === "root" || catalogLayer === "connectors" || catalogQuery || activeTrigger) && <>{menuTools.length > 0 && <small>Built-in tools</small>}{menuTools.map((item) => <button className="catalog-item" key={item.id} onClick={() => insertCatalog(activeTrigger?.char === "@" ? `@${item.id} ` : activeTrigger?.char === "/" ? `/${item.id} ` : item.insert_text)}><span>{activeTrigger?.char === "/" ? `/${item.id}` : item.id}</span><em>{item.description}</em></button>)}{menuSkills.length > 0 && <small>Skills and agents</small>}{menuSkills.map((skill) => <button className="catalog-item" key={skill.name} onClick={() => insertCatalog(activeTrigger?.char === "@" ? `@${skill.name} ` : activeTrigger?.char === "/" ? `/${skill.name} ` : `Use the skill tool with name ${skill.name}: `)}><span>{activeTrigger?.char === "@" ? `@${skill.name}` : activeTrigger?.char === "/" ? `/${skill.name}` : `skill/${skill.name}`}</span><em>{skill.description}</em></button>)}{activeTrigger?.char === "@" && searchableItems.agents.length > 0 && <><small>Agents</small>{searchableItems.agents.map((agent) => <button className="catalog-item" key={`agent-${agent.name}`} onClick={() => insertCatalog(`@${agent.name} `)}><span>@{agent.name}</span><em>{agent.purpose}</em></button>)}</>}{activeTrigger?.char === "@" && searchableItems.files.length > 0 && <><small>Files</small>{searchableItems.files.map((file) => <button className="catalog-item" key={file.path} onClick={() => insertCatalog(`@${file.path} `)}><span>@{file.name}</span><em>{file.path}</em></button>)}</>}</>}</>}

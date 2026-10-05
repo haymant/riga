@@ -82,6 +82,10 @@ pub enum ServerMessage {
         endpoint: String,
         model: String,
         reasoning_effort: String,
+        /// The backend runs will actually use. The endpoint and model above are
+        /// echoed as stored, so a client switching back to remote keeps them,
+        /// but they are ignored when this is `local`.
+        kind: ProviderKind,
     },
     Event {
         envelope: RigaEventEnvelope,
@@ -148,6 +152,7 @@ pub async fn upgrade(
                                     endpoint: config.endpoint.clone(),
                                     model: config.model.clone(),
                                     reasoning_effort: config.reasoning_effort.clone(),
+                                    kind: config.kind,
                                 },
                             )
                             .await
@@ -165,6 +170,7 @@ pub async fn upgrade(
                         let model = config.model.clone();
                         let endpoint = config.endpoint.clone();
                         let reasoning_effort = config.reasoning_effort.clone();
+                        let kind = config.kind;
                         if let Err(error) =
                             crate::secure_store::save_json("provider", &config).await
                         {
@@ -191,6 +197,7 @@ pub async fn upgrade(
                                 endpoint,
                                 model,
                                 reasoning_effort,
+                                kind,
                             },
                         )
                         .await
@@ -1328,6 +1335,22 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn provider_configured_echoes_the_active_backend_kind() {
+        // The client cannot infer the backend from a stored config, because a
+        // local provider keeps the previous remote endpoint and model so a user
+        // can switch back. `kind` is therefore part of the frame.
+        let local = serde_json::to_string(&ServerMessage::ProviderConfigured {
+            endpoint: "https://api.example/v1".into(),
+            model: "opencode-go".into(),
+            reasoning_effort: "low".into(),
+            kind: ProviderKind::Local,
+        })
+        .unwrap();
+        assert!(local.contains(r#""kind":"local""#), "{local}");
+        assert!(local.contains(r#""endpoint":"https://api.example/v1""#));
     }
 
     #[test]

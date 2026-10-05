@@ -12,7 +12,7 @@ export type RigaWebSocketClientMessage =
 
 export type RigaWebSocketServerMessage =
   | { type: "ready"; protocol_version: number; server_version: string }
-  | { type: "provider_configured"; endpoint: string; model: string; reasoning_effort: "low" | "medium" | "high" }
+  | { type: "provider_configured"; endpoint: string; model: string; reasoning_effort: "low" | "medium" | "high"; kind?: ProviderKind }
   | { type: "event"; envelope: RigaEventEnvelope }
   | { type: "run_cancelled"; run_id: string }
   | { type: "approval_recorded"; run_id: string; approval_id: string; approved: boolean }
@@ -37,9 +37,9 @@ export class RigaWebSocketClient {
   private readonly onEvent: (envelope: RigaEventEnvelope) => void;
   private readonly onError: (code: string, message: string) => void;
   private readonly onStatus: (status: "connecting" | "connected" | "closed" | "error") => void;
-  private readonly onProviderConfigured: (endpoint: string, model: string, reasoningEffort: "low" | "medium" | "high") => void;
+  private readonly onProviderConfigured: (endpoint: string, model: string, reasoningEffort: "low" | "medium" | "high", kind: ProviderKind) => void;
 
-  constructor(options: { url: string; onEvent: (envelope: RigaEventEnvelope) => void; onError?: (code: string, message: string) => void; onStatus?: (status: "connecting" | "connected" | "closed" | "error") => void; onProviderConfigured?: (endpoint: string, model: string, reasoningEffort: "low" | "medium" | "high") => void; socketFactory?: RigaWebSocketFactory }) {
+  constructor(options: { url: string; onEvent: (envelope: RigaEventEnvelope) => void; onError?: (code: string, message: string) => void; onStatus?: (status: "connecting" | "connected" | "closed" | "error") => void; onProviderConfigured?: (endpoint: string, model: string, reasoningEffort: "low" | "medium" | "high", kind: ProviderKind) => void; socketFactory?: RigaWebSocketFactory }) {
     this.url = options.url;
     this.onEvent = options.onEvent;
     this.onError = options.onError ?? (() => undefined);
@@ -89,7 +89,9 @@ export class RigaWebSocketClient {
         } else if (parsed.type === "event") {
           this.onEvent(parsed.envelope);
         } else if (parsed.type === "provider_configured") {
-          this.onProviderConfigured(parsed.endpoint, parsed.model, parsed.reasoning_effort);
+          // Older servers omit `kind`; a client written before local models
+          // existed must still read the frame as remote rather than fail.
+          this.onProviderConfigured(parsed.endpoint, parsed.model, parsed.reasoning_effort, parsed.kind ?? "remote");
         } else if (parsed.type === "error") {
           this.onStatus("error");
           this.onError(parsed.code, parsed.message);
