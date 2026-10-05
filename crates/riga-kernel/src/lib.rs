@@ -4,7 +4,9 @@
 pub const PROTOCOL_VERSION: u16 = 1;
 
 pub mod events;
+pub mod persistence;
 pub mod rig_compat;
+pub mod state;
 
 /// Minimal health marker used by the Phase 0 compatibility scaffold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
