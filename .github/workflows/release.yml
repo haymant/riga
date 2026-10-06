@@ -4,20 +4,15 @@ on:
   push:
     tags:
       - "v*.*.*"
-  # Optional GPU variants are slow, so they are off on tag pushes and only run
-  # when requested from the Actions UI.
+  # linux-cuda is slow and needs an NVIDIA driver to run, so it is manual only.
   workflow_dispatch:
     inputs:
       build_linux_cuda:
         description: "Also build linux-cuda (slow; installs the CUDA toolkit)"
         type: boolean
         default: false
-      build_macos_metal:
-        description: "Also build macos-metal (slow; Metal toolchain)"
-        type: boolean
-        default: false
       tag:
-        description: "Release tag to attach the GPU assets to (empty = the pushed tag)"
+        description: "Release tag to attach the CUDA assets to (empty = the pushed tag)"
         type: string
         default: ""
 
@@ -39,21 +34,19 @@ jobs:
       - name: Compose the platform matrix
         id: set
         run: |
-          # A tag push builds the CPU release. A manual run builds only the GPU
-          # variants that were checked, so it never redoes the CPU work.
+          # A tag push builds the shipping set: linux, windows, and Apple
+          # Silicon with Metal (every aarch64 Mac supports it, and it still
+          # falls back to CPU). linux-cuda is slow and manual only.
           include='[]'
           if [ "${{ github.event_name }}" = "push" ]; then
             include='[
               {"platform":"linux","os":"ubuntu-22.04","args":"","rust-targets":"","features":"","enable_cuda":false,"enable_metal":false,"release":true},
               {"platform":"windows","os":"windows-latest","args":"","rust-targets":"","features":"","enable_cuda":false,"enable_metal":false,"release":true},
-              {"platform":"macos","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"","enable_cuda":false,"enable_metal":false,"release":true}
+              {"platform":"macos-metal","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"metal","enable_cuda":false,"enable_metal":true,"release":true}
             ]'
           fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.build_linux_cuda }}" = "true" ]; then
             include=$(printf '%s' "$include" | jq -c '. + [{"platform":"linux-cuda","os":"ubuntu-22.04","args":"","rust-targets":"","features":"cuda","enable_cuda":true,"enable_metal":false,"release":false,"asset_prefix":"RIGA-CUDA"}]')
-          fi
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.build_macos_metal }}" = "true" ]; then
-            include=$(printf '%s' "$include" | jq -c '. + [{"platform":"macos-metal","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"metal","enable_cuda":false,"enable_metal":true,"release":false,"asset_prefix":"RIGA-Metal"}]')
           fi
           # Collapse to one line: `$GITHUB_OUTPUT` cannot carry a raw newline.
           include=$(printf '%s' "$include" | jq -c '.')
@@ -124,25 +117,21 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
-      # macOS: the CPU build turns Metal off (its linker workaround). The Metal
-      # build keeps Metal on and links the toolchain's compiler-rt archive, which
-      # provides `___isPlatformVersionAtLeast` — a symbol Rust's `-nodefaultlibs`
-      # link omits, so without it the Metal build fails to link.
+      # Every aarch64 Mac supports Metal, so the macOS build keeps it on. Link
+      # the toolchain's compiler-rt archive, which provides
+      # `___isPlatformVersionAtLeast` — a symbol Rust's `-nodefaultlibs` link
+      # omits, so without it the Metal build fails to link.
       - name: Set macOS build environment
         if: runner.os == 'macOS'
         run: |
           echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
           echo "CMAKE_OSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
-          if [ "${{ matrix.enable_metal }}" = "true" ]; then
-            echo "GGML_METAL=ON" >> "$GITHUB_ENV"
-            resource_dir="$(clang -print-resource-dir)"
-            echo "RUSTFLAGS=-C link-arg=${resource_dir}/lib/darwin/libclang_rt.osx.a" >> "$GITHUB_ENV"
-            xcodebuild -downloadComponent MetalToolchain || true
-          else
-            echo "GGML_METAL=OFF" >> "$GITHUB_ENV"
-          fi
+          echo "GGML_METAL=ON" >> "$GITHUB_ENV"
+          resource_dir="$(clang -print-resource-dir)"
+          echo "RUSTFLAGS=-C link-arg=${resource_dir}/lib/darwin/libclang_rt.osx.a" >> "$GITHUB_ENV"
+          xcodebuild -downloadComponent MetalToolchain || true
 
-      # CPU build: attached to the tagged GitHub release.
+      # Release build: attached to the tagged GitHub release.
       - name: Build and upload RIGA
         if: matrix.release
         uses: tauri-apps/tauri-action@v1
@@ -157,10 +146,10 @@ jobs:
 
             Download the installer for your operating system from the assets below.
 
-            - `linux` / `windows` / `macos` — CPU builds
-            - `linux-cuda` / `macos-metal` — optional GPU builds, produced on demand
-              from the Actions UI and published as workflow artifacts (not attached
-              here, because they would replace the CPU installers of the same name)
+            - `linux` / `windows` — CPU builds
+            - `macos` — Apple Silicon with Metal (and CPU fallback)
+            - `linux-cuda` — optional NVIDIA build, produced on demand and
+              published as a `RIGA-CUDA-…` asset (needs a CUDA driver to run)
           releaseDraft: false
           prerelease: false
           args: >-
