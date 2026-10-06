@@ -2030,14 +2030,35 @@ fn is_subagent_dispatch(input: &serde_json::Value) -> bool {
 /// deterministic: the named subagent runs directly instead of the model having
 /// to notice the mention and choose to dispatch.
 fn leading_agent_mention(prompt: &str) -> Option<(String, String)> {
-    let rest = prompt.trim_start().strip_prefix('@')?;
-    let mut parts = rest.splitn(2, char::is_whitespace);
-    let name = parts.next()?.trim();
-    let task = parts.next().unwrap_or("").trim();
-    if name.is_empty() || task.is_empty() {
-        return None;
+    // A mention can appear anywhere, not only at the very start: users write
+    // "Build X ... @build make sure ...". Find the first `@name` that names a
+    // known profile and hand it the whole request (with the mention removed) as
+    // its task. An `@` that names no profile (an email address, say) is skipped.
+    let mut search = prompt;
+    while let Some(at) = search.find('@') {
+        let after = &search[at + 1..];
+        let name: String = after
+            .chars()
+            .take_while(|character| {
+                character.is_ascii_alphanumeric() || *character == '-' || *character == '_'
+            })
+            .collect();
+        if !name.is_empty()
+            && let Some(profile) = crate::catalog::find_agent_profile(&name.to_lowercase())
+        {
+            let before = &search[..at];
+            let rest = &after[name.len()..];
+            let task = format!("{} {}", before.trim(), rest.trim())
+                .trim()
+                .to_owned();
+            if task.is_empty() {
+                return None;
+            }
+            return Some((profile.name, task));
+        }
+        search = &search[at + 1..];
     }
-    crate::catalog::find_agent_profile(name).map(|profile| (profile.name, task.to_owned()))
+    None
 }
 
 /// Process-wide counter for subagent task ids.
@@ -2121,7 +2142,7 @@ async fn dispatch_subagent(
         .await;
 
     let allowed = allowed_tools_for(&profile);
-    let system_prompt = subagent_system_prompt(&profile);
+    let system_prompt = subagent_system_prompt(&profile, workspace_root);
     // A local run dispatches local children; a remote run dispatches remote
     // children, so a subagent never crosses the provider boundary. The child's
     // loop is tagged with its task id so its tool calls nest in the UI.
@@ -2185,7 +2206,10 @@ async fn dispatch_subagent(
 
 /// The system prompt for a dispatched subagent, built from its profile rules and
 /// expected output sections.
-fn subagent_system_prompt(profile: &crate::catalog::AgentProfile) -> String {
+fn subagent_system_prompt(
+    profile: &crate::catalog::AgentProfile,
+    workspace_root: &std::path::Path,
+) -> String {
     let mut prompt = format!(
         "You are the RIGA `{}` subagent. {}\n\nRules:\n",
         profile.name, profile.purpose
@@ -2193,9 +2217,11 @@ fn subagent_system_prompt(profile: &crate::catalog::AgentProfile) -> String {
     for rule in &profile.system_rules {
         prompt.push_str(&format!("- {rule}\n"));
     }
-    prompt.push_str(
-        "\nYou were dispatched by the orchestrator: work autonomously, do not ask the user questions, and return a concise result it can use.\n",
-    );
+    prompt.push_str(&format!(
+        "\nWorkspace root: {}\n\
+         You were dispatched by the orchestrator: work autonomously, do not ask the user questions, and return a concise result it can use.\n",
+        workspace_root.display()
+    ));
     if !profile.output_format.is_empty() {
         prompt.push_str("Use these sections:\n");
         for section in &profile.output_format {
@@ -2248,7 +2274,11 @@ Reply with exactly ONE smaller tool call whose <tool_call> block is valid JSON. 
 /// Tokens requested per local turn before `resolve_max_tokens` shrinks it to the
 /// room the prompt leaves. Deliberately modest: a 1.5B model at 4k tokens on CPU
 /// is minutes of work, and the tool loop re-decodes the history every turn.
-const LOCAL_MAX_TOKENS: u32 = 1024;
+/// Output budget for one local turn. `resolve_max_tokens` clamps it to whatever
+/// the context has room for, so a large value is safe. 1024 was too small for a
+/// `write` that carries a file's body: the JSON was cut off mid-string, which
+/// parses as neither a tool call nor an answer.
+const LOCAL_MAX_TOKENS: u32 = 4096;
 
 #[derive(Debug, PartialEq)]
 struct ParsedToolCall {
@@ -2292,8 +2322,47 @@ fn parse_local_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
     (prose.trim().to_owned(), calls)
 }
 
+/// Escape literal control characters inside JSON string values.
+///
+/// Small models routinely paste a multi-line file body straight into the JSON of
+/// a tool call; a raw newline or tab inside a string is invalid JSON, so the
+/// whole call would be dropped. Only characters inside strings are touched, and
+/// existing escapes are preserved.
+fn escape_json_control_chars(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 16);
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if in_string && escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => {
+                escaped = true;
+                out.push(ch);
+            }
+            '"' => {
+                in_string = !in_string;
+                out.push(ch);
+            }
+            '\n' if in_string => out.push_str("\\n"),
+            '\r' if in_string => out.push_str("\\r"),
+            '\t' if in_string => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 fn parse_one_local_tool_call(raw: &str) -> Option<ParsedToolCall> {
-    let candidate: serde_json::Value = serde_json::from_str(raw).ok()?;
+    // A model that writes a file body with real newlines produces invalid JSON
+    // (control characters are not allowed inside a JSON string). Retry once with
+    // those characters escaped rather than failing the whole run.
+    let candidate: serde_json::Value = serde_json::from_str(raw)
+        .or_else(|_| serde_json::from_str(&escape_json_control_chars(raw)))
+        .ok()?;
     let name = candidate
         .get("name")
         .and_then(serde_json::Value::as_str)
@@ -3757,11 +3826,22 @@ mod tests {
             super::leading_agent_mention("@scout look around").map(|(agent, _)| agent),
             Some("explore".to_owned())
         );
-        // A mention that is not at the start, has no task, or names no known
-        // agent is left to the orchestrator.
-        assert!(super::leading_agent_mention("email @explore later").is_none());
+        // A mention is honoured anywhere in the sentence, with the surrounding
+        // text kept as the task: users write "Build X ... @build make sure ...".
+        assert_eq!(
+            super::leading_agent_mention("Build X @build make sure"),
+            Some(("build".to_owned(), "Build X make sure".to_owned()))
+        );
+        // Matching is case-insensitive.
+        assert_eq!(
+            super::leading_agent_mention("please @Build this").map(|(agent, _)| agent),
+            Some("build".to_owned())
+        );
+        // A mention with no task, or an `@` that names no profile (an email),
+        // is left to the orchestrator.
         assert!(super::leading_agent_mention("@explore").is_none());
         assert!(super::leading_agent_mention("@unknown do a thing").is_none());
+        assert!(super::leading_agent_mention("mail me at user@example.com").is_none());
     }
 
     #[test]
@@ -3816,7 +3896,7 @@ mod tests {
     #[test]
     fn subagent_prompt_carries_the_profile_rules_and_sections() {
         let review = crate::catalog::find_agent_profile("review").expect("review profile");
-        let prompt = super::subagent_system_prompt(&review);
+        let prompt = super::subagent_system_prompt(&review, std::path::Path::new("/tmp/ws"));
         assert!(prompt.contains("`review` subagent"), "{prompt}");
         assert!(prompt.contains("Never modify files"), "{prompt}");
         assert!(prompt.contains("Findings"), "{prompt}");
@@ -4094,6 +4174,24 @@ mod tests {
         assert!(error.contains("content"), "{error}");
         assert!(error.contains("files"), "{error}");
         assert!(error.contains("one file per call"), "{error}");
+    }
+
+    #[test]
+    fn tool_calls_survive_a_multiline_file_body() {
+        // The common failure: a file body pasted with real newlines and tabs
+        // inside the JSON string. It is invalid JSON, but must still parse.
+        let raw = "{\"name\": \"write\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"line1\nline2\ttab\"}}";
+        assert!(serde_json::from_str::<serde_json::Value>(raw).is_err());
+        let call = super::parse_one_local_tool_call(raw).expect("repaired");
+        assert_eq!(call.name, "write");
+        assert_eq!(call.arguments["path"], "a.txt");
+        assert_eq!(call.arguments["content"], "line1\nline2\ttab");
+    }
+
+    #[test]
+    fn escaping_leaves_valid_json_untouched() {
+        let raw = r#"{"content": "a \"quoted\" word\nb"}"#;
+        assert_eq!(super::escape_json_control_chars(raw), raw);
     }
 
     #[tokio::test]

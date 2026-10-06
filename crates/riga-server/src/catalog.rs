@@ -356,6 +356,9 @@ pub fn agent_profiles() -> Vec<AgentProfile> {
             &[
                 "Never ask questions; complete the task or document a blocker.",
                 "Respect RIGA write and shell capability gates and approval requirements.",
+                "Create one file per `write` call, with `path` and `content`; never batch several files into one call.",
+                "Run one command per `bash` call, with `command`; do not pass an array of commands.",
+                "Write under the workspace root shown below, using its absolute path when a relative path would be ambiguous.",
                 "After changes, run the project's own validation scripts.",
             ],
             &["Completed", "Files Changed", "Notes"],
