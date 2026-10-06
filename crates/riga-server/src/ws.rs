@@ -1172,6 +1172,9 @@ async fn execute_tool(
                 .ok_or_else(|| {
                     argument_error("bash", "{\"command\": \"<one shell command>\"}", &input)
                 })?;
+            if let Some(message) = install_preflight(workspace_root, command) {
+                return Err(message);
+            }
             if let Some(output_stream) = output_stream {
                 execute_streaming_bash(workspace_root, command, output_stream).await
             } else {
@@ -1285,6 +1288,58 @@ fn argument_error(tool: &str, expected: &str, input: &serde_json::Value) -> Stri
         "{tool} needs {expected}; received keys: [{}]",
         keys.join(", ")
     )
+}
+
+/// The directory a `cd <dir> && …` command switches into, when it starts with one.
+fn cd_target(command: &str) -> Option<String> {
+    let rest = command.trim().strip_prefix("cd ")?;
+    let target = rest
+        .split("&&")
+        .next()?
+        .trim()
+        .trim_matches(|character| character == '"' || character == '\'');
+    (!target.is_empty()).then(|| target.to_owned())
+}
+
+/// Refuse an install command that has no manifest to install from.
+///
+/// A model that runs `npm install` before writing `package.json` gets a shell
+/// error that reads like a harness failure, and it wastes an approval prompt.
+/// Naming what is missing teaches it the ordering instead.
+fn install_preflight(root: &std::path::Path, command: &str) -> Option<String> {
+    let lowered = command.to_ascii_lowercase();
+    let node_install = [
+        "npm install",
+        "npm ci",
+        "npm i ",
+        "yarn install",
+        "yarn add",
+        "pnpm install",
+        "pnpm add",
+        "bun install",
+    ];
+    let manifests: &[&str] = if lowered.contains("pip install") || lowered.contains("pip3 install")
+    {
+        &["requirements.txt", "pyproject.toml", "setup.py"]
+    } else if node_install.iter().any(|needle| lowered.contains(needle)) {
+        &["package.json"]
+    } else {
+        return None;
+    };
+    // A manifest in the workspace root or in the `cd` target satisfies the check.
+    let target = cd_target(command)
+        .map(|dir| root.join(dir))
+        .unwrap_or_else(|| root.to_path_buf());
+    if manifests
+        .iter()
+        .any(|manifest| target.join(manifest).is_file() || root.join(manifest).is_file())
+    {
+        return None;
+    }
+    Some(format!(
+        "no {} exists yet; create it with `write` before running an install command",
+        manifests[0]
+    ))
 }
 
 /// The body a `write` was asked to store.
@@ -3245,8 +3300,10 @@ and never claim a write or command succeeded before its tool result confirms it.
 If an approval is denied, adapt or summarize what you completed rather than retrying the same call.\n",
     );
     prompt.push_str(
-        "For a request to create an app or service, create the files with `write` and validate with `bash`; \
-do not spend turns enumerating subagents — listing profiles changes nothing.\n",
+        "For a request to create an app or service, create the files with `write` first and validate with `bash` \
+after; never run an install command (`npm install`, `pip install`, …) before the manifest it reads \
+(`package.json`, `requirements.txt`, …) exists, because it will fail and waste a turn. \
+Do not spend turns enumerating subagents — listing profiles changes nothing.\n",
     );
     prompt.push_str(
         "Your edits land in an isolated git worktree for this session, not the user's working tree. \
@@ -4180,6 +4237,34 @@ mod tests {
         assert!(error.contains("content"), "{error}");
         assert!(error.contains("files"), "{error}");
         assert!(error.contains("one file per call"), "{error}");
+    }
+
+    #[test]
+    fn install_preflight_requires_a_manifest() {
+        let dir = std::env::temp_dir().join(format!("riga-preflight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("app")).unwrap();
+        // No manifest anywhere: refused with a message that names the fix.
+        let error = super::install_preflight(&dir, "npm install").expect("refused");
+        assert!(error.contains("package.json"), "{error}");
+        assert!(
+            super::install_preflight(&dir, "cd app && npm install").is_some(),
+            "a missing cd target has no manifest either"
+        );
+        // A non-install command is never blocked.
+        assert!(super::install_preflight(&dir, "node app.js").is_none());
+        // The manifest in the cd target satisfies it.
+        std::fs::write(dir.join("app").join("package.json"), "{}").unwrap();
+        assert!(super::install_preflight(&dir, "cd app && npm install").is_none());
+        // Python reads a different manifest, so a package.json does not satisfy
+        // `pip install`.
+        assert!(super::install_preflight(&dir, "pip install flask").is_some());
+        std::fs::write(dir.join("requirements.txt"), "flask").unwrap();
+        assert!(super::install_preflight(&dir, "pip install flask").is_none());
+        // A manifest in the workspace root satisfies npm.
+        std::fs::write(dir.join("package.json"), "{}").unwrap();
+        assert!(super::install_preflight(&dir, "npm install").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

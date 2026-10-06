@@ -359,6 +359,7 @@ pub fn agent_profiles() -> Vec<AgentProfile> {
                 "Create one file per `write` call, with `path` and `content`; never batch several files into one call.",
                 "Run one command per `bash` call, with `command`; do not pass an array of commands.",
                 "Write under the workspace root shown below, using its absolute path when a relative path would be ambiguous.",
+                "Create the files before running anything that needs them: never run `npm install` (or another install) before the manifest it reads (`package.json`, `requirements.txt`, …) exists.",
                 "After changes, run the project's own validation scripts.",
             ],
             &["Completed", "Files Changed", "Notes"],
