@@ -69,15 +69,21 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
-      # `riga-server` links llama.cpp, whose C++ uses `std::filesystem`. The SDK
-      # marks that unavailable below macOS 10.15, so the default (older) target
-      # fails the whole build with "'path' is unavailable: introduced in macOS
-      # 10.15". Raise the deployment target for both the C++ and Rust compilers.
-      - name: Set macOS deployment target
+      # `riga-server` links llama.cpp. Two macOS build settings are needed:
+      #  - Its C++ uses `std::filesystem`, which the SDK marks unavailable below
+      #    macOS 10.15, so raise the deployment target for the C++ and Rust
+      #    compilers (the default fails with "'path' is unavailable").
+      #  - ggml's Metal backend probes `@available(macOS 15.0)`, which emits the
+      #    compiler-rt symbol `___isPlatformVersionAtLeast`. Rust links with
+      #    `-nodefaultlibs` and does not provide it, so the final link fails with
+      #    "Undefined symbols … ___isPlatformVersionAtLeast". Build CPU-only
+      #    until the compiler runtime is linked explicitly.
+      - name: Set macOS build environment
         if: runner.os == 'macOS'
         run: |
           echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
           echo "CMAKE_OSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
+          echo "GGML_METAL=OFF" >> "$GITHUB_ENV"
 
       - name: Build and upload RIGA
         uses: tauri-apps/tauri-action@v1
