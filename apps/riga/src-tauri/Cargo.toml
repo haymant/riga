@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Forward the inference backends so `tauri build --features cuda|metal` works.
+# Both stay off by default, keeping the portable CPU build the norm.
+default = []
+cuda = ["riga-server/cuda"]
+metal = ["riga-server/metal"]
+
 [dependencies]
 # The released desktop app has no dev server to talk to, so the shell hosts the
 # same `riga-server` HTTP/WebSocket adapter the browser build is proxied to. The

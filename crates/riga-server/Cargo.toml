@@ -10,9 +10,11 @@ description = "RIGA authenticated HTTP adapter"
 [features]
 # Backend selection is explicit so the default build stays portable. Enabling
 # `cuda` requires an NVIDIA driver and CUDA toolkit on the *build* machine; it is
-# not switched on merely by running the app on a CUDA-capable computer.
+# not switched on merely by running the app on a CUDA-capable computer. Enabling
+# `metal` needs macOS / Apple Silicon build tools (Xcode / Metal).
 default = []
 cuda = ["llama-cpp-2/cuda"]
+metal = ["llama-cpp-2/metal"]
 
 [dependencies]
 async-stream = "0.3"

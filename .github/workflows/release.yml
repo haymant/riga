@@ -4,6 +4,18 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # Optional GPU variants are slow, so they are off on tag pushes and only run
+  # when requested from the Actions UI.
+  workflow_dispatch:
+    inputs:
+      build_linux_cuda:
+        description: "Also build linux-cuda (slow; installs the CUDA toolkit)"
+        type: boolean
+        default: false
+      build_macos_metal:
+        description: "Also build macos-metal (slow; Metal toolchain)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -13,31 +25,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  matrix:
+    name: Build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.set.outputs.include }}
+    steps:
+      - name: Compose the platform matrix
+        id: set
+        run: |
+          include='[
+            {"platform":"linux","os":"ubuntu-22.04","args":"","rust-targets":"","features":"","enable_cuda":false,"enable_metal":false,"release":true},
+            {"platform":"windows","os":"windows-latest","args":"","rust-targets":"","features":"","enable_cuda":false,"enable_metal":false,"release":true},
+            {"platform":"macos","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"","enable_cuda":false,"enable_metal":false,"release":true}
+          ]'
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.build_linux_cuda }}" = "true" ]; then
+            include=$(printf '%s' "$include" | jq -c '. + [{"platform":"linux-cuda","os":"ubuntu-22.04","args":"","rust-targets":"","features":"cuda","enable_cuda":true,"enable_metal":false,"release":false}]')
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.build_macos_metal }}" = "true" ]; then
+            include=$(printf '%s' "$include" | jq -c '. + [{"platform":"macos-metal","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"metal","enable_cuda":false,"enable_metal":true,"release":false}]')
+          fi
+          echo "include=$include" >> "$GITHUB_OUTPUT"
+          echo "Matrix: $include"
+
   desktop:
     name: Build desktop app (${{ matrix.platform }})
+    needs: matrix
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: linux
-            os: ubuntu-22.04
-            args: ""
-            rust-targets: ""
-          - platform: windows
-            os: windows-latest
-            args: ""
-            rust-targets: ""
-          - platform: macos
-            os: macos-latest
-            args: "--target aarch64-apple-darwin"
-            rust-targets: aarch64-apple-darwin
-          - platform: macos-intel
-            os: macos-latest
-            args: "--target x86_64-apple-darwin"
-            rust-targets: x86_64-apple-darwin
-
+        include: ${{ fromJson(needs.matrix.outputs.include) }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@v4
@@ -51,7 +70,18 @@ jobs:
             libappindicator3-dev \
             librsvg2-dev \
             patchelf \
-            xdg-utils
+            xdg-utils \
+            build-essential \
+            pkg-config \
+            clang
+
+      - name: Install CUDA Toolkit
+        if: matrix.enable_cuda
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "12.6.3"
+          method: network
+          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -69,23 +99,27 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
-      # `riga-server` links llama.cpp. Two macOS build settings are needed:
-      #  - Its C++ uses `std::filesystem`, which the SDK marks unavailable below
-      #    macOS 10.15, so raise the deployment target for the C++ and Rust
-      #    compilers (the default fails with "'path' is unavailable").
-      #  - ggml's Metal backend probes `@available(macOS 15.0)`, which emits the
-      #    compiler-rt symbol `___isPlatformVersionAtLeast`. Rust links with
-      #    `-nodefaultlibs` and does not provide it, so the final link fails with
-      #    "Undefined symbols … ___isPlatformVersionAtLeast". Build CPU-only
-      #    until the compiler runtime is linked explicitly.
+      # macOS: the CPU build turns Metal off (its linker workaround). The Metal
+      # build keeps Metal on and links the toolchain's compiler-rt archive, which
+      # provides `___isPlatformVersionAtLeast` — a symbol Rust's `-nodefaultlibs`
+      # link omits, so without it the Metal build fails to link.
       - name: Set macOS build environment
         if: runner.os == 'macOS'
         run: |
           echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
           echo "CMAKE_OSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
-          echo "GGML_METAL=OFF" >> "$GITHUB_ENV"
+          if [ "${{ matrix.enable_metal }}" = "true" ]; then
+            echo "GGML_METAL=ON" >> "$GITHUB_ENV"
+            resource_dir="$(clang -print-resource-dir)"
+            echo "RUSTFLAGS=-C link-arg=${resource_dir}/lib/darwin/libclang_rt.osx.a" >> "$GITHUB_ENV"
+            xcodebuild -downloadComponent MetalToolchain || true
+          else
+            echo "GGML_METAL=OFF" >> "$GITHUB_ENV"
+          fi
 
+      # CPU build: attached to the tagged GitHub release.
       - name: Build and upload RIGA
+        if: matrix.release
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -97,6 +131,35 @@ jobs:
             Desktop release for RIGA ${{ github.ref_name }}.
 
             Download the installer for your operating system from the assets below.
+
+            - `linux` / `windows` / `macos` — CPU builds
+            - `linux-cuda` / `macos-metal` — optional GPU builds, produced on demand
+              from the Actions UI and published as workflow artifacts (not attached
+              here, because they would replace the CPU installers of the same name)
           releaseDraft: false
           prerelease: false
-          args: ${{ matrix.args }}
+          args: >-
+            ${{ matrix.args }}
+            ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }}
+
+      # Optional GPU variant: compile-only, published as a workflow artifact.
+      - name: Build RIGA (build-only variant)
+        if: ${{ !matrix.release }}
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/riga
+          args: >-
+            ${{ matrix.args }}
+            ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }}
+
+      - name: Upload build-only bundles
+        if: ${{ !matrix.release }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: riga-${{ matrix.platform }}
+          if-no-files-found: warn
+          path: |
+            apps/riga/src-tauri/target/release/bundle/**
+            apps/riga/src-tauri/target/*/release/bundle/**
