@@ -1,1 +1,1 @@
-{"main-window":{"identifier":"main-window","description":"Minimal Phase 0 capability placeholder; native permissions are added and tested in Phase 3.","local":true,"windows":["main"],"permissions":[]}}
+{"main-window":{"identifier":"main-window","description":"Core permissions for the main window. The kernel is reached over HTTP/WebSocket, not IPC, so no transport plugins are required.","local":true,"windows":["main"],"permissions":["core:default","opener:default"]}}

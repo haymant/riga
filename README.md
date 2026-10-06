@@ -56,11 +56,11 @@ npm install
 npm run tauri:dev
 ```
 
-`tauri:dev` starts the kernel adapter and the Vite server through `beforeDevCommand`, then opens the native window against `http://127.0.0.1:1420`. Do not run `npm run dev` at the same time; port `1420` has `strictPort` enabled and both flows claim it. `npm run tauri:build` compiles the binary only, because `bundle.active` is `false` in `apps/riga/src-tauri/tauri.conf.json`.
+`tauri:dev` starts the kernel adapter and the Vite server through `beforeDevCommand`, then opens the native window against `http://127.0.0.1:1420`. Do not run `npm run dev` at the same time; port `1420` has `strictPort` enabled and both flows claim it. `npm run tauri:build` bundles a release app; that build hosts `riga-server` inside the shell and hands the surface its loopback origin through the `server_url` command.
 
 Linux desktop builds need the WebKitGTK development packages (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`, plus the usual `build-essential` and `pkg-config`).
 
-A bundled release binary is not yet wired: the shipped UI resolves `/ws` and `/catalog` relative to the `tauri://` origin, so the packaged app still needs the in-process server and the `packages/transport-tauri` boundary described in the roadmap.
+The packaged build does not use the Vite proxy. Its webview loads from `tauri://localhost`, so the shell binds `riga-server` on `127.0.0.1:0` (release only) and passes that absolute origin to `AssistantUI`'s `serverUrl`. The server answers the webview's cross-origin `fetch` and `EventSource` calls with a permissive CORS policy, and the window CSP permits `http://127.0.0.1:*` and `ws://127.0.0.1:*`, so the WebSocket and the local-model manager work without a proxy. The browser build and `tauri:dev` pass no origin and keep resolving against the page origin, so that path is unchanged. `packages/transport-tauri` stays a stub; a native IPC transport is still roadmap work and is not required for the packaged app.
 
 ## Provider configuration
 

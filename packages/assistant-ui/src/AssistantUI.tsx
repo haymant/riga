@@ -29,11 +29,6 @@ import "./styles.css";
 import { Markdown } from "./Markdown";
 import { DEFAULT_ASSISTANT_UI_OPTIONS, type AssistantUiOptions } from "./options";
 
-// An empty base URL makes every request resolve against the page origin, which
-// is how the host already talks to the kernel (`/catalog`, `/attachments`) and
-// what lets the container's dev proxy forward it unchanged.
-const localModelClient = new LocalModelClient("");
-
 // Sentinel for the composer's local-model entry. Distinct from any remote model
 // id so selecting it is unambiguous.
 const LOCAL_MODEL_VALUE = "__local_model__";
@@ -51,16 +46,50 @@ let idCounter = 0;
  */
 function newId(): string {
   const webCrypto = globalThis.crypto;
-  if (typeof webCrypto?.randomUUID === "function") return webCrypto.randomUUID();
-  if (typeof webCrypto?.getRandomValues === "function") {
-    const bytes = webCrypto.getRandomValues(new Uint8Array(16));
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  // Both calls are feature-detected *and* guarded: a WebKit webview served from
+  // the `tauri://` custom scheme can expose `randomUUID` yet throw "The
+  // operation is insecure" because the origin is not a secure context. A throw
+  // here previously blanked the app the moment a message was sent.
+  try {
+    if (typeof webCrypto?.randomUUID === "function") return webCrypto.randomUUID();
+  } catch {
+    // fall through to the counter
+  }
+  try {
+    if (typeof webCrypto?.getRandomValues === "function") {
+      const bytes = webCrypto.getRandomValues(new Uint8Array(16));
+      bytes[6] = (bytes[6] & 0x0f) | 0x40;
+      bytes[8] = (bytes[8] & 0x3f) | 0x80;
+      const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    }
+  } catch {
+    // fall through to the counter
   }
   idCounter += 1;
   return `id-${Date.now().toString(36)}-${idCounter.toString(36)}`;
+}
+
+/** Absolute request URL: the server origin when out-of-band, else the relative
+ *  path. An empty base URL keeps the browser build same-origin so the dev proxy
+ *  and Vite's SPA fallback keep working unchanged. */
+function apiUrl(baseUrl: string, path: string): string {
+  return baseUrl ? `${baseUrl}${path}` : path;
+}
+
+/**
+ * Resolve the run-control WebSocket from the server origin.
+ *
+ * With an empty base URL the page's own origin is used, which is the browser and
+ * `tauri:dev` path behind the Vite proxy. The packaged desktop app passes the
+ * loopback origin of the server it hosts, avoiding the `ws://<asset-host>/ws`
+ * URL that a `tauri://` page would otherwise build.
+ */
+function resolveWebSocketUrl(baseUrl: string): string {
+  const origin = baseUrl || `${window.location.protocol}//${window.location.host}`;
+  const url = new URL(origin);
+  const protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${url.host}/ws`;
 }
 
 type Role = "user" | "assistant" | "system";
@@ -132,7 +161,13 @@ export type AssistantUIProps = AssistantUiOptions;
 function AssistantUIInner({
   showSessionHistoryButton = DEFAULT_ASSISTANT_UI_OPTIONS.showSessionHistoryButton,
   fullWidth: initialFullWidth = DEFAULT_ASSISTANT_UI_OPTIONS.fullWidth,
+  serverUrl,
 }: AssistantUIProps = {}) {
+  // Origin of the out-of-band RIGA server, or "" when same-origin. Everything
+  // below derives from it: the catalog, attachments, MCP registry, the
+  // local-model client, and the run-control WebSocket.
+  const apiBaseUrl = serverUrl ?? "";
+  const localModelClient = useMemo(() => new LocalModelClient(apiBaseUrl), [apiBaseUrl]);
   const [sessions, setSessions] = useState<Session[]>(() => loadLocal("riga.sessions.v1", initialSessions));
   const [sessionTranscripts, setSessionTranscripts] = useState<Record<string, TranscriptItem[]>>(() => loadLocal("riga.transcripts.v1", sessionHistories));
   const [draft, setDraft] = useState("");
@@ -295,16 +330,15 @@ function AssistantUIInner({
   }, [catalogOpen]);
 
   useEffect(() => {
-    void fetch("/catalog").then((response) => response.json()).then((value: { tools?: CatalogItem[]; agents?: AgentSummary[]; files?: FileCandidate[]; skills?: SkillSummary[]; mcp_servers?: McpServerSummary[] }) => {
+    void fetch(apiUrl(apiBaseUrl, "/catalog")).then((response) => response.json()).then((value: { tools?: CatalogItem[]; agents?: AgentSummary[]; files?: FileCandidate[]; skills?: SkillSummary[]; mcp_servers?: McpServerSummary[] }) => {
       setCatalogItems(value.tools ?? []);
       setAgents(value.agents ?? []);
       setWorkspaceFiles(value.files ?? []);
       setSkills(value.skills ?? []);
       setMcpServers(value.mcp_servers ?? []);
     }).catch(() => undefined);
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const client = new RigaWebSocketClient({
-      url: `${protocol}//${window.location.host}/ws`,
+      url: resolveWebSocketUrl(apiBaseUrl),
       onStatus: setTransportStatus,
       onProviderConfigured: (endpoint, model, effort, kind, api, subagent) => {
         // Endpoint and model are echoed even for a local provider so the remote
@@ -402,7 +436,7 @@ function AssistantUIInner({
     transportRef.current = client;
     client.connect().catch(() => setTransportStatus("error"));
     return () => client.close();
-  }, []);
+  }, [apiBaseUrl]);
 
   // A phone that was locked, a tab that was backgrounded, or a network that just
   // came back should reconnect at once rather than wait out a backoff timer that
@@ -426,7 +460,7 @@ function AssistantUIInner({
     } catch (error) {
       setModelError(error instanceof Error ? error.message : "Local model manager is unavailable");
     }
-  }, []);
+  }, [localModelClient]);
 
   // The model manager is opened from Settings, so the catalog is fetched when
   // that panel first appears rather than on every render. The event subscription
@@ -546,7 +580,7 @@ function AssistantUIInner({
       const form = new FormData();
       form.append("file", file, file.name);
       try {
-        const response = await fetch("/attachments", { method: "POST", body: form });
+        const response = await fetch(apiUrl(apiBaseUrl, "/attachments"), { method: "POST", body: form });
         const uploaded = (await response.json()) as Attachment & { error?: string };
         if (!response.ok) throw new Error(uploaded.error ?? "attachment upload failed");
         setAttachments((current) => [...current, uploaded]);
@@ -604,7 +638,7 @@ function AssistantUIInner({
       return;
     }
     try {
-      const response = await fetch("/mcp/registry", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, transport: connectorDraft.transport, command: connectorDraft.transport === "stdio" ? connectorDraft.command.trim() : undefined, args: connectorDraft.args.trim() ? connectorDraft.args.trim().split(/\s+/) : [], url: connectorDraft.transport === "http" ? connectorDraft.url.trim() : undefined, api_key: connectorDraft.transport === "http" ? connectorDraft.apiKey.trim() || undefined : undefined }) });
+      const response = await fetch(apiUrl(apiBaseUrl, "/mcp/registry"), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, transport: connectorDraft.transport, command: connectorDraft.transport === "stdio" ? connectorDraft.command.trim() : undefined, args: connectorDraft.args.trim() ? connectorDraft.args.trim().split(/\s+/) : [], url: connectorDraft.transport === "http" ? connectorDraft.url.trim() : undefined, api_key: connectorDraft.transport === "http" ? connectorDraft.apiKey.trim() || undefined : undefined }) });
       const payload = await response.json().catch(() => ({})) as McpServerSummary & { error?: string };
       if (!response.ok) { setToast(payload.error ?? `Connector could not be persisted (${response.status})`); return; }
       const updated = [...allConnectors.filter((server) => server.name !== name), payload];

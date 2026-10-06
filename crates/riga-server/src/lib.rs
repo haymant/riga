@@ -24,8 +24,10 @@ use riga_kernel::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tower_http::cors::{Any, CorsLayer};
 
 pub mod catalog;
+pub mod health_stdio;
 pub mod local_model;
 pub mod mcp;
 pub mod secure_store;
@@ -142,7 +144,22 @@ pub fn router(state: ServerState) -> Router {
             "/local-models/downloads/events",
             get(local_model_download_events),
         )
+        .layer(cors_layer())
         .with_state(state)
+}
+
+/// The packaged desktop webview loads from `tauri://localhost`, so every call it
+/// makes to the loopback server is cross-origin. Loopback binds hold no cookies
+/// and are reachable only from this machine, so a permissive policy is safe and
+/// lets the same surface run unchanged in a browser (same-origin, no CORS) and
+/// in the desktop shell (cross-origin). Without it the browser build hides the
+/// problem behind the Vite proxy, and the packaged build fails on `fetch` and
+/// `EventSource` with an opaque network error.
+fn cors_layer() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any)
 }
 
 async fn ws_upgrade(

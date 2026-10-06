@@ -127,11 +127,17 @@ your host needs to control when the sheet loads, import it explicitly instead:
 import "@rigai/assistant-ui/styles.css";
 ```
 
-`AssistantUI` accepts two options, both optional:
+`AssistantUI` accepts three options, all optional:
 
 ```tsx
-<AssistantUI showSessionHistoryButton fullWidth />
+<AssistantUI showSessionHistoryButton fullWidth serverUrl="http://127.0.0.1:49152" />
 ```
+
+`serverUrl` is the absolute origin of the RIGA server. Omit it (or pass `""`)
+when the surface is same-origin with the server — the browser build behind the
+Vite proxy. A packaged host that owns the server passes the origin it was given;
+otherwise `/ws` and `/local-models` resolve against the asset origin and never
+reach the kernel.
 
 ## 3. Reach the agent — run `riga-server` and proxy to it
 
@@ -231,6 +237,30 @@ Never commit `.env.local`, the provider key, or `RIGA_TOKEN`; provider
 credentials are encrypted at rest by the server store and are write-only from
 the browser.
 
+## 5. Package it
+
+The browser build reaches the server through Vite's proxy, but a packaged app has
+no proxy: its webview loads from `tauri://localhost`. Bind the same `riga-server`
+inside the shell on an OS-assigned loopback port, expose that origin as a
+command, and hand it to the surface.
+
+The webview is a different origin from the loopback server, so allow it to reach
+loopback in the window CSP (`riga-server` already answers any origin because it
+binds loopback only):
+
+```json
+"app": {
+  "security": {
+    "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:* ws://127.0.0.1:*; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:"
+  }
+}
+```
+
+`apps/riga` is the reference: `src-tauri/src/main.rs` starts the server and
+exposes `server_url`, and `src/main.tsx` passes the origin to
+`<AssistantUI serverUrl={…} />`. The development build skips the embedded server
+so there is exactly one kernel.
+
 ## Extending
 
 - **A new agent capability** belongs in the kernel. Add a method to `Agent` in
@@ -243,11 +273,15 @@ the browser.
 
 ## Current limits
 
-- The packaged (non-dev) Tauri build does not yet host the agent in-process. The
-  shipped UI resolves `/ws` and the other paths against the `tauri://` origin,
-  which needs the `packages/transport-tauri` boundary (currently a stub). In
-  development the Vite proxy covers this, which is why `npm run dev` and
-  `npm run tauri:dev` both run `riga-server` as a separate process.
+- The packaged build hosts `riga-server` in-process and reaches it over
+  HTTP/WebSocket with a permissive-CORS loopback bind. `packages/transport-tauri`
+  (a native IPC transport) is still a stub and is not required for this.
+  Development uses a separate `riga-server` behind the Vite proxy, which is why
+  `npm run dev` and `npm run tauri:dev` both run it as its own process.
+- The packaged shell does not provision `RIGA_TOKEN`, so `riga-server`'s
+  encrypted store is off and provider settings survive only for the process. Set
+  `RIGA_TOKEN` before launching to persist them. Local GGUF models are stored
+  under the user's data directory and are unaffected.
 - `riga-server` links `llama-cpp-2`, so the first kernel build compiles llama.cpp
   (about two minutes). `npm run dev` therefore starts slower than Vite alone.
 
