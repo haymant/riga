@@ -236,6 +236,54 @@ describe("RigaWebSocketClient", () => {
       vi.useRealTimers();
     }
   });
+
+  it("drives the default native WebSocket factory end to end", async () => {
+    // Every other test injects a `socketFactory`, so the built-in one that
+    // wraps the platform `WebSocket` was never exercised. It is real code — the
+    // getters/setters and handlers the client relies on — and is covered here.
+    const instances: NativeSocket[] = [];
+    class NativeSocket implements RigaWebSocketLike {
+      onopen: (() => void) | null = null;
+      onmessage: ((event: { data: string }) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      sent: string[] = [];
+      closed = false;
+      constructor(readonly url: string) {
+        instances.push(this);
+      }
+      send(data: string) {
+        this.sent.push(data);
+      }
+      close() {
+        this.closed = true;
+        this.onclose?.();
+      }
+    }
+    vi.stubGlobal("WebSocket", NativeSocket);
+    try {
+      const statuses: string[] = [];
+      const events: unknown[] = [];
+      const client = new RigaWebSocketClient({ url: "ws://default/ws", onEvent: (event) => events.push(event), onStatus: (status) => statuses.push(status) });
+      const ready = client.connect();
+      const native = instances[0]!;
+      expect(native.url).toBe("ws://default/ws");
+      native.onopen?.();
+      native.onmessage?.({ data: JSON.stringify({ type: "ready", protocol_version: 1, server_version: "0.1.0" }) });
+      await ready;
+      expect(statuses).toContain("connected");
+      await client.startRun("run-1", "session-1", "hi");
+      expect(JSON.parse(native.sent.at(-1)!)).toMatchObject({ type: "start_run", run_id: "run-1" });
+      native.onmessage?.({ data: JSON.stringify({ type: "event", envelope }) });
+      expect(events).toEqual([envelope]);
+      native.onerror?.();
+      expect(statuses).toContain("error");
+      client.close();
+      expect(native.closed).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 it("restores provider metadata, kind and api without a credential", async () => {

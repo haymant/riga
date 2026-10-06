@@ -4,6 +4,13 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # `vitest` and its coverage provider declare each other as an exact peer
+      # dependency, so bumping one alone fails `npm ci`. Update them as a pair.
+      vitest:
+        patterns:
+          - "vitest"
+          - "@vitest/*"
   - package-ecosystem: cargo
     directory: /
     schedule:
