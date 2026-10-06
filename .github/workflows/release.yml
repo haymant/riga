@@ -198,6 +198,12 @@ jobs:
           sub-packages: '["toolkit"]'
           log-file-suffix: "linux-cuda.txt"
 
+      # llama.cpp defaults to compiling for a long list of architectures (with
+      # PTX variants), which dominates the build. These cover Turing through
+      # Hopper; the build script forwards `CMAKE_*` env vars as CMake defines.
+      - name: Limit CUDA architectures
+        run: echo "CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90" >> "$GITHUB_ENV"
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
