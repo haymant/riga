@@ -1140,15 +1140,28 @@ async fn execute_tool(
         "read" => {
             crate::catalog::execute_read(
                 workspace_root,
-                path_arg(&input).ok_or("read requires path")?,
+                path_arg(&input)
+                    .ok_or_else(|| argument_error("read", "{\"path\": \"<file>\"}", &input))?,
             )
             .await
         }
         "write" => {
             crate::catalog::execute_write(
                 workspace_root,
-                path_arg(&input).ok_or("write requires path")?,
-                content_arg(&input).ok_or("write requires content")?,
+                path_arg(&input).ok_or_else(|| {
+                    argument_error(
+                        "write",
+                        "{\"path\": \"<file>\", \"content\": \"<text>\"} (one file per call)",
+                        &input,
+                    )
+                })?,
+                content_arg(&input).ok_or_else(|| {
+                    argument_error(
+                        "write",
+                        "{\"path\": \"<file>\", \"content\": \"<text>\"} (one file per call)",
+                        &input,
+                    )
+                })?,
             )
             .await
         }
@@ -1156,7 +1169,9 @@ async fn execute_tool(
             let command = input
                 .get("command")
                 .and_then(serde_json::Value::as_str)
-                .ok_or("bash requires command")?;
+                .ok_or_else(|| {
+                    argument_error("bash", "{\"command\": \"<one shell command>\"}", &input)
+                })?;
             if let Some(output_stream) = output_stream {
                 execute_streaming_bash(workspace_root, command, output_stream).await
             } else {
@@ -1253,6 +1268,23 @@ fn path_arg(input: &serde_json::Value) -> Option<&str> {
     ["path", "file", "filename", "file_path", "filepath"]
         .into_iter()
         .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
+}
+
+/// A tool-argument error that tells the model what to send instead.
+///
+/// Small models ignore the schema and invent shapes such as `{"files": [...]}`
+/// or `{"commands": [...]}`. A terse `write requires path` leaves them guessing
+/// again (and they often just retry the same call). Naming the expected keys and
+/// the ones actually sent gives them something concrete to correct against.
+fn argument_error(tool: &str, expected: &str, input: &serde_json::Value) -> String {
+    let keys: Vec<&str> = input
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    format!(
+        "{tool} needs {expected}; received keys: [{}]",
+        keys.join(", ")
+    )
 }
 
 /// The body a `write` was asked to store.
@@ -2291,7 +2323,16 @@ fn parse_one_local_tool_call(raw: &str) -> Option<ParsedToolCall> {
 /// used here instead of inventing a new one.
 fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition]) -> String {
     let mut text = String::from(
-        "\n\nYou can call tools. To call exactly one, reply with this and nothing else:\n<tool_call>{\"name\": \"TOOL_NAME\", \"arguments\": {}}</tool_call>\n\nAvailable tools:\n",
+        "\n\nYou can call tools. To call exactly one, reply with this and nothing else:\n\
+         <tool_call>{\"name\": \"TOOL_NAME\", \"arguments\": {}}</tool_call>\n\n\
+         Use the exact argument names from the schemas below, and one item per call: a \
+         write creates one file with \"path\" and \"content\"; a bash call runs one command \
+         with \"command\". Do not send batches such as a \"files\" or \"commands\" array.\n\n\
+         Examples:\n\
+         <tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"src/app.js\"}}</tool_call>\n\
+         <tool_call>{\"name\": \"write\", \"arguments\": {\"path\": \"src/app.js\", \"content\": \"console.log(1);\"}}</tool_call>\n\
+         <tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"npm install\"}}</tool_call>\n\n\
+         Available tools:\n",
     );
     for definition in definitions {
         let name = definition.name.clone();
@@ -2303,8 +2344,10 @@ fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition])
         ));
     }
     text.push_str(
-        "\nCall one tool per reply and wait for its result. When you have the final \
-         answer, reply with plain prose and no tool_call block.\n",
+        "\nCall one tool per reply and wait for its result. If a tool call fails, read \
+         the error and change the arguments before calling again; never repeat the same \
+         failing call. When you have the final answer, reply with plain prose and no \
+         tool_call block.\n",
     );
     text
 }
@@ -4037,6 +4080,20 @@ mod tests {
             Some("a")
         );
         assert_eq!(super::content_arg(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn argument_errors_name_the_expected_and_received_keys() {
+        let error = super::argument_error(
+            "write",
+            "{\"path\": \"<file>\", \"content\": \"<text>\"} (one file per call)",
+            &serde_json::json!({"files": ["a", "b"]}),
+        );
+        // The model is told the keys it should use and the keys it did use.
+        assert!(error.contains("path"), "{error}");
+        assert!(error.contains("content"), "{error}");
+        assert!(error.contains("files"), "{error}");
+        assert!(error.contains("one file per call"), "{error}");
     }
 
     #[tokio::test]
