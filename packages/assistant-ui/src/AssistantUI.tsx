@@ -659,7 +659,7 @@ function AssistantUIInner({
     <div className={`app-shell theme-${theme}`}>
       <main className="main-panel">
         <header className="app-header">
-          <div className="app-brand"><div className="brand-mark"><Code2 size={15} strokeWidth={2.6} /></div><strong>RIGA</strong><span>@haymant/assistant-ui</span></div>
+          <div className="app-brand"><div className="brand-mark"><Code2 size={15} strokeWidth={2.6} /></div><strong>RIGA</strong><span>@rigai/assistant-ui</span></div>
           <div className="app-header-actions"><span className={transportStatus === "connected" ? "connection-pill connected" : "connection-pill"}><span /> {transportStatus}</span><button className="icon-button" aria-label="Toggle theme" title="Toggle theme" onClick={() => setTheme((value) => value === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}</button><button className={`icon-button ${fullWidthEnabled ? "selected" : ""}`} aria-label="Toggle full-width chat" title={fullWidthEnabled ? "Use centered chat width" : "Use full-width chat"} onClick={() => setFullWidthEnabled((value) => !value)}>{fullWidthEnabled ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button></div>
         </header>
         <section className={`content-column${fullWidthEnabled ? " full-width" : ""}`}>

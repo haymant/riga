@@ -9,7 +9,7 @@ get a working RIGA agent.
 
 | Piece | Where | Role |
 |---|---|---|
-| `@haymant/assistant-ui` | `packages/assistant-ui` | The React chat surface: transcript, tool timeline, composer, settings and local-model manager, plus the stylesheet it is built from. |
+| `@rigai/assistant-ui` | `packages/assistant-ui` | The React chat surface: transcript, tool timeline, composer, settings and local-model manager, plus the stylesheet it is built from. |
 | `riga-kernel::Agent` | `crates/riga-kernel` | The transport-neutral agent. A host owns one and forwards its own commands to it. |
 | `riga-server` | `crates/riga-server` | HTTP + WebSocket host that runs the agent loop over the wire. The React surface talks to this, not to Tauri IPC. |
 
@@ -97,7 +97,7 @@ need iOS or Android.
 ```json
 {
   "dependencies": {
-    "@haymant/assistant-ui": "file:../../packages/assistant-ui",
+    "@rigai/assistant-ui": "file:../../packages/assistant-ui",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },
@@ -115,7 +115,7 @@ need iOS or Android.
 
 ```tsx
 import { createRoot } from "react-dom/client";
-import { AssistantUI } from "@haymant/assistant-ui";
+import { AssistantUI } from "@rigai/assistant-ui";
 
 createRoot(document.getElementById("root")!).render(<AssistantUI />);
 ```
@@ -124,7 +124,7 @@ The component imports its own stylesheet, so there is nothing else to load. If
 your host needs to control when the sheet loads, import it explicitly instead:
 
 ```tsx
-import "@haymant/assistant-ui/styles.css";
+import "@rigai/assistant-ui/styles.css";
 ```
 
 `AssistantUI` accepts two options, both optional:
