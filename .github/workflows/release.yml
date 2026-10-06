@@ -34,25 +34,36 @@ jobs:
       - name: Compose the platform matrix
         id: set
         run: |
-          include='[
-            {"platform":"linux","os":"ubuntu-22.04","args":"","rust-targets":"","features":"","enable_cuda":false,"enable_metal":false,"release":true},
-            {"platform":"windows","os":"windows-latest","args":"","rust-targets":"","features":"","enable_cuda":false,"enable_metal":false,"release":true},
-            {"platform":"macos","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"","enable_cuda":false,"enable_metal":false,"release":true}
-          ]'
+          # A tag push builds the CPU release. A manual run builds only the GPU
+          # variants that were checked, so it never redoes the CPU work.
+          include='[]'
+          if [ "${{ github.event_name }}" = "push" ]; then
+            include='[
+              {"platform":"linux","os":"ubuntu-22.04","args":"","rust-targets":"","features":"","enable_cuda":false,"enable_metal":false,"release":true,"skip":false},
+              {"platform":"windows","os":"windows-latest","args":"","rust-targets":"","features":"","enable_cuda":false,"enable_metal":false,"release":true,"skip":false},
+              {"platform":"macos","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"","enable_cuda":false,"enable_metal":false,"release":true,"skip":false}
+            ]'
+          fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.build_linux_cuda }}" = "true" ]; then
-            include=$(printf '%s' "$include" | jq -c '. + [{"platform":"linux-cuda","os":"ubuntu-22.04","args":"","rust-targets":"","features":"cuda","enable_cuda":true,"enable_metal":false,"release":false}]')
+            include=$(printf '%s' "$include" | jq -c '. + [{"platform":"linux-cuda","os":"ubuntu-22.04","args":"","rust-targets":"","features":"cuda","enable_cuda":true,"enable_metal":false,"release":false,"skip":false}]')
           fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.build_macos_metal }}" = "true" ]; then
-            include=$(printf '%s' "$include" | jq -c '. + [{"platform":"macos-metal","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"metal","enable_cuda":false,"enable_metal":true,"release":false}]')
+            include=$(printf '%s' "$include" | jq -c '. + [{"platform":"macos-metal","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"metal","enable_cuda":false,"enable_metal":true,"release":false,"skip":false}]')
           fi
           # Collapse to one line: `$GITHUB_OUTPUT` cannot carry a raw newline.
           include=$(printf '%s' "$include" | jq -c '.')
+          # An empty matrix would schedule nothing; use one skipped placeholder.
+          if [ "$include" = "[]" ]; then
+            include='[{"platform":"noop","os":"ubuntu-latest","args":"","rust-targets":"","features":"","enable_cuda":false,"enable_metal":false,"release":false,"skip":true}]'
+          fi
           echo "include=$include" >> "$GITHUB_OUTPUT"
           echo "Matrix: $include"
 
   desktop:
     name: Build desktop app (${{ matrix.platform }})
     needs: matrix
+    # `noop` is the placeholder used when a manual run selected no variant.
+    if: ${{ !matrix.skip }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
