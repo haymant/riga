@@ -45,6 +45,8 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.build_macos_metal }}" = "true" ]; then
             include=$(printf '%s' "$include" | jq -c '. + [{"platform":"macos-metal","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"metal","enable_cuda":false,"enable_metal":true,"release":false}]')
           fi
+          # Collapse to one line: `$GITHUB_OUTPUT` cannot carry a raw newline.
+          include=$(printf '%s' "$include" | jq -c '.')
           echo "include=$include" >> "$GITHUB_OUTPUT"
           echo "Matrix: $include"
 
