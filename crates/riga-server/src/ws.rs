@@ -1148,10 +1148,7 @@ async fn execute_tool(
             crate::catalog::execute_write(
                 workspace_root,
                 path_arg(&input).ok_or("write requires path")?,
-                input
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("write requires content")?,
+                content_arg(&input).ok_or("write requires content")?,
             )
             .await
         }
@@ -1253,7 +1250,18 @@ async fn execute_tool(
 /// a strict read made the write fail silently in the transcript that prompted
 /// this. The canonical key is preferred; the rest are accepted.
 fn path_arg(input: &serde_json::Value) -> Option<&str> {
-    ["path", "file", "filename", "file_path"]
+    ["path", "file", "filename", "file_path", "filepath"]
+        .into_iter()
+        .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
+}
+
+/// The body a `write` was asked to store.
+///
+/// Phi-4 emits `text` where the schema says `content`; without this the call
+/// fails with "write requires content" and the model retries until the run
+/// exhausts its turns. The canonical key is preferred; the rest are accepted.
+fn content_arg(input: &serde_json::Value) -> Option<&str> {
+    ["content", "text", "body", "contents", "data"]
         .into_iter()
         .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
 }
@@ -1706,6 +1714,8 @@ async fn run_chat_loop(
     );
     messages.push(serde_json::json!({ "role": "user", "content": prompt }));
     let mut nudges = 0usize;
+    // Reset by any successful tool call, so only a genuinely stuck loop stops.
+    let mut consecutive_failures = 0usize;
     for _ in 0..24 {
         // Honour a cancellation between turns; an in-flight request cannot be
         // interrupted, but the next one is not started.
@@ -1933,6 +1943,11 @@ async fn run_chat_loop(
                     Err(error) => (false, format!("tool error: {error}")),
                 }
             };
+            if ok {
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures += 1;
+            }
             evidence.record(&call.name, ok);
             let trace = ToolTrace {
                 call: call.call.clone(),
@@ -1950,8 +1965,15 @@ async fn run_chat_loop(
             messages.push(serde_json::json!({
                 "role": "tool",
                 "tool_call_id": call.call_id,
-                "content": crate::catalog::truncate_tool_result(output, crate::catalog::MAX_TOOL_RESULT_CHARS),
+                "content": crate::catalog::truncate_tool_result(output.clone(), crate::catalog::MAX_TOOL_RESULT_CHARS),
             }));
+            // Stop a model that keeps re-sending a call that cannot succeed.
+            if consecutive_failures >= MAX_CONSECUTIVE_TOOL_FAILURES {
+                return Err(format!(
+                    "the model called `{}` {consecutive_failures} times in a row and each attempt failed; stopping so it does not loop. Last error: {output}",
+                    call.name
+                ));
+            }
         }
     }
     Err("provider exceeded the maximum tool-call turns".into())
@@ -2182,6 +2204,12 @@ const LOCAL_MAX_TURNS: usize = 8;
 /// How many times a local turn is asked to re-emit an unparseable tool call.
 const MAX_TOOL_CALL_RETRIES: usize = 2;
 
+/// How many tool executions may fail in a row before the local loop gives up.
+///
+/// A small model that keeps re-sending a call with the wrong arguments otherwise
+/// burns every turn, and the run looks stuck at "thinking" for many minutes.
+const MAX_CONSECUTIVE_TOOL_FAILURES: usize = 3;
+
 const LOCAL_TOOL_CALL_RETRY: &str = "Your reply contained a <tool_call> block that was not valid JSON; it was probably cut off. \
 Reply with exactly ONE smaller tool call whose <tool_call> block is valid JSON. Prefer several small `write` calls over one large one.";
 
@@ -2351,6 +2379,8 @@ async fn run_local_loop(
     // Bounded, so a model stuck on an unparseable tool call cannot spend the
     // whole turn budget regenerating.
     let mut tool_call_retries = 0usize;
+    // Reset by any successful tool call, so only a genuinely stuck loop stops.
+    let mut consecutive_failures = 0usize;
     for turn in 0..LOCAL_MAX_TURNS {
         // Generation is blocking C, so it runs on the blocking pool. The future
         // is awaited directly: nothing else in this task needs the executor, and
@@ -2501,6 +2531,11 @@ async fn run_local_loop(
                 Ok(output) => (true, output),
                 Err(error) => (false, format!("tool error: {error}")),
             };
+            if ok {
+                consecutive_failures = 0;
+            } else {
+                consecutive_failures += 1;
+            }
             evidence.record(&call.name, ok);
             trace_sender
                 .send(ToolTraceEvent::Completed(ToolTrace {
@@ -2517,11 +2552,19 @@ async fn run_local_loop(
                     "Result from {}: {}",
                     call.name,
                     crate::catalog::truncate_tool_result(
-                        output,
+                        output.clone(),
                         crate::catalog::MAX_TOOL_RESULT_CHARS
                     )
                 ),
             });
+            // Stop a model that keeps re-sending a call that cannot succeed,
+            // instead of letting it spend every remaining turn on the same error.
+            if consecutive_failures >= MAX_CONSECUTIVE_TOOL_FAILURES {
+                return Err(format!(
+                    "the local model called `{}` {consecutive_failures} times in a row and each attempt failed; stopping so it does not loop. Last error: {output}",
+                    call.name
+                ));
+            }
         }
     }
     Err("local model exceeded the maximum tool-call turns".into())
@@ -3967,6 +4010,56 @@ mod tests {
             Some("a")
         );
         assert_eq!(super::path_arg(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn content_arguments_accept_the_aliases_small_models_emit() {
+        // Phi-4 emits `text` where the schema says `content`.
+        assert_eq!(
+            super::content_arg(&serde_json::json!({"content": "a"})),
+            Some("a")
+        );
+        assert_eq!(
+            super::content_arg(&serde_json::json!({"text": "b"})),
+            Some("b")
+        );
+        assert_eq!(
+            super::content_arg(&serde_json::json!({"body": "c"})),
+            Some("c")
+        );
+        assert_eq!(
+            super::content_arg(&serde_json::json!({"contents": "d"})),
+            Some("d")
+        );
+        // Canonical key wins when both are present.
+        assert_eq!(
+            super::content_arg(&serde_json::json!({"content": "a", "text": "b"})),
+            Some("a")
+        );
+        assert_eq!(super::content_arg(&serde_json::json!({})), None);
+    }
+
+    #[tokio::test]
+    async fn write_accepts_text_as_content_end_to_end() {
+        // The exact call Phi-4 emitted: `text` instead of `content`.
+        let dir = std::env::temp_dir().join(format!("riga-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = crate::mcp::McpRuntime::new();
+        let result = super::execute_tool(
+            &dir,
+            &runtime,
+            "write",
+            serde_json::json!({"path": "essay.txt", "text": "sunny"}),
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("essay.txt")).unwrap(),
+            "sunny"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
