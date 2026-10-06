@@ -3965,6 +3965,7 @@ dependencies = [
  "glob",
  "http-body-util",
  "llama-cpp-2",
+ "llama-cpp-sys-2",
  "reqwest 0.12.28",
  "rig-agent",
  "rig-core",

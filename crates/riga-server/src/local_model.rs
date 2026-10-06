@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    ffi::CString,
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -52,6 +53,14 @@ const MAX_DECODE_BATCH: u32 = 2048;
 /// this decoupling exists to prevent, so it fails the build instead of waiting
 /// for a test.
 const _: () = assert!(MAX_DECODE_BATCH > 0 && MAX_DECODE_BATCH < MAX_CONTEXT);
+
+/// Device memory the auto-fit planner is told to leave unused, per device.
+///
+/// llama.cpp's estimate of weights + KV cache is exact for the tensors it knows
+/// about but not for runtime graph temporaries, driver pools, or another process
+/// taking VRAM between the fit and the load. A fixed 1 GiB margin absorbs that
+/// gap; without it a "fits on paper" plan can still OOM at `cudaMalloc`.
+const FIT_MARGIN_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Minimum wall-clock gap between download progress broadcasts. Ten per second
 /// is past the point where a progress bar looks continuous.
@@ -576,32 +585,76 @@ impl LocalModelRuntime {
         let engine = self.engine.clone();
         let loaded_name = self.loaded_name.clone();
         tokio::task::spawn_blocking(move || {
-            // Offload every layer the build supports: with the `cuda` feature
-            // this uses the GPU, otherwise it stays on the CPU and OpenMP still
-            // parallelizes the matmuls. `with_n_gpu_layers` takes a u32 in this
-            // version of the crate and saturates it to i32::MAX, which is how
-            // llama.cpp is told "every layer" (it clamps to the real depth).
-            let params = LlamaModelParams::default().with_n_gpu_layers(u32::MAX);
-            let model = LlamaModel::load_from_file(&backend, &model_path, &params).map_err(
-                |error| {
-                    format!("Model could not be loaded (the GGUF may be corrupt or exceed available memory): {error}")
-                },
-            )?;
             let file_name = model_path
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("local model")
                 .to_owned();
             let curated = CATALOG.iter().find(|entry| entry.file_name == file_name);
-            // The GGUF header is the source of truth; the curated window is only
-            // a starting point that gets clamped by it.
-            let context_size = resolve_context(
-                model.n_ctx_train(),
-                requested_context(
-                    curated.map(|entry| entry.max_context),
-                    std::env::var("RIGA_LOCAL_CONTEXT").ok().as_deref(),
-                ),
+
+            // The window we intend to use, before the GGUF header gets a chance
+            // to clamp it. Fitting for this value keeps the KV-cache estimate an
+            // upper bound: `resolve_context` only ever shrinks the result below.
+            let requested = requested_context(
+                curated.map(|entry| entry.max_context),
+                std::env::var("RIGA_LOCAL_CONTEXT").ok().as_deref(),
+            )
+            .clamp(MIN_CONTEXT, MAX_CONTEXT);
+            let batch_size = requested.min(MAX_DECODE_BATCH);
+            let mut context_params = LlamaContextParams::default()
+                .with_n_ctx(std::num::NonZeroU32::new(requested))
+                .with_n_batch(batch_size)
+                .with_n_ubatch(batch_size);
+
+            // Fit the GPU plan to the memory actually available instead of
+            // offloading every layer (`u32::MAX`), which OOMs any card that
+            // cannot hold the whole model plus its KV cache. `fit_params` sets
+            // `n_gpu_layers`, the tensor split and any buffer overrides in place;
+            // it requires `n_gpu_layers` to still be at its default, so the
+            // params are left untouched until here. On a CPU-only build this
+            // resolves to zero GPU layers and is harmless.
+            let model_path_c = CString::new(
+                model_path
+                    .to_str()
+                    .ok_or_else(|| "Model path is not valid UTF-8".to_string())?,
+            )
+            .map_err(|_| "Model path contains an interior NUL byte".to_string())?;
+            let mut margins = vec![FIT_MARGIN_BYTES; llama_cpp_2::max_devices().max(1)];
+            let mut params = Box::pin(LlamaModelParams::default());
+            let fit = params.as_mut().fit_params(
+                model_path_c.as_c_str(),
+                &mut context_params,
+                &mut margins,
+                MIN_CONTEXT,
+                llama_cpp_sys_2::GGML_LOG_LEVEL_WARN,
             );
+            match fit {
+                Ok(result) => tracing::info!(
+                    model = %file_name,
+                    n_gpu_layers = params.n_gpu_layers(),
+                    context = result.n_ctx,
+                    "local model GPU plan fitted to available memory"
+                ),
+                Err(error) => {
+                    // No plan fit the free device memory (or fitting failed).
+                    // Fall back to CPU-only rather than refusing to load, so the
+                    // model still runs — just without GPU offload.
+                    tracing::warn!(
+                        %error,
+                        model = %file_name,
+                        "local model auto-fit found no GPU plan; loading on CPU"
+                    );
+                    params = Box::pin(LlamaModelParams::default().with_n_gpu_layers(0));
+                }
+            }
+            let model = LlamaModel::load_from_file(&backend, &model_path, &params).map_err(
+                |error| {
+                    format!("Model could not be loaded (the GGUF may be corrupt or exceed available memory): {error}")
+                },
+            )?;
+            // The GGUF header is the source of truth; the curated window and the
+            // fitted window are only starting points that get clamped by it.
+            let context_size = resolve_context(model.n_ctx_train(), requested);
             // Report the window actually resolved, so a short output budget can
             // be diagnosed against the real context instead of guessed at.
             tracing::info!(
