@@ -16,6 +16,10 @@ on:
         description: "Also build macos-metal (slow; Metal toolchain)"
         type: boolean
         default: false
+      tag:
+        description: "Release tag to attach the GPU assets to (empty = the pushed tag)"
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -46,10 +50,10 @@ jobs:
             ]'
           fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.build_linux_cuda }}" = "true" ]; then
-            include=$(printf '%s' "$include" | jq -c '. + [{"platform":"linux-cuda","os":"ubuntu-22.04","args":"","rust-targets":"","features":"cuda","enable_cuda":true,"enable_metal":false,"release":false}]')
+            include=$(printf '%s' "$include" | jq -c '. + [{"platform":"linux-cuda","os":"ubuntu-22.04","args":"","rust-targets":"","features":"cuda","enable_cuda":true,"enable_metal":false,"release":false,"asset_prefix":"RIGA-CUDA"}]')
           fi
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.build_macos_metal }}" = "true" ]; then
-            include=$(printf '%s' "$include" | jq -c '. + [{"platform":"macos-metal","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"metal","enable_cuda":false,"enable_metal":true,"release":false}]')
+            include=$(printf '%s' "$include" | jq -c '. + [{"platform":"macos-metal","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"metal","enable_cuda":false,"enable_metal":true,"release":false,"asset_prefix":"RIGA-Metal"}]')
           fi
           # Collapse to one line: `$GITHUB_OUTPUT` cannot carry a raw newline.
           include=$(printf '%s' "$include" | jq -c '.')
@@ -175,12 +179,29 @@ jobs:
             ${{ matrix.args }}
             ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }}
 
-      - name: Upload build-only bundles
+      # GPU variants are published under a variant-prefixed asset name so they
+      # never replace the CPU installer of the same name — a CUDA binary needs
+      # `libcuda` at runtime and would break machines without an NVIDIA driver.
+      - name: Publish GPU bundles to the release
         if: ${{ !matrix.release }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: riga-${{ matrix.platform }}
-          if-no-files-found: warn
-          path: |
-            apps/riga/src-tauri/target/release/bundle/**
-            apps/riga/src-tauri/target/*/release/bundle/**
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag="${{ github.ref_name }}"
+          prefix="${{ matrix.asset_prefix }}"
+          shopt -s nullglob
+          files=(target/release/bundle/*/* target/*/release/bundle/*/*)
+          uploaded=0
+          for file in "${files[@]}"; do
+            [ -f "$file" ] || continue
+            renamed="$(dirname "$file")/$(basename "$file" | sed "s/^RIGA/$prefix/")"
+            cp "$file" "$renamed"
+            gh release upload "$tag" "$renamed" --clobber
+            uploaded=$((uploaded + 1))
+          done
+          echo "Published $uploaded asset(s) to $tag"
+          if [ "$uploaded" -eq 0 ]; then
+            echo "::error::No bundle files found under target/*/release/bundle"
+            exit 1
+          fi
