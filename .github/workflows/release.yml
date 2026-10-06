@@ -83,7 +83,13 @@ jobs:
         with:
           cuda: "12.6.3"
           method: network
-          sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
+          # The action prefixes `cuda-` and appends `-<major>-<minor>`; `cublas`
+          # is not a cuda-prefixed package (it is `libcublas`), so it belongs in
+          # `non-cuda-sub-packages`. Install the toolkit meta-package instead:
+          # it pulls nvcc plus the cudart/cublas dev packages (the static libs
+          # llama.cpp links) without the driver packages the `cuda` meta pulls.
+          sub-packages: '["toolkit"]'
+          log-file-suffix: "linux-cuda.txt"
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
