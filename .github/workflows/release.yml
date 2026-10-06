@@ -4,11 +4,12 @@ on:
   push:
     tags:
       - "v*.*.*"
-  # linux-cuda is slow and needs an NVIDIA driver to run, so it is manual only.
+  # A manual run builds ONLY the variant selected below: the cpu and metal jobs
+  # are gated on a tag push, so checking this box rebuilds just linux-cuda.
   workflow_dispatch:
     inputs:
       build_linux_cuda:
-        description: "Also build linux-cuda (slow; installs the CUDA toolkit)"
+        description: "Build linux-cuda only (slow; installs the CUDA toolkit)"
         type: boolean
         default: false
       tag:
