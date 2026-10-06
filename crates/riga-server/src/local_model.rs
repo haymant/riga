@@ -602,6 +602,14 @@ impl LocalModelRuntime {
                     std::env::var("RIGA_LOCAL_CONTEXT").ok().as_deref(),
                 ),
             );
+            // Report the window actually resolved, so a short output budget can
+            // be diagnosed against the real context instead of guessed at.
+            tracing::info!(
+                model = %file_name,
+                context_size,
+                trained = model.n_ctx_train(),
+                "local model loaded"
+            );
             let loaded = LoadedModel {
                 model,
                 backend,

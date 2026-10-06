@@ -2274,11 +2274,15 @@ Reply with exactly ONE smaller tool call whose <tool_call> block is valid JSON. 
 /// Tokens requested per local turn before `resolve_max_tokens` shrinks it to the
 /// room the prompt leaves. Deliberately modest: a 1.5B model at 4k tokens on CPU
 /// is minutes of work, and the tool loop re-decodes the history every turn.
-/// Output budget for one local turn. `resolve_max_tokens` clamps it to whatever
-/// the context has room for, so a large value is safe. 1024 was too small for a
-/// `write` that carries a file's body: the JSON was cut off mid-string, which
-/// parses as neither a tool call nor an answer.
-const LOCAL_MAX_TOKENS: u32 = 4096;
+/// Output budget for one local turn.
+///
+/// This is a cap, not a target: generation still stops at the model's end token,
+/// so a larger value costs nothing on a short reply and only buys room for a long
+/// one. It is clamped by `resolve_max_tokens` to whatever the context has left
+/// after the prompt, so it can never overflow. A `write` that carries a file's
+/// body needs real room — 1024 truncated the JSON mid-string, which parses as
+/// neither a tool call nor an answer.
+const LOCAL_MAX_TOKENS: u32 = 8192;
 
 #[derive(Debug, PartialEq)]
 struct ParsedToolCall {
@@ -3119,7 +3123,9 @@ fn completion_request_body_with_tools(
         "model": model,
         "messages": messages,
         "stream": true,
-        "max_completion_tokens": 2048,
+        // A cap, not a target: a long file body needs room, short replies are
+        // unaffected because generation stops at the end token.
+        "max_completion_tokens": 4096,
         "tools": tools,
         "tool_choice": "auto",
     })
@@ -3376,7 +3382,7 @@ mod tests {
             &[serde_json::json!({"role": "user", "content": "hello"})],
             Vec::new(),
         );
-        assert_eq!(body["max_completion_tokens"], 2048);
+        assert_eq!(body["max_completion_tokens"], 4096);
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["model"], "gpt-5-nano");
         // Streaming is on so a remote provider streams like a local one.
