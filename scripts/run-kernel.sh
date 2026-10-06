@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+# Operate from the repository root so `cargo run` resolves the workspace and
+# `.env.local` is found regardless of the caller's working directory (for
+# example `npm run dev` from `apps/riga`).
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
 source "$HOME/.cargo/env"
 
 # Load local settings (provider keys, RIGA_TOKEN, overrides). Writes and shell

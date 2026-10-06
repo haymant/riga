@@ -182,11 +182,25 @@ Start the server with `cargo run -p riga-server` (it listens on
 
 ## 4. Run it
 
+From either `apps/riga` or the repository root:
+
 ```bash
 npm install
 cp .env.example .env.local   # then set the flags below
 npm run dev                  # riga-server + Vite on :1420
 ```
+
+`dev` runs `concurrently` over `backend:dev` (`cargo run -p riga-server`) and
+`web:dev` (Vite). Run the halves in their own terminals when you want them
+separate:
+
+```bash
+npm run backend:dev   # riga-server on :8787
+npm run web:dev       # Vite on :1420
+```
+
+`npm run dev --prefix ../..` from the repository root delegates to the same
+script.
 
 For a native window, `npm run tauri:dev` starts the same two processes through
 `beforeDevCommand`. Do not run both at once: port `1420` is `strictPort` and both
