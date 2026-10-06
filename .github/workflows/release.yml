@@ -24,51 +24,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  matrix:
-    name: Build matrix
-    runs-on: ubuntu-latest
-    outputs:
-      include: ${{ steps.set.outputs.include }}
-      has_jobs: ${{ steps.set.outputs.has_jobs }}
-    steps:
-      - name: Compose the platform matrix
-        id: set
-        run: |
-          # A tag push builds the shipping set: linux, windows, and Apple
-          # Silicon with Metal (every aarch64 Mac supports it, and it still
-          # falls back to CPU). linux-cuda is slow and manual only.
-          include='[]'
-          if [ "${{ github.event_name }}" = "push" ]; then
-            include='[
-              {"platform":"linux","os":"ubuntu-22.04","args":"","rust-targets":"","features":"","enable_cuda":false,"enable_metal":false,"release":true},
-              {"platform":"windows","os":"windows-latest","args":"","rust-targets":"","features":"","enable_cuda":false,"enable_metal":false,"release":true},
-              {"platform":"macos-metal","os":"macos-latest","args":"--target aarch64-apple-darwin","rust-targets":"aarch64-apple-darwin","features":"metal","enable_cuda":false,"enable_metal":true,"release":true}
-            ]'
-          fi
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.build_linux_cuda }}" = "true" ]; then
-            include=$(printf '%s' "$include" | jq -c '. + [{"platform":"linux-cuda","os":"ubuntu-22.04","args":"","rust-targets":"","features":"cuda","enable_cuda":true,"enable_metal":false,"release":false,"asset_prefix":"RIGA-CUDA"}]')
-          fi
-          # Collapse to one line: `$GITHUB_OUTPUT` cannot carry a raw newline.
-          include=$(printf '%s' "$include" | jq -c '.')
-          if [ "$include" = "[]" ]; then
-            echo "has_jobs=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_jobs=true" >> "$GITHUB_OUTPUT"
-          fi
-          echo "include=$include" >> "$GITHUB_OUTPUT"
-          echo "Matrix: $include"
-
-  desktop:
+  # ---------------------------------------------------------------------------
+  # 1. CPU builds: Linux and Windows. A separate CPU macOS build is deliberately
+  #    absent — the Metal job below covers Apple Silicon and would otherwise
+  #    write the same `RIGA_<version>_aarch64.dmg`.
+  # ---------------------------------------------------------------------------
+  cpu:
     name: Build desktop app (${{ matrix.platform }})
-    needs: matrix
-    # Skip entirely when a manual run selected no GPU variant (empty matrix).
-    if: needs.matrix.outputs.has_jobs == 'true'
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        include: ${{ fromJson(needs.matrix.outputs.include) }}
+        include:
+          - platform: linux
+            os: ubuntu-22.04
+          - platform: windows
+            os: windows-latest
     steps:
       - name: Check out release tag
         uses: actions/checkout@v4
@@ -87,26 +60,11 @@ jobs:
             pkg-config \
             clang
 
-      - name: Install CUDA Toolkit
-        if: matrix.enable_cuda
-        uses: Jimver/cuda-toolkit@v0.2.36
-        with:
-          cuda: "12.6.3"
-          method: network
-          # The action prefixes `cuda-` and appends `-<major>-<minor>`; `cublas`
-          # is not a cuda-prefixed package (it is `libcublas`), so it belongs in
-          # `non-cuda-sub-packages`. Install the toolkit meta-package instead:
-          # it pulls nvcc plus the cudart/cublas dev packages (the static libs
-          # llama.cpp links) without the driver packages the `cuda` meta pulls.
-          sub-packages: '["toolkit"]'
-          log-file-suffix: "linux-cuda.txt"
-
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.0
           components: rustfmt
-          targets: ${{ matrix.rust-targets }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -117,23 +75,7 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
-      # Every aarch64 Mac supports Metal, so the macOS build keeps it on. Link
-      # the toolchain's compiler-rt archive, which provides
-      # `___isPlatformVersionAtLeast` — a symbol Rust's `-nodefaultlibs` link
-      # omits, so without it the Metal build fails to link.
-      - name: Set macOS build environment
-        if: runner.os == 'macOS'
-        run: |
-          echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
-          echo "CMAKE_OSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
-          echo "GGML_METAL=ON" >> "$GITHUB_ENV"
-          resource_dir="$(clang -print-resource-dir)"
-          echo "RUSTFLAGS=-C link-arg=${resource_dir}/lib/darwin/libclang_rt.osx.a" >> "$GITHUB_ENV"
-          xcodebuild -downloadComponent MetalToolchain || true
-
-      # Release build: attached to the tagged GitHub release.
       - name: Build and upload RIGA
-        if: matrix.release
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -152,39 +94,144 @@ jobs:
               published as a `RIGA-CUDA-…` asset (needs a CUDA driver to run)
           releaseDraft: false
           prerelease: false
-          args: >-
-            ${{ matrix.args }}
-            ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }}
 
-      # Optional GPU variant: compile-only, published as a workflow artifact.
-      - name: Build RIGA (build-only variant)
-        if: ${{ !matrix.release }}
+  # ---------------------------------------------------------------------------
+  # 2. Apple Silicon with Metal. Every aarch64 Mac supports Metal, and it still
+  #    falls back to CPU, so there is no separate CPU macOS build.
+  # ---------------------------------------------------------------------------
+  metal:
+    name: Build desktop app (macos-metal)
+    if: github.event_name == 'push'
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt
+          targets: aarch64-apple-darwin
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      # Link the toolchain's compiler-rt archive, which provides
+      # `___isPlatformVersionAtLeast` — a symbol Rust's `-nodefaultlibs` link
+      # omits, so without it the Metal build fails to link.
+      - name: Set macOS build environment
+        run: |
+          echo "MACOSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
+          echo "CMAKE_OSX_DEPLOYMENT_TARGET=10.15" >> "$GITHUB_ENV"
+          echo "GGML_METAL=ON" >> "$GITHUB_ENV"
+          resource_dir="$(clang -print-resource-dir)"
+          echo "RUSTFLAGS=-C link-arg=${resource_dir}/lib/darwin/libclang_rt.osx.a" >> "$GITHUB_ENV"
+          xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Build and upload RIGA
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: apps/riga
-          args: >-
-            ${{ matrix.args }}
-            ${{ matrix.features != '' && format('--features {0}', matrix.features) || '' }}
+          tagName: ${{ github.ref_name }}
+          releaseName: RIGA ${{ github.ref_name }}
+          releaseBody: |
+            Desktop release for RIGA ${{ github.ref_name }}.
 
-      # GPU variants are published under a variant-prefixed asset name so they
-      # never replace the CPU installer of the same name — a CUDA binary needs
-      # `libcuda` at runtime and would break machines without an NVIDIA driver.
-      - name: Publish GPU bundles to the release
-        if: ${{ !matrix.release }}
+            Download the installer for your operating system from the assets below.
+
+            - `linux` / `windows` — CPU builds
+            - `macos` — Apple Silicon with Metal (and CPU fallback)
+            - `linux-cuda` — optional NVIDIA build, produced on demand and
+              published as a `RIGA-CUDA-…` asset (needs a CUDA driver to run)
+          releaseDraft: false
+          prerelease: false
+          args: --target aarch64-apple-darwin --features metal
+
+  # ---------------------------------------------------------------------------
+  # 3. Linux with CUDA — manual only. Built without a release upload, then
+  #    published under a `RIGA-CUDA-` prefixed name so it never replaces the CPU
+  #    installer (a CUDA binary needs `libcuda` at runtime).
+  # ---------------------------------------------------------------------------
+  cuda:
+    name: Build desktop app (linux-cuda)
+    if: github.event_name == 'workflow_dispatch' && inputs.build_linux_cuda
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils \
+            build-essential \
+            pkg-config \
+            clang
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.36
+        with:
+          cuda: "12.6.3"
+          method: network
+          # The action prefixes `cuda-` and appends `-<major>-<minor>`; `cublas`
+          # is not a cuda-prefixed package (it is `libcublas`), so install the
+          # toolkit meta-package instead: nvcc plus the cudart/cublas dev
+          # packages (the static libs llama.cpp links) without the driver
+          # packages the `cuda` meta-package would pull onto a GPU-less runner.
+          sub-packages: '["toolkit"]'
+          log-file-suffix: "linux-cuda.txt"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          components: rustfmt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Build RIGA (CUDA)
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/riga
+          args: --features cuda
+
+      - name: Publish CUDA bundles to the release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           tag="${{ inputs.tag }}"
           [ -n "$tag" ] || tag="${{ github.ref_name }}"
-          prefix="${{ matrix.asset_prefix }}"
           shopt -s nullglob
           files=(target/release/bundle/*/* target/*/release/bundle/*/*)
           uploaded=0
           for file in "${files[@]}"; do
             [ -f "$file" ] || continue
-            renamed="$(dirname "$file")/$(basename "$file" | sed "s/^RIGA/$prefix/")"
+            renamed="$(dirname "$file")/$(basename "$file" | sed 's/^RIGA/RIGA-CUDA/')"
             cp "$file" "$renamed"
             gh release upload "$tag" "$renamed" --clobber
             uploaded=$((uploaded + 1))
