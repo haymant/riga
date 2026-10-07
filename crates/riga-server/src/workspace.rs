@@ -80,6 +80,14 @@ pub async fn ensure_worktree(base: &Path, session_id: &str) -> Result<PathBuf, S
             .map_err(|error| format!("could not create the worktree directory: {error}"))?;
     }
     let branch = branch_name(session_id);
+    // A worktree whose directory was deleted out from under git (a cleaned
+    // workspace, a removed dev tree) leaves an administrative registration that
+    // still "owns" its branch. Both `worktree add` forms then fail — `-b` with
+    // "branch already exists" and the attach form with "already used by
+    // worktree" — even though the tree is gone. Prune those stale entries
+    // first; it only drops registrations whose directory is missing, so a live
+    // session is untouched.
+    let _ = run_git(base, &["worktree", "prune"]).await;
     // A fresh branch; if it already exists (a removed-and-recreated worktree),
     // attach to it instead.
     if run_git(
@@ -257,6 +265,41 @@ mod tests {
 
         // The base checkout is untouched by either session.
         assert!(!base.join("app.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn a_deleted_worktree_is_pruned_and_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(base)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(base.join("seed.txt"), "from head").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "seed"]);
+
+        let first = ensure_worktree(base, "session-1").await.unwrap();
+        // Simulate a workspace whose worktrees were deleted without `git
+        // worktree remove`: the directory is gone, but the branch and the
+        // administrative registration remain. Before the prune, every later
+        // `worktree add` for this session failed with "already used by
+        // worktree".
+        std::fs::remove_dir_all(&first).unwrap();
+        let recreated = ensure_worktree(base, "session-1").await.unwrap();
+        assert_eq!(recreated, worktree_path(base, "session-1"));
+        assert!(recreated.join(".git").exists());
+        assert_eq!(
+            std::fs::read_to_string(recreated.join("seed.txt")).unwrap(),
+            "from head"
+        );
     }
 
     #[tokio::test]
