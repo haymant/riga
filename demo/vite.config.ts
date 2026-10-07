@@ -9,6 +9,7 @@ export default defineConfig(() => ({
   plugins: [react()],
 
   resolve: {
+    dedupe: ["react", "react-dom"],
     alias: {
       "@rigai/assistant-ui": new URL("../packages/assistant-ui/src/index.ts", import.meta.url).pathname,
       "@haymant/transport-http": new URL("../packages/transport-http/src/index.ts", import.meta.url).pathname,

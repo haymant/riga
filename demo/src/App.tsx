@@ -7,7 +7,13 @@ function App() {
   const [kernelStatus, setKernelStatus] = useState("checking…");
 
   useEffect(() => {
-    void invoke("kernel_health")
+    const healthRequest = "__TAURI_INTERNALS__" in window
+      ? invoke("kernel_health")
+      : fetch("/health").then((response) => {
+          if (!response.ok) throw new Error(`health request failed (${response.status})`);
+          return response.json();
+        });
+    void healthRequest
       .then((health) => setKernelStatus(JSON.stringify(health)))
       .catch((error: unknown) => setKernelStatus(`error: ${String(error)}`));
   }, []);
