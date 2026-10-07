@@ -225,7 +225,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: apps/riga
-          args: --features cuda
+          # Only a .deb: rpm packaging is very slow on the large CUDA binary and
+          # the AppImage step downloads tooling. The CPU Linux release already
+          # ships the rpm and AppImage.
+          args: --features cuda --bundles deb
 
       - name: Publish CUDA bundles to the release
         env:
