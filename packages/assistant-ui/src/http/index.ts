@@ -77,10 +77,12 @@ export class RigaHttpTransport implements RigaTransport {
   saveMcpRegistry(request: McpRegistryRequest): Promise<McpServerSummary[]> {
     return this.request("/mcp/registry", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
   }
-  async uploadAttachment(file: File): Promise<Attachment> {
+  async uploadAttachment(file: File, sessionId: string): Promise<Attachment> {
     const form = new FormData();
     form.append("file", file, file.name);
-    return this.request("/attachments", { method: "POST", body: form });
+    // The server stores the file in the session's worktree, so it must know the
+    // session; the agent's tools then read it at the returned relative path.
+    return this.request(`/attachments?session=${encodeURIComponent(sessionId)}`, { method: "POST", body: form });
   }
   listLocalModels() { return this.localModels.overview(); }
   subscribeLocalModels(): () => void { return this.localModelUnsubscribe; }

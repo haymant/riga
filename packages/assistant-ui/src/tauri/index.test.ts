@@ -80,8 +80,8 @@ describe("RigaTauriTransport", () => {
     await transport.unloadModel();
     await transport.downloadModel("model-1");
     const file = new File([new Uint8Array([1, 2, 3])], "note.txt");
-    await transport.uploadAttachment(file);
+    await transport.uploadAttachment(file, "session-1");
     expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.localModelAction && (call.args?.request as { action?: string } | undefined)?.action === "download")?.args).toEqual({ request: { action: "download", model_id: "model-1" } });
-    expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.uploadAttachment)?.args).toEqual({ attachment: { name: "note.txt", bytes: [1, 2, 3] } });
+    expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.uploadAttachment)?.args).toEqual({ attachment: { name: "note.txt", bytes: [1, 2, 3], session_id: "session-1" } });
   });
 });

@@ -37,6 +37,10 @@ pub struct Attachment {
 pub struct IpcAttachment {
     pub name: String,
     pub bytes: Vec<u8>,
+    /// Session whose worktree receives the file. Defaults to the base workspace
+    /// when absent, for a client that predates session-scoped uploads.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl IpcService {
@@ -323,36 +327,17 @@ impl IpcService {
     }
 
     pub async fn upload_attachment(&self, attachment: IpcAttachment) -> Result<Attachment, String> {
-        let safe_name: String = attachment
-            .name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let safe_name = if safe_name.is_empty() {
-            "attachment".into()
-        } else {
-            safe_name
-        };
-        let relative_path = format!("tmp/riga-attachments/{}-{}", chrono_millis(), safe_name);
-        let path = self.state.workspace_root.join(&relative_path);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        tokio::fs::write(&path, &attachment.bytes)
-            .await
-            .map_err(|e| e.to_string())?;
+        // Store inside the session's worktree so the agent's tools find the file
+        // at the relative path the prompt advertises.
+        let session = attachment.session_id.as_deref().unwrap_or_default();
+        let dir =
+            crate::workspace::ensure_attachment_dir(&self.state.workspace_root, session).await?;
+        let (path, size) =
+            crate::workspace::store_attachment(&dir, &attachment.name, &attachment.bytes).await?;
         Ok(Attachment {
             name: attachment.name,
-            path: relative_path,
-            size: attachment.bytes.len(),
+            path,
+            size,
         })
     }
 
@@ -405,13 +390,6 @@ impl IpcService {
             .events
             .subscribe()
     }
-}
-
-fn chrono_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default()
 }
 
 fn run_journal_path(run_id: &str) -> PathBuf {

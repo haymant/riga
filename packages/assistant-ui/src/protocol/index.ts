@@ -153,7 +153,7 @@ export interface RigaTransport {
   respondToApproval(runId: string, approvalId: string, approved: boolean, option?: "once" | "always"): Promise<void>;
   listMcpRegistry(): Promise<McpServerSummary[]>;
   saveMcpRegistry(request: McpRegistryRequest): Promise<McpServerSummary[]>;
-  uploadAttachment(file: File): Promise<Attachment>;
+  uploadAttachment(file: File, sessionId: string): Promise<Attachment>;
   listLocalModels(): Promise<LocalModelOverview>;
   subscribeLocalModels(): () => void;
   downloadModel(modelId: string): Promise<void>;

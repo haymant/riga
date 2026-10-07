@@ -16,6 +16,14 @@ use std::process::Stdio;
 /// Directory, relative to the base repository, that holds session worktrees.
 pub const WORKTREE_DIR: &str = ".riga/worktrees";
 
+/// Directory, relative to a session worktree, that holds uploaded attachments.
+///
+/// It lives *inside* the worktree so the agent's tools resolve the same
+/// relative path the prompt advertises, it is git-ignored, and the whole
+/// worktree sits under the hidden `.riga/` tree so a desktop dev watcher does
+/// not reload on every upload.
+pub const ATTACHMENTS_DIR: &str = "tmp/riga-attachments";
+
 /// Reduce a client-supplied session id to a safe path and branch component.
 pub fn sanitize_session(session_id: &str) -> String {
     let cleaned: String = session_id
@@ -90,6 +98,64 @@ pub async fn ensure_worktree(base: &Path, session_id: &str) -> Result<PathBuf, S
     ))
 }
 
+/// Reduce a client-supplied file name to a safe path component.
+pub fn safe_attachment_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "attachment".to_owned()
+    } else {
+        cleaned
+    }
+}
+
+/// Ensure the session's worktree and attachment directory exist, returning the
+/// directory to write into. Falls back to the base workspace when the session id
+/// is empty, so a client that predates session-scoped uploads still works.
+pub async fn ensure_attachment_dir(base: &Path, session_id: &str) -> Result<PathBuf, String> {
+    let root = if session_id.is_empty() {
+        base.to_path_buf()
+    } else {
+        ensure_worktree(base, session_id).await?
+    };
+    let dir = root.join(ATTACHMENTS_DIR);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|error| format!("could not create the attachment directory: {error}"))?;
+    Ok(dir)
+}
+
+/// Write attachment bytes under `dir` with a unique, sanitized name.
+///
+/// Returns the path relative to the worktree root (what the prompt advertises
+/// and the tools read) and the byte length.
+pub async fn store_attachment(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(String, usize), String> {
+    let file_name = format!("{}-{}", now_millis(), safe_attachment_name(name));
+    tokio::fs::write(dir.join(&file_name), bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((format!("{ATTACHMENTS_DIR}/{file_name}"), bytes.len()))
+}
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
 /// Run a git command in `base`, returning whether it succeeded. stderr is
 /// surfaced through `tracing` so a failure is diagnosable without failing the
 /// caller, which retries or falls back.
@@ -120,7 +186,10 @@ async fn run_git(base: &Path, args: &[&str]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{branch_name, ensure_worktree, sanitize_session, worktree_path};
+    use super::{
+        branch_name, ensure_attachment_dir, ensure_worktree, sanitize_session, store_attachment,
+        worktree_path,
+    };
 
     #[test]
     fn session_ids_are_sanitized_for_paths_and_branches() {
@@ -195,5 +264,40 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
         assert_eq!(ensure_worktree(base, "session-1").await.unwrap(), base);
+    }
+
+    #[tokio::test]
+    async fn attachments_land_inside_the_session_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(base)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(base.join("seed.txt"), "from head").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "seed"]);
+
+        let attachment_dir = ensure_attachment_dir(base, "session-1").await.unwrap();
+        let (relative, size) = store_attachment(&attachment_dir, "my report.txt", b"hello")
+            .await
+            .unwrap();
+        assert_eq!(size, 5);
+        // The prompt advertises this relative path and the tools read it there.
+        assert!(relative.starts_with("tmp/riga-attachments/"));
+        assert!(relative.ends_with("-my_report.txt"));
+        assert!(
+            worktree_path(base, "session-1").join(&relative).is_file(),
+            "attachment should be inside the session worktree"
+        );
+        // The base checkout stays clean.
+        assert!(!base.join(&relative).exists());
     }
 }

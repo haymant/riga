@@ -554,10 +554,10 @@ function AssistantUIInner({
     if (!files?.length) return;
     for (const file of Array.from(files)) {
       try {
-        const uploaded = await transportRef.current?.uploadAttachment(file);
+        const uploaded = await transportRef.current?.uploadAttachment(file, activeSession.id);
         if (!uploaded) throw new Error("transport is not connected");
         setAttachments((current) => [...current, uploaded]);
-        setToast(`${file.name} uploaded to the temporary workspace`);
+        setToast(`${file.name} uploaded to this session's workspace`);
       } catch (error) {
         setToast(error instanceof Error ? error.message : "attachment upload failed");
       }

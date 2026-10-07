@@ -114,9 +114,9 @@ export class RigaTauriTransport implements RigaTransport {
   listMcpRegistry(): Promise<McpServerSummary[]> { return this.call(RIGA_IPC_COMMANDS.listMcpRegistry); }
   saveMcpRegistry(request: McpRegistryRequest): Promise<McpServerSummary[]> { return this.call(RIGA_IPC_COMMANDS.saveMcpRegistry, { request }); }
 
-  async uploadAttachment(file: File): Promise<Attachment> {
+  async uploadAttachment(file: File, sessionId: string): Promise<Attachment> {
     const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
-    return this.call(RIGA_IPC_COMMANDS.uploadAttachment, { attachment: { name: file.name, bytes } });
+    return this.call(RIGA_IPC_COMMANDS.uploadAttachment, { attachment: { name: file.name, bytes, session_id: sessionId } });
   }
 
   listLocalModels(): Promise<import("../protocol").LocalModelOverview> {

@@ -10,7 +10,7 @@ use std::sync::{
 use async_stream::stream;
 use axum::{
     Json, Router,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
     response::{
         IntoResponse,
@@ -529,8 +529,16 @@ async fn mcp_health_http(
         .into_response()
 }
 
+#[derive(Debug, Deserialize)]
+struct AttachmentQuery {
+    /// Session whose worktree receives the file. Empty falls back to the base
+    /// workspace for a client that predates session-scoped uploads.
+    session: Option<String>,
+}
+
 async fn upload_attachment(
     State(state): State<ServerState>,
+    Query(query): Query<AttachmentQuery>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     let Some(field) = (multipart.next_field().await).ok().flatten() else {
@@ -551,52 +559,36 @@ async fn upload_attachment(
                 .into_response();
         }
     };
-    let safe_name = original_name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    let safe_name = if safe_name.is_empty() {
-        "attachment".to_owned()
-    } else {
-        safe_name
+    // Store inside the session's worktree so the agent's tools find the file at
+    // the relative path the prompt advertises.
+    let session = query.session.unwrap_or_default();
+    let dir = match crate::workspace::ensure_attachment_dir(&state.workspace_root, &session).await {
+        Ok(dir) => dir,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error })),
+            )
+                .into_response();
+        }
     };
-    let relative_path = format!(
-        "tmp/riga-attachments/{}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default(),
-        safe_name
-    );
-    let path = state.workspace_root.join(&relative_path);
-    if let Some(parent) = path.parent()
-        && let Err(error) = tokio::fs::create_dir_all(parent).await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": error.to_string() })),
-        )
-            .into_response();
-    }
-    if let Err(error) = tokio::fs::write(&path, &bytes).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": error.to_string() })),
-        )
-            .into_response();
-    }
+    let (relative_path, size) =
+        match crate::workspace::store_attachment(&dir, &original_name, &bytes).await {
+            Ok(stored) => stored,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": error })),
+                )
+                    .into_response();
+            }
+        };
     (
         StatusCode::CREATED,
         Json(serde_json::json!({
             "name": original_name,
             "path": relative_path,
-            "size": bytes.len(),
+            "size": size,
         })),
     )
         .into_response()
