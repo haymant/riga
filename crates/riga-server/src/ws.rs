@@ -183,13 +183,16 @@ struct LocalDeltaStream {
     /// `None` until the turn's shape is known; `Some(true)` prose, `Some(false)`
     /// a tool call.
     decided: Option<bool>,
+    /// True while inside a ` thinking…` block, whose text streams as reasoning.
+    in_reasoning: bool,
     streamed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LocalDeltaStream {
     const MARKER: &'static str = "<tool_call>";
-    /// Qwen3-style reasoning block; hidden from the reply like the tool call.
-    const REASONING: &'static str = " thinking";
+    /// Qwen3-style reasoning block; streamed as reasoning, not reply text.
+    const REASONING_OPEN: &'static str = " thinking";
+    const REASONING_CLOSE: &'static str = "";
 
     fn new(
         sender: mpsc::Sender<ToolTraceEvent>,
@@ -199,70 +202,81 @@ impl LocalDeltaStream {
             sender,
             pending: String::new(),
             decided: None,
+            in_reasoning: false,
             streamed,
         }
     }
 
     fn push(&mut self, delta: &str) {
-        match self.decided {
-            Some(true) => self.emit(delta),
-            Some(false) => {}
-            None => {
-                self.pending.push_str(delta);
-                self.drop_reasoning();
-                // Inside an unterminated ` thinking` block: hold, decide later.
-                if self.holding_reasoning() {
+        if self.decided == Some(true) {
+            self.emit_text(delta);
+            return;
+        }
+        if self.decided == Some(false) {
+            return;
+        }
+        self.pending.push_str(delta);
+        loop {
+            if self.in_reasoning {
+                if let Some(end) = self.pending.find(Self::REASONING_CLOSE) {
+                    let reasoning = self.pending[..end].to_owned();
+                    self.emit_reasoning(&reasoning);
+                    self.pending = self.pending[end + Self::REASONING_CLOSE.len()..].to_owned();
+                    self.in_reasoning = false;
+                } else {
+                    // Stream reasoning as it arrives, holding back a short tail that
+                    // may be the start of the closing tag. Snap to a char boundary.
+                    let keep = Self::REASONING_CLOSE.len();
+                    if self.pending.len() > keep {
+                        let split = (0..=self.pending.len() - keep)
+                            .rev()
+                            .find(|index| self.pending.is_char_boundary(*index))
+                            .unwrap_or(0);
+                        let ready = self.pending[..split].to_owned();
+                        self.emit_reasoning(&ready);
+                        self.pending = self.pending[split..].to_owned();
+                    }
                     return;
+                }
+            } else {
+                let start = self.pending.len() - self.pending.trim_start().len();
+                if self.pending[start..].starts_with(Self::REASONING_OPEN) {
+                    self.pending = self.pending[start + Self::REASONING_OPEN.len()..].to_owned();
+                    self.in_reasoning = true;
+                    continue;
                 }
                 let trimmed = self.pending.trim_start();
                 if trimmed.starts_with(Self::MARKER) {
                     self.decided = Some(false);
                     self.pending.clear();
-                } else if trimmed.len() >= Self::MARKER.len() || !Self::MARKER.starts_with(trimmed)
-                {
+                    return;
+                }
+                if trimmed.len() >= Self::MARKER.len() || !Self::MARKER.starts_with(trimmed) {
                     self.decided = Some(true);
                     let buffered = std::mem::take(&mut self.pending);
-                    self.emit(&buffered);
+                    self.emit_text(&buffered);
+                    return;
                 }
+                return;
             }
         }
     }
 
-    /// Drop a completed leading ` thinking…` block; reasoning is not reply text.
-    fn drop_reasoning(&mut self) {
-        const CLOSE: &str = "";
-        let start = self.pending.len() - self.pending.trim_start().len();
-        if !self.pending[start..].starts_with(Self::REASONING) {
-            return;
-        }
-        if let Some(end) = self.pending[start..].find(CLOSE) {
-            let after = start + end + CLOSE.len();
-            self.pending = self.pending[after..].trim_start().to_owned();
-        }
-    }
-
-    /// True while the buffer is inside an unterminated leading reasoning block.
-    fn holding_reasoning(&self) -> bool {
-        const CLOSE: &str = "";
-        let trimmed = self.pending.trim_start();
-        trimmed.starts_with(Self::REASONING) && !trimmed.contains(CLOSE)
-    }
-
-    /// Flush a still-undecided short turn as prose when generation ends.
+    /// Flush whatever is buffered when generation ends.
     fn finish(&mut self) {
-        self.drop_reasoning();
-        if self.holding_reasoning() {
-            // The model produced only reasoning; there is no reply to show.
-            self.pending.clear();
+        if self.in_reasoning {
+            let rest = std::mem::take(&mut self.pending);
+            self.emit_reasoning(&rest);
+            self.in_reasoning = false;
         }
         if self.decided.is_none() {
             self.decided = Some(true);
             let buffered = std::mem::take(&mut self.pending);
-            self.emit(&buffered);
+            self.emit_text(&buffered);
         }
     }
 
-    fn emit(&mut self, delta: &str) {
+    fn emit_text(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
         }
@@ -270,6 +284,17 @@ impl LocalDeltaStream {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = self.sender.blocking_send(ToolTraceEvent::Ui(
             riga_kernel::events::RigaEvent::TextDelta {
+                delta: delta.to_owned(),
+            },
+        ));
+    }
+
+    fn emit_reasoning(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let _ = self.sender.blocking_send(ToolTraceEvent::Ui(
+            riga_kernel::events::RigaEvent::ReasoningDelta {
                 delta: delta.to_owned(),
             },
         ));
@@ -2450,6 +2475,16 @@ const MAX_TOOL_CALL_RETRIES: usize = 2;
 /// burns every turn, and the run looks stuck at "thinking" for many minutes.
 const MAX_CONSECUTIVE_TOOL_FAILURES: usize = 3;
 
+/// Cap on tool calls in one local run, across every turn. A model that keeps
+/// globbing for files that do not exist would otherwise spend the whole turn
+/// budget; this stops it even when every call is a *different* pattern.
+const LOCAL_MAX_TOOL_CALLS: usize = 16;
+
+/// How many times the exact same call (name + arguments) may appear before the
+/// run stops. A model that repeats a call it already has the result for is
+/// looping, not working.
+const MAX_REPEATED_TOOL_CALLS: usize = 2;
+
 const LOCAL_TOOL_CALL_RETRY: &str = "Your reply contained a <tool_call> block that was not valid JSON; it was probably cut off. \
 Reply with exactly ONE smaller tool call whose <tool_call> block is valid JSON. Prefer several small `write` calls over one large one.";
 
@@ -2623,6 +2658,9 @@ fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition])
          <tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"src/app.js\"}}</tool_call>\n\
          <tool_call>{\"name\": \"write\", \"arguments\": {\"path\": \"src/app.js\", \"content\": \"console.log(1);\"}}</tool_call>\n\
          <tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"npm install\"}}</tool_call>\n\n\
+         If a tool returns no matches, an empty result, or an error, do not repeat \
+         the same call. Try one genuinely different call, then answer with what you \
+         have. Never call the same tool with the same arguments twice.\n\n\
          Available tools:\n",
     );
     for definition in definitions {
@@ -2729,6 +2767,9 @@ async fn run_local_loop(
     // while the UI sits at "thinking".
     let run_deadline = std::time::Instant::now() + LOCAL_RUN_WALL_CLOCK;
     let mut generated_total = 0usize;
+    // Across turns: a call the model already made must not be re-run.
+    let mut tool_calls_total = 0usize;
+    let mut seen_calls: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for turn in 0..LOCAL_MAX_TURNS {
         // Generation is blocking C, so it runs on the blocking pool. The future
         // is awaited directly: nothing else in this task needs the executor, and
@@ -2844,6 +2885,59 @@ async fn run_local_loop(
                 "arguments": call.arguments,
                 "task_id": task_id,
             });
+            // Loop guards: cap the total, and stop an identical call the model
+            // already made. Both turn "stuck globbing" into a clear stop instead
+            // of burning every turn.
+            tool_calls_total += 1;
+            if tool_calls_total > LOCAL_MAX_TOOL_CALLS {
+                return Err(format!(
+                    "the local model made more than {LOCAL_MAX_TOOL_CALLS} tool calls without finishing; stopping so it does not loop. Ask a narrower question or use a larger model."
+                ));
+            }
+            let repeats = {
+                let entry = seen_calls
+                    .entry(format!(
+                        "{}\u{1}{}",
+                        call.name,
+                        serde_json::to_string(&call.arguments).unwrap_or_default()
+                    ))
+                    .or_insert(0usize);
+                *entry += 1;
+                *entry
+            };
+            if repeats > MAX_REPEATED_TOOL_CALLS {
+                return Err(format!(
+                    "the local model repeated the same `{}` call {repeats} times without finishing; stopping so it does not loop.",
+                    call.name
+                ));
+            }
+            if repeats > 1 {
+                // The exact call already ran; its result is in the history. Feed a
+                // reminder instead of executing it again, so the model has a
+                // chance to answer before the cap above stops the run.
+                trace_sender
+                    .send(ToolTraceEvent::Started(payload.clone()))
+                    .await
+                    .map_err(|_| "tool lifecycle stream closed")?;
+                let message = format!(
+                    "You already called `{}` with these exact arguments; its result is in the history above. Do not repeat it — use that result to answer, or call a different tool.",
+                    call.name
+                );
+                trace_sender
+                    .send(ToolTraceEvent::Completed(ToolTrace {
+                        call: payload.clone(),
+                        name: call.name.clone(),
+                        output: message.clone(),
+                        ok: false,
+                    }))
+                    .await
+                    .map_err(|_| "tool lifecycle stream closed")?;
+                messages.push(crate::local_model::ChatMessage {
+                    role: "tool".into(),
+                    content: format!("Result from {}: {message}", call.name),
+                });
+                continue;
+            }
             trace_sender
                 .send(ToolTraceEvent::Started(payload.clone()))
                 .await

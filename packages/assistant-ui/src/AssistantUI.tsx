@@ -76,6 +76,7 @@ type Role = "user" | "assistant" | "system";
 type Session = { id: string; title: string; meta: string; active?: boolean };
 type TranscriptItem =
   | { id: string; role: Role; text: string; time: string }
+  | { id: string; role: "reasoning"; text: string; time: string }
   | { id: string; role: "tool"; callId?: string; taskId?: string; name: string; command: string; status: "running" | "done" | "error"; output: string; time: string };
 type TranscriptBlock = TranscriptItem | { id: string; role: "timeline"; items: Extract<TranscriptItem, { role: "tool" }>[] };
 type CatalogItem = { id: string; kind: string; description: string; insert_text: string; requires_approval: boolean };
@@ -360,6 +361,18 @@ function AssistantUIInner({
           if (textFrameRef.current === null) {
             textFrameRef.current = window.requestAnimationFrame(flushStreamedText);
           }
+        } else if (typeof event === "object" && event !== null && "ReasoningDelta" in event) {
+          const delta = (event as { ReasoningDelta: { delta: string } }).ReasoningDelta.delta;
+          // Reasoning streams as its own collapsible block, ahead of the reply.
+          setTranscript((current) => {
+            const last = current.at(-1);
+            if (last && last.role === "reasoning") {
+              const next = [...current];
+              next[next.length - 1] = { ...last, text: last.text + delta };
+              return next;
+            }
+            return [...current, { id: `reasoning-${envelope.event_id}`, role: "reasoning", text: delta, time: "now" }];
+          });
         } else if (typeof event === "object" && event !== null && "RunCompleted" in event) {
           // Flush before marking the run done, otherwise the tail of the reply
           // would sit in the buffer until the next frame after the spinner stops.
@@ -682,7 +695,7 @@ function AssistantUIInner({
           <div ref={transcriptRef} className="transcript" aria-live="polite">
             {transcript.length === 0 && <div className="empty-state"><div className="empty-icon"><Bot size={26} /></div><h2>Start a coding run</h2><p>Describe the change, then review every tool action before it touches your workspace.</p></div>}
             {groupTranscript(transcript.filter((item) => !(item.role === "tool" && item.taskId))).map((block) => block.role === "timeline" ? <ToolTimeline key={block.id} items={block.items} /> : <TranscriptItemView key={block.id} item={block} />)}
-            {isRunning && <div className="typing-row"><div className="assistant-badge"><Bot size={15} /></div><div className="typing-bubble"><span /><span /><span /></div><small>RIGA is thinking</small></div>}
+            {isRunning && <ThinkingIndicator transcript={transcript} />}
           </div>
 
           {pendingApproval && <div className="approval-card"><div className="approval-icon"><ShieldCheck size={19} /></div><div className="approval-copy"><div className="approval-title"><strong>Approval required</strong><span>{pendingApproval.tool}</span></div><p>The agent wants to run <code>{pendingApproval.summary}</code>.</p></div><div className="approval-actions"><button className="deny-button" onClick={() => answerApproval(false, "once")}>Decline</button><button className="outline-button" onClick={() => answerApproval(true, "always")}>Always allow</button><button className="approve-button" onClick={() => answerApproval(true, "once")}><Check size={15} /> Allow once</button></div></div>}
@@ -783,7 +796,32 @@ function ToolCallView({ item }: { item: Extract<TranscriptItem, { role: "tool" }
   </details>;
 }
 
+// Reasoning as the assistant-ui "reasoning" element: a collapsed block that
+// follows the active turn, so the model's thinking is available but not shouted.
+function ReasoningView({ item }: { item: Extract<TranscriptItem, { role: "reasoning" }> }) {
+  const text = item.text.trim();
+  const words = text ? text.split(/\s+/).length : 0;
+  return <details className="reasoning-block">
+    <summary className="reasoning-summary"><Bot size={13} /><strong>Reasoning</strong><span>{words} {words === 1 ? "word" : "words"}</span></summary>
+    <div className="reasoning-text">{text}</div>
+  </details>;
+}
+
+// The live status line while a run is in flight: what the agent is doing now and
+// for how long, per the assistant-ui "thinking indicator".
+function ThinkingIndicator({ transcript }: { transcript: TranscriptItem[] }) {
+  const [seconds, setSeconds] = useState(0);
+  useEffect(() => {
+    const id = window.setInterval(() => setSeconds((value) => value + 1), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  const runningTool = [...transcript].reverse().find((item): item is Extract<TranscriptItem, { role: "tool" }> => item.role === "tool" && item.status === "running");
+  const label = runningTool ? `${TOOL_VERBS[runningTool.name]?.[1] ?? "Running"} ${runningTool.name}` : "Thinking";
+  return <div className="thinking-indicator"><span className="thinking-pulse" /><span className="thinking-label">{label}</span><span className="thinking-elapsed">{seconds}s</span></div>;
+}
+
 function TranscriptItemView({ item }: { item: TranscriptItem }) {
+  if (item.role === "reasoning") return <ReasoningView item={item} />;
   if (item.role === "tool") return <ToolCallView item={item} />;
   // Only the assistant's prose is rendered as markdown. A user message is echoed
   // back verbatim on purpose: parsing it would reflow what was literally typed,
