@@ -15,3 +15,4 @@ export {
   DEFAULT_ASSISTANT_UI_OPTIONS,
   type AssistantUiOptions,
 } from "./options";
+export * from "./protocol";
