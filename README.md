@@ -97,6 +97,17 @@ falls back to `/usr/local/cuda`, and a newer toolkit there can fail the link
 with `undefined symbol: cudaGetDeviceProperties_v2` (CUDA 13 dropped the `_v2`
 suffix).
 
+The build script only watches `CUDA_PATH`, not `CUDA_LIBRARY_PATH`, so after
+changing it force the cached build script to re-run (a clean CI build does this
+automatically). Dropping the cached output re-runs the script and re-emits the
+link order without recompiling the CUDA kernels; `cargo clean -p` is the
+guaranteed fallback but recompiles them:
+
+```bash
+rm -rf target/release/build/llama-cpp-sys-2-*/output
+# fallback: cargo clean -p llama-cpp-sys-2
+```
+
 ## Provider configuration
 
 Configure an OpenAI-compatible endpoint, model, reasoning effort, and API key in the UI. Provider metadata is restored from the encrypted server store; the key is never returned to the browser in restoration frames.
