@@ -188,7 +188,6 @@ The browser mode must continue using HTTP/WebSocket. The Tauri mode must use onl
 - Publish the corrected npm package version after all tests pass.
 - Publish the corresponding Rust crate version containing the IPC service surface.
 - Update CI and release workflow to validate the demo app.
-- Add migration notes for consumers of `@haymant/transport-http` and `@haymant/transport-tauri`.
 - Commit and push the final phase changes.
 
 ### Exit criteria
