@@ -328,7 +328,10 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 .tool-output-label { display: block; margin-bottom: 6px; color: #687587; text-transform: uppercase; letter-spacing: .08em; font-size: 9px; }
 .tool-call-query { display: block; max-width: 360px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #748191; font: 10px 'DM Mono', monospace; }
 [data-theme="light"] .tool-call-query { color: #667085; }
-.reasoning-block { margin-left: 39px; max-width: 700px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-soft); overflow: hidden; }
+/* `overflow: hidden` on a grid item zeroes its automatic minimum size, so in
+   WebKit (the Tauri webview) the block collapsed to its 2px border. The
+   max-content guards are the same ones `.tool-timeline` needs. */
+.reasoning-block { margin-left: 39px; max-width: 700px; min-height: max-content; height: max-content; align-self: start; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-soft); overflow: hidden; }
 .reasoning-block > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 7px; padding: 8px 12px; color: var(--text-muted); font-size: 11px; }
 .reasoning-block > summary::-webkit-details-marker { display: none; }
 .reasoning-summary strong { color: var(--text); font-size: 11px; }

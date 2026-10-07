@@ -771,8 +771,12 @@ impl LocalModelRuntime {
             .apply_chat_template(&template, &llama_messages, true)
             .map_err(|error| format!("Could not format the chat prompt: {error}"))?;
         // A template that ends with ` thinking` has already opened the reasoning
-        // block; the model's first tokens are the reasoning itself.
-        reasoning_expected.store(prompt.trim_end().ends_with(" thinking"), Ordering::Relaxed);
+        // block; the model's first tokens are the reasoning itself. Written as an
+        // escape: literal angle-bracket tags get mangled by tooling.
+        reasoning_expected.store(
+            prompt.trim_end().ends_with("\u{3c}think\u{3e}"),
+            Ordering::Relaxed,
+        );
         let tokens = loaded.model.vocab().tokenize(prompt.as_bytes(), true, true);
         if tokens.is_empty() {
             return Err("The model tokenizer returned an empty prompt".into());

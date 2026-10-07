@@ -363,15 +363,19 @@ function AssistantUIInner({
           }
         } else if (typeof event === "object" && event !== null && "ReasoningDelta" in event) {
           const delta = (event as { ReasoningDelta: { delta: string } }).ReasoningDelta.delta;
-          // Reasoning streams as its own collapsible block, ahead of the reply.
+          // Reasoning streams as one collapsible block per run. Keying on the run
+          // (not the event id) keeps it a single block even if a text or tool
+          // frame lands between two reasoning deltas.
           setTranscript((current) => {
-            const last = current.at(-1);
-            if (last && last.role === "reasoning") {
+            const id = `reasoning-${envelope.run_id}`;
+            const at = current.findIndex((item) => item.id === id);
+            if (at >= 0) {
+              const item = current[at] as Extract<TranscriptItem, { role: "reasoning" }>;
               const next = [...current];
-              next[next.length - 1] = { ...last, text: last.text + delta };
+              next[at] = { ...item, text: item.text + delta };
               return next;
             }
-            return [...current, { id: `reasoning-${envelope.event_id}`, role: "reasoning", text: delta, time: "now" }];
+            return [...current, { id, role: "reasoning", text: delta, time: "now" }];
           });
         } else if (typeof event === "object" && event !== null && "RunCompleted" in event) {
           // Flush before marking the run done, otherwise the tail of the reply
@@ -796,12 +800,16 @@ function ToolCallView({ item }: { item: Extract<TranscriptItem, { role: "tool" }
   </details>;
 }
 
-// Reasoning as the assistant-ui "reasoning" element: a collapsed block that
-// follows the active turn, so the model's thinking is available but not shouted.
+// Reasoning as the assistant-ui "reasoning" element: the model's thinking,
+// shown by default and still collapsible. Opening it is the point — a closed
+// `<details>` collapses the whole block to its summary bar, which reads as a
+// bare grey line rather than the reasoning the user asked to see.
 function ReasoningView({ item }: { item: Extract<TranscriptItem, { role: "reasoning" }> }) {
-  const text = item.text.trim();
+  // A reasoning model may repeat the ` thinking` tag the template already opened;
+  // it is the block delimiter, not reasoning text.
+  const text = item.text.replace(/^\s*<\s*think\s*>\s*/i, "").trim();
   const words = text ? text.split(/\s+/).length : 0;
-  return <details className="reasoning-block">
+  return <details className="reasoning-block" open>
     <summary className="reasoning-summary"><Bot size={13} /><strong>Reasoning</strong><span>{words} {words === 1 ? "word" : "words"}</span></summary>
     <div className="reasoning-text">{text}</div>
   </details>;

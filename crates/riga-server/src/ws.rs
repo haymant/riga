@@ -196,8 +196,8 @@ struct LocalDeltaStream {
 impl LocalDeltaStream {
     const MARKER: &'static str = "<tool_call>";
     /// Qwen3-style reasoning block; streamed as reasoning, not reply text.
-    const REASONING_OPEN: &'static str = " thinking";
-    // `<` and `>` as escapes: the literal tag is stripped by some tooling.
+    // `<` and `>` written as escapes: the literal tag is stripped by tooling.
+    const REASONING_OPEN: &'static str = "\u{3c}think\u{3e}";
     const REASONING_CLOSE: &'static str = "\u{3c}/think\u{3e}";
 
     fn new(
@@ -236,6 +236,14 @@ impl LocalDeltaStream {
         self.pending.push_str(delta);
         loop {
             if self.in_reasoning {
+                // A reasoning model may repeat the opening tag the template
+                // already added; drop it from the reasoning text.
+                let start = self.pending.len() - self.pending.trim_start().len();
+                if self.pending[start..].starts_with(Self::REASONING_OPEN) {
+                    self.pending = self.pending[start + Self::REASONING_OPEN.len()..]
+                        .trim_start()
+                        .to_owned();
+                }
                 if let Some(end) = self.pending.find(Self::REASONING_CLOSE) {
                     let reasoning = self.pending[..end].to_owned();
                     self.emit_reasoning(&reasoning);
@@ -2545,10 +2553,19 @@ struct ParsedToolCall {
 /// and be fed back to the model on the next turn. An unterminated block (a turn
 /// cut off mid-thought) drops the tail rather than leaking half of it.
 fn strip_reasoning(text: &str) -> String {
-    const OPEN: &str = " thinking";
-    const CLOSE: &str = "</think>";
+    // Angle-bracket tags written as escapes: literal tag text is mangled by tooling.
+    const OPEN: &str = "\u{3c}think\u{3e}";
+    const CLOSE: &str = "\u{3c}/think\u{3e}";
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
+    // A template-opened reasoning block (Qwen3 `add_generation_prompt`) carries
+    // no opening tag in the generated text: the reply starts inside the block, so
+    // the first marker is the close tag. Drop everything up to and including it.
+    if let Some(end) = rest.find(CLOSE)
+        && rest.find(OPEN).is_none_or(|open| end < open)
+    {
+        rest = &rest[end + CLOSE.len()..];
+    }
     while let Some(start) = rest.find(OPEN) {
         out.push_str(&rest[..start]);
         let after = &rest[start + OPEN.len()..];
@@ -3673,7 +3690,7 @@ mod tests {
     #[test]
     fn reasoning_is_stripped_before_the_tool_call_is_parsed() {
         // The shape a Qwen3-style model emits: a reasoning block, then the call.
-        let reply = " thinking\nThe user wants files.\n</think>\n<tool_call>{\"name\": \"glob\", \"arguments\": {\"pattern\": \".\"}}</tool_call>";
+        let reply = "\u{3c}think\u{3e}\nThe user wants files.\n\u{3c}/think\u{3e}\n<tool_call>{\"name\": \"glob\", \"arguments\": {\"pattern\": \".\"}}</tool_call>";
         let stripped = strip_reasoning(reply);
         assert_eq!(
             stripped,
@@ -3687,7 +3704,16 @@ mod tests {
 
     #[test]
     fn an_unterminated_reasoning_block_is_dropped() {
-        assert_eq!(strip_reasoning(" thinking\nstill thinking"), "");
+        assert_eq!(strip_reasoning("\u{3c}think\u{3e}\nstill thinking"), "");
+    }
+
+    #[test]
+    fn a_template_opened_reasoning_block_is_stripped() {
+        // Qwen3's template opens the block in the prompt, so the generated text
+        // has no opening tag: it starts inside the block and only the close tag
+        // marks where the answer begins.
+        let reply = "The user wants files.\n\u{3c}/think\u{3e}\nHere is the answer.";
+        assert_eq!(strip_reasoning(reply), "Here is the answer.");
     }
 
     #[test]
@@ -4687,5 +4713,33 @@ mod tests {
         assert_eq!(reasoning, "The user wants files.");
         assert_eq!(text, "");
         assert!(!flag.load(Ordering::Relaxed), "reasoning is not reply text");
+
+        // A newline inside the reasoning must not end the block: the whole
+        // reasoning stays one ReasoningDelta stream, and only the text after the
+        // close tag is prose.
+        let (sender, receiver) = mpsc::channel(16);
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut stream =
+            super::LocalDeltaStream::new(sender, flag.clone(), Arc::new(AtomicBool::new(true)));
+        stream.push("Okay, list files.\n");
+        stream.push("First, I need to list.");
+        stream.push("\u{3c}/think\u{3e}");
+        stream.push("The answer is 42.");
+        stream.finish();
+        let (text, reasoning) = drain(receiver);
+        assert_eq!(reasoning, "Okay, list files.\nFirst, I need to list.");
+        assert_eq!(text, "The answer is 42.");
+
+        // The model repeating the template's opening tag is not reasoning text.
+        let (sender, receiver) = mpsc::channel(16);
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut stream =
+            super::LocalDeltaStream::new(sender, flag.clone(), Arc::new(AtomicBool::new(true)));
+        stream.push("\u{3c}think\u{3e}\nReasoning.");
+        stream.push("\u{3c}/think\u{3e}");
+        stream.finish();
+        let (text, reasoning) = drain(receiver);
+        assert_eq!(reasoning, "Reasoning.");
+        assert_eq!(text, "");
     }
 }
