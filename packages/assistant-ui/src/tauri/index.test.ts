@@ -29,8 +29,8 @@ describe("RigaTauriTransport", () => {
       RIGA_IPC_COMMANDS.cancelRun,
       RIGA_IPC_COMMANDS.approval,
     ]);
-    expect(calls[1]?.args).toMatchObject({ endpoint: "https://model.test/v1", api_key: "secret", reasoning_effort: "medium", api: "responses" });
-    expect(calls[4]?.args).toEqual({ run_id: "run-1" });
+    expect(calls[1]?.args).toMatchObject({ endpoint: "https://model.test/v1", apiKey: "secret", reasoningEffort: "medium", api: "responses" });
+    expect(calls[4]?.args).toEqual({ runId: "run-1" });
   });
 
   it("delivers run, local-model, provider, and error events", async () => {
@@ -81,7 +81,7 @@ describe("RigaTauriTransport", () => {
     await transport.downloadModel("model-1");
     const file = new File([new Uint8Array([1, 2, 3])], "note.txt");
     await transport.uploadAttachment(file);
-    expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.localModelAction && call.args?.action === "download")?.args).toEqual({ action: "download", model_id: "model-1" });
-    expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.uploadAttachment)?.args).toEqual({ name: "note.txt", bytes: [1, 2, 3] });
+    expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.localModelAction && (call.args?.request as { action?: string } | undefined)?.action === "download")?.args).toEqual({ request: { action: "download", model_id: "model-1" } });
+    expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.uploadAttachment)?.args).toEqual({ attachment: { name: "note.txt", bytes: [1, 2, 3] } });
   });
 });

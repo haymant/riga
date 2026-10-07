@@ -94,25 +94,29 @@ export class RigaTauriTransport implements RigaTransport {
   catalog(): Promise<Catalog> { return this.call(RIGA_IPC_COMMANDS.catalog); }
   listSessions(): Promise<Session[]> { return this.call(RIGA_IPC_COMMANDS.listSessions); }
   createSession(request: CreateSessionRequest): Promise<Session> { return this.call(RIGA_IPC_COMMANDS.createSession, { request }); }
+  // Tauri maps camelCase JS keys to the command's snake_case parameters, so the
+  // flat command args are camelCase. A parameter that is itself a struct is
+  // passed under its own key (`request` / `attachment`) and keeps serde's
+  // snake_case field names inside.
   configureProvider(endpoint: string, apiKey: string, model: string, reasoningEffort: "low" | "medium" | "high", kind = "remote", api = "chat", subagentModel = ""): Promise<void> {
-    return this.call(RIGA_IPC_COMMANDS.configureProvider, { endpoint, api_key: apiKey, model, reasoning_effort: reasoningEffort, kind, api, subagent_model: subagentModel });
+    return this.call(RIGA_IPC_COMMANDS.configureProvider, { endpoint, apiKey, model, reasoningEffort, kind, api, subagentModel });
   }
   startRun(runId: string, sessionId: string, prompt: string): Promise<void> {
-    return this.call(RIGA_IPC_COMMANDS.startRun, { run_id: runId, session_id: sessionId, prompt });
+    return this.call(RIGA_IPC_COMMANDS.startRun, { runId, sessionId, prompt });
   }
   resumeRun(runId: string, afterSequence: number): Promise<void> {
-    return this.call(RIGA_IPC_COMMANDS.resumeRun, { run_id: runId, after_sequence: afterSequence });
+    return this.call(RIGA_IPC_COMMANDS.resumeRun, { runId, afterSequence });
   }
-  cancelRun(runId: string): Promise<void> { return this.call(RIGA_IPC_COMMANDS.cancelRun, { run_id: runId }); }
+  cancelRun(runId: string): Promise<void> { return this.call(RIGA_IPC_COMMANDS.cancelRun, { runId }); }
   respondToApproval(runId: string, approvalId: string, approved: boolean, option?: "once" | "always"): Promise<void> {
-    return this.call(RIGA_IPC_COMMANDS.approval, { run_id: runId, approval_id: approvalId, approved, option });
+    return this.call(RIGA_IPC_COMMANDS.approval, { request: { run_id: runId, approval_id: approvalId, approved, option } });
   }
   listMcpRegistry(): Promise<McpServerSummary[]> { return this.call(RIGA_IPC_COMMANDS.listMcpRegistry); }
   saveMcpRegistry(request: McpRegistryRequest): Promise<McpServerSummary[]> { return this.call(RIGA_IPC_COMMANDS.saveMcpRegistry, { request }); }
 
   async uploadAttachment(file: File): Promise<Attachment> {
     const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
-    return this.call(RIGA_IPC_COMMANDS.uploadAttachment, { name: file.name, bytes });
+    return this.call(RIGA_IPC_COMMANDS.uploadAttachment, { attachment: { name: file.name, bytes } });
   }
 
   listLocalModels(): Promise<import("../protocol").LocalModelOverview> {
@@ -155,7 +159,7 @@ export class RigaTauriTransport implements RigaTransport {
   }
 
   private localModelAction(action: string, extra: Record<string, unknown> = {}): Promise<void> {
-    return this.call(RIGA_IPC_COMMANDS.localModelAction, { action, ...extra });
+    return this.call(RIGA_IPC_COMMANDS.localModelAction, { request: { action, ...extra } });
   }
 }
 

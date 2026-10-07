@@ -16,7 +16,7 @@ html, body, #root { height: 100%; }
 body { margin: 0; min-width: 320px; background: var(--bg); overflow: hidden; }
 button, textarea, input { font: inherit; }
 button { cursor: pointer; }
-.app-shell { height: 100dvh; min-height: 0; display: flex; overflow: hidden; background: radial-gradient(circle at 75% -10%, rgba(103, 71, 190, .12), transparent 32rem), var(--bg); }
+.app-shell { width: 100%; height: 100dvh; min-height: 0; display: flex; overflow: hidden; background: radial-gradient(circle at 75% -10%, rgba(103, 71, 190, .12), transparent 32rem), var(--bg); }
 .sidebar { width: 276px; height: 100dvh; min-height: 0; background: rgba(12, 14, 19, .94); border-right: 1px solid var(--line); display: flex; flex-direction: column; padding: 22px 15px 15px; position: relative; z-index: 20; }
 .brand-row { display: flex; align-items: center; gap: 10px; padding: 0 9px 24px; }
 .brand-row strong { display: block; font-size: 14px; letter-spacing: .18em; font-weight: 800; }
