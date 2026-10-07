@@ -76,12 +76,15 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
+      - name: Install demo dependencies
+        run: npm ci --prefix demo
+
       - name: Build and upload RIGA
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          projectPath: apps/riga
+          projectPath: demo
           tagName: ${{ github.ref_name }}
           releaseName: RIGA ${{ github.ref_name }}
           releaseBody: |
@@ -125,6 +128,9 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
+      - name: Install demo dependencies
+        run: npm ci --prefix demo
+
       # Link the toolchain's compiler-rt archive, which provides
       # `___isPlatformVersionAtLeast` — a symbol Rust's `-nodefaultlibs` link
       # omits, so without it the Metal build fails to link.
@@ -142,7 +148,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          projectPath: apps/riga
+          projectPath: demo
           tagName: ${{ github.ref_name }}
           releaseName: RIGA ${{ github.ref_name }}
           releaseBody: |
@@ -229,12 +235,15 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
+      - name: Install demo dependencies
+        run: npm ci --prefix demo
+
       - name: Build RIGA (CUDA)
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          projectPath: apps/riga
+          projectPath: demo
           # Only a .deb: rpm packaging is very slow on the large CUDA binary and
           # the AppImage step downloads tooling. The CPU Linux release already
           # ships the rpm and AppImage.
