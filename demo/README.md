@@ -93,9 +93,42 @@ Expected result:
 1. A window titled **RIGA** opens.
 2. The header shows a `kernel:` health result.
 3. The RIGA assistant surface renders below the header.
-4. Assistant requests are not expected to complete yet because the embedded `riga-server` transport is the next integration step.
+4. Assistant requests can be tested through the Vite proxy using an OpenAI-compatible provider or a loaded local GGUF model.
 
-## 7. Next integration stages
+## 7. Run the web app with the kernel
+
+The browser development command starts both processes:
+
+```bash
+npm run dev
+```
+
+This runs:
+
+- `riga-server` on `http://127.0.0.1:8787`
+- Vite on `http://localhost:1420`
+
+Vite proxies `/ws`, `/catalog`, `/sessions`, `/mcp`, `/attachments`, `/health`, and `/local-models` to the kernel. Open <http://localhost:1420> for manual verification.
+
+### OpenAI-compatible endpoint
+
+1. Open **Settings** in the RIGA surface.
+2. Select the remote/OpenAI-compatible provider.
+3. Enter the endpoint, API key, model, API mode, and reasoning effort.
+4. Save the provider, then send a message.
+
+Provider settings are sent through the WebSocket and persisted by the RIGA server according to its configured persistence backend.
+
+### Local GGUF model
+
+1. Open **Settings** and select **Local GGUF model**.
+2. Refresh the curated catalog.
+3. Download a model, wait for the download event to finish, and load it.
+4. Choose **Use this model**, then send a message.
+
+The browser demo uses the same `/local-models` HTTP and event-stream routes as the desktop shell, so download and load behavior can be validated before packaging.
+
+## 8. Next integration stages
 
 The changes are intentionally staged:
 

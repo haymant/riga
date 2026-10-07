@@ -35,5 +35,14 @@ export default defineConfig(() => ({
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
+    proxy: {
+      "/ws": { target: "ws://127.0.0.1:8787", ws: true },
+      "/health": { target: "http://127.0.0.1:8787" },
+      "/catalog": { target: "http://127.0.0.1:8787" },
+      "/mcp": { target: "http://127.0.0.1:8787" },
+      "/attachments": { target: "http://127.0.0.1:8787" },
+      "/sessions": { target: "http://127.0.0.1:8787" },
+      "/local-models": { target: "http://127.0.0.1:8787" },
+    },
   },
 }));
