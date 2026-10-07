@@ -14,7 +14,7 @@ use std::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use encoding_rs::UTF_8;
@@ -725,6 +725,8 @@ impl LocalModelRuntime {
         &self,
         messages: &[ChatMessage],
         max_tokens: u32,
+        deadline: Option<Instant>,
+        no_progress: Option<Duration>,
         cancel: &AtomicBool,
         mut on_delta: F,
     ) -> Result<Generated, String>
@@ -822,9 +824,22 @@ impl LocalModelRuntime {
         // rather than by running out of the token budget. A run that ran out is
         // cut off mid-thought, which the caller has to know.
         let mut ended_on_token = false;
+        let mut timed_out = false;
+        let mut generated_tokens = 0usize;
+        // Reset per token, so a generation that stalls (a long decode, or a model
+        // that stops emitting) is caught by the no-progress limit instead of
+        // holding the run at "thinking" indefinitely.
+        let mut last_progress = Instant::now();
         for position in (prompt_len..).take(max_tokens as usize) {
             if cancel.load(Ordering::Relaxed) {
                 ended_on_token = true;
+                break;
+            }
+            let now = Instant::now();
+            if deadline.is_some_and(|deadline| now >= deadline)
+                || no_progress.is_some_and(|limit| now.duration_since(last_progress) >= limit)
+            {
+                timed_out = true;
                 break;
             }
             let token = sampler.sample(&context, sample_row);
@@ -833,6 +848,8 @@ impl LocalModelRuntime {
                 ended_on_token = true;
                 break;
             }
+            generated_tokens += 1;
+            last_progress = Instant::now();
             let piece = loaded.model.vocab().token_to_piece(token, true, None);
             let mut delta = String::with_capacity(
                 decoder
@@ -856,6 +873,8 @@ impl LocalModelRuntime {
         Ok(Generated {
             text,
             truncated: !ended_on_token,
+            tokens: generated_tokens,
+            timed_out,
         })
     }
 }
@@ -868,6 +887,11 @@ pub struct Generated {
     /// `text` is cut off. A cut tool call is not parseable, and a cut answer is
     /// incomplete; the caller must not present either as a finished result.
     pub truncated: bool,
+    /// Tokens actually sampled, so the caller can enforce a whole-run budget.
+    pub tokens: usize,
+    /// True when the deadline or no-progress limit stopped generation, as opposed
+    /// to the model's end token or the token cap.
+    pub timed_out: bool,
 }
 
 fn is_gguf(path: &Path) -> bool {

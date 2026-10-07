@@ -188,6 +188,8 @@ struct LocalDeltaStream {
 
 impl LocalDeltaStream {
     const MARKER: &'static str = "<tool_call>";
+    /// Qwen3-style reasoning block; hidden from the reply like the tool call.
+    const REASONING: &'static str = " thinking";
 
     fn new(
         sender: mpsc::Sender<ToolTraceEvent>,
@@ -207,6 +209,11 @@ impl LocalDeltaStream {
             Some(false) => {}
             None => {
                 self.pending.push_str(delta);
+                self.drop_reasoning();
+                // Inside an unterminated ` thinking` block: hold, decide later.
+                if self.holding_reasoning() {
+                    return;
+                }
                 let trimmed = self.pending.trim_start();
                 if trimmed.starts_with(Self::MARKER) {
                     self.decided = Some(false);
@@ -221,8 +228,33 @@ impl LocalDeltaStream {
         }
     }
 
+    /// Drop a completed leading ` thinking…` block; reasoning is not reply text.
+    fn drop_reasoning(&mut self) {
+        const CLOSE: &str = "";
+        let start = self.pending.len() - self.pending.trim_start().len();
+        if !self.pending[start..].starts_with(Self::REASONING) {
+            return;
+        }
+        if let Some(end) = self.pending[start..].find(CLOSE) {
+            let after = start + end + CLOSE.len();
+            self.pending = self.pending[after..].trim_start().to_owned();
+        }
+    }
+
+    /// True while the buffer is inside an unterminated leading reasoning block.
+    fn holding_reasoning(&self) -> bool {
+        const CLOSE: &str = "";
+        let trimmed = self.pending.trim_start();
+        trimmed.starts_with(Self::REASONING) && !trimmed.contains(CLOSE)
+    }
+
     /// Flush a still-undecided short turn as prose when generation ends.
     fn finish(&mut self) {
+        self.drop_reasoning();
+        if self.holding_reasoning() {
+            // The model produced only reasoning; there is no reply to show.
+            self.pending.clear();
+        }
         if self.decided.is_none() {
             self.decided = Some(true);
             let buffered = std::mem::take(&mut self.pending);
@@ -2434,10 +2466,46 @@ Reply with exactly ONE smaller tool call whose <tool_call> block is valid JSON. 
 /// neither a tool call nor an answer.
 const LOCAL_MAX_TOKENS: u32 = 8192;
 
+/// Whole-run output budget for a local model, summed across every tool turn.
+///
+/// Without this a small model can generate `LOCAL_MAX_TURNS * LOCAL_MAX_TOKENS`
+/// tokens — tens of minutes on CPU — while the UI sits at "thinking". When the
+/// budget is spent the run stops with a clear message instead of hanging.
+const LOCAL_RUN_TOKEN_BUDGET: usize = 20_480;
+
+/// Wall-clock budget for one turn and for the whole run.
+const LOCAL_TURN_WALL_CLOCK: std::time::Duration = std::time::Duration::from_secs(240);
+const LOCAL_RUN_WALL_CLOCK: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How long a turn may produce no token before it is treated as stalled.
+const LOCAL_NO_PROGRESS: std::time::Duration = std::time::Duration::from_secs(90);
+
 #[derive(Debug, PartialEq)]
 struct ParsedToolCall {
     name: String,
     arguments: serde_json::Value,
+}
+
+/// Remove Qwen3-style ` thinking…</think>` reasoning from a reply.
+///
+/// The reasoning is not part of the answer; leaving it in would show up as prose
+/// and be fed back to the model on the next turn. An unterminated block (a turn
+/// cut off mid-thought) drops the tail rather than leaking half of it.
+fn strip_reasoning(text: &str) -> String {
+    const OPEN: &str = " thinking";
+    const CLOSE: &str = "</think>";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + OPEN.len()..];
+        match after.find(CLOSE) {
+            Some(end) => rest = &after[end + CLOSE.len()..],
+            None => return out.trim().to_owned(),
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_owned()
 }
 
 /// Extract `<tool_call>{...}</tool_call>` blocks and return them alongside the
@@ -2636,9 +2704,19 @@ async fn run_local_loop(
         role: turn.role.clone(),
         content: turn.content.clone(),
     }));
+    // Qwen3 is a hybrid reasoning model that otherwise spends most of a turn in a
+    // ` thinking` block before acting. Its soft switch disables that for tool use;
+    // other models are left untouched.
+    let qwen3 = local_models
+        .loaded_file_name()
+        .is_some_and(|name| name.to_ascii_lowercase().contains("qwen3"));
     messages.push(crate::local_model::ChatMessage {
         role: "user".into(),
-        content: prompt.to_owned(),
+        content: if qwen3 {
+            format!("{prompt}\n/no_think")
+        } else {
+            prompt.to_owned()
+        },
     });
     let mut final_text = String::new();
     let mut nudges = 0usize;
@@ -2647,6 +2725,10 @@ async fn run_local_loop(
     let mut tool_call_retries = 0usize;
     // Reset by any successful tool call, so only a genuinely stuck loop stops.
     let mut consecutive_failures = 0usize;
+    // Whole-run budgets, so a small model cannot generate for tens of minutes
+    // while the UI sits at "thinking".
+    let run_deadline = std::time::Instant::now() + LOCAL_RUN_WALL_CLOCK;
+    let mut generated_total = 0usize;
     for turn in 0..LOCAL_MAX_TURNS {
         // Generation is blocking C, so it runs on the blocking pool. The future
         // is awaited directly: nothing else in this task needs the executor, and
@@ -2667,11 +2749,17 @@ async fn run_local_loop(
         let stream_sender = trace_sender.clone();
         let streamed_flag = evidence.streamed();
         let worker_cancel = cancel.clone();
+        let turn_deadline = std::cmp::min(
+            run_deadline,
+            std::time::Instant::now() + LOCAL_TURN_WALL_CLOCK,
+        );
         let generated = tokio::task::spawn_blocking(move || {
             let mut stream = LocalDeltaStream::new(stream_sender, streamed_flag);
             let result = runtime.generate(
                 &request,
                 LOCAL_MAX_TOKENS,
+                Some(turn_deadline),
+                Some(LOCAL_NO_PROGRESS),
                 worker_cancel.as_ref(),
                 |delta| stream.push(delta),
             );
@@ -2680,8 +2768,19 @@ async fn run_local_loop(
         })
         .await
         .map_err(|error| format!("local inference worker failed: {error}"))??;
-        let text = generated.text;
+        let text = strip_reasoning(&generated.text);
         let truncated = generated.truncated;
+        generated_total += generated.tokens;
+        if generated.timed_out {
+            return Err(format!(
+                "The local model stalled and was stopped after {generated_total} tokens. It may be too large for this prompt; try a smaller prompt, a faster build, or a shorter request."
+            ));
+        }
+        if generated_total >= LOCAL_RUN_TOKEN_BUDGET {
+            return Err(format!(
+                "The local model exceeded the {LOCAL_RUN_TOKEN_BUDGET}-token budget for one run. Try a smaller prompt or a smaller request."
+            ));
+        }
         let (prose, tool_calls) = parse_local_tool_calls(&text);
         if !prose.is_empty() {
             final_text = prose.clone();
@@ -3459,10 +3558,30 @@ fn run_journal_path(run_id: &str) -> std::path::PathBuf {
 mod tests {
     use super::{
         ClientMessage, ParsedToolCall, ProviderApi, ProviderConfig, ProviderKind, ServerMessage,
-        parse_local_tool_calls, resolve_run_provider,
+        parse_local_tool_calls, resolve_run_provider, strip_reasoning,
     };
     use riga_kernel::events::RigaEvent;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn reasoning_is_stripped_before_the_tool_call_is_parsed() {
+        // The shape a Qwen3-style model emits: a reasoning block, then the call.
+        let reply = " thinking\nThe user wants files.\n</think>\n<tool_call>{\"name\": \"glob\", \"arguments\": {\"pattern\": \".\"}}</tool_call>";
+        let stripped = strip_reasoning(reply);
+        assert_eq!(
+            stripped,
+            "<tool_call>{\"name\": \"glob\", \"arguments\": {\"pattern\": \".\"}}</tool_call>"
+        );
+        let (prose, calls) = parse_local_tool_calls(&stripped);
+        assert_eq!(prose, "");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "glob");
+    }
+
+    #[test]
+    fn an_unterminated_reasoning_block_is_dropped() {
+        assert_eq!(strip_reasoning(" thinking\nstill thinking"), "");
+    }
 
     #[test]
     fn protocol_accepts_provider_configuration_without_persisting_it() {

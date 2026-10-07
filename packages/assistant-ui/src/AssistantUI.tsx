@@ -727,15 +727,59 @@ function ToolTimeline({ items }: { items: Extract<TranscriptItem, { role: "tool"
   </details>;
 }
 
+// Verb pair per tool, so a call reads as an action ("Read", "Ran") rather than
+// its wire name. The settled verb shows once done, the active one while running.
+const TOOL_VERBS: Record<string, [string, string]> = {
+  read: ["Read", "Reading"],
+  write: ["Wrote", "Writing"],
+  glob: ["Listed", "Listing"],
+  grep: ["Searched", "Searching"],
+  bash: ["Ran", "Running"],
+  shell: ["Ran", "Running"],
+  web: ["Fetched", "Fetching"],
+  task: ["Delegated", "Delegating"],
+  skill: ["Ran skill", "Running skill"],
+};
+
+/** Parse a tool call's argument JSON, tolerating a non-object or invalid payload. */
+function toolArguments(command: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(command) as unknown;
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** The primary argument, shown as the disclosure's chip (path, command, query…). */
+function primaryToolArgument(args: Record<string, unknown>): string {
+  for (const key of ["path", "command", "pattern", "query", "url", "agent", "name"]) {
+    const value = args[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  for (const value of Object.values(args)) {
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+// One tool invocation as the assistant-ui tool-call element: a single collapsed
+// line (verb, primary-argument chip, status) that expands to the raw request and
+// result. Never the `<tool_call>` payload the model emitted.
 function ToolCallView({ item }: { item: Extract<TranscriptItem, { role: "tool" }> }) {
   const terminal = item.name === "bash" || item.name === "shell";
-  return <details className={`tool-card ${terminal ? "terminal-tool" : ""}`} open>
+  const [verb, activeVerb] = TOOL_VERBS[item.name] ?? ["Called", "Calling"];
+  const query = primaryToolArgument(toolArguments(item.command));
+  const running = item.status === "running";
+  const failed = item.status === "error";
+  return <details className={`tool-card ${terminal ? "terminal-tool" : ""}`}>
     <summary className="tool-card-top">
       <div className="tool-symbol"><TerminalSquare size={15} /></div>
-      <div><strong>{item.name}</strong><span>{item.command}</span></div>
-      <span className={`tool-status ${item.status}`}><span /> {item.status === "running" ? "Running" : item.status === "error" ? "Failed" : "Completed"}</span>
+      <div><strong>{running ? activeVerb : verb}</strong><span className="tool-call-query" title={query || item.name}>{query || item.name}</span></div>
+      <span className={`tool-status ${item.status}`}><span /> {running ? "Running" : failed ? "Failed" : "Completed"}</span>
     </summary>
-    <div className={`tool-output ${terminal ? "terminal-output" : ""}`}><span className="tool-output-label">{terminal ? "Terminal output" : item.status === "error" ? "Tool error" : "Tool result"}</span>{item.output}</div>
+    <div className="tool-output"><span className="tool-output-label">Request</span>{item.command || "{}"}</div>
+    <div className={`tool-output ${terminal ? "terminal-output" : ""}`}><span className="tool-output-label">{failed ? "Tool error" : terminal ? "Terminal output" : "Tool result"}</span>{item.output || (running ? "Running…" : "")}</div>
   </details>;
 }
 
