@@ -75,9 +75,22 @@ linux-cuda only** checked (a manual run builds only that variant; the CPU and
 macOS jobs run on tag pushes). At load time the model's GPU plan is auto-fitted
 to the memory actually free, so it does not blindly offload every layer.
 
-To build a CUDA variant locally, point the build at the CUDA toolkit and — for a
-much faster compile — at just your GPU's compute capability (`86` is Ampere /
-RTX 30-series; `75` Turing, `80` A100, `89` Ada, `90` Hopper):
+The demo ships a wrapper that runs Tauri with the `cuda` feature and does the
+build setup for you — a coherent CUDA toolkit, position-independent CUDA objects
+for the cdylib link, and (on glibc ≥ 2.41) a header shim for the `rsqrt`
+exception-specification clash:
+
+```bash
+npm run tauri:dev:cuda     # or: npm run tauri:build:cuda
+```
+
+It defaults `CMAKE_CUDA_ARCHITECTURES` to the detected GPU's compute capability
+(override with `CMAKE_CUDA_ARCHITECTURES=89 npm run tauri:build:cuda`). At load
+time the server auto-fits the GPU plan to the memory actually free.
+
+To build a CUDA variant locally by hand, point the build at the CUDA toolkit and
+— for a much faster compile — at just your GPU's compute capability (`86` is
+Ampere / RTX 30-series; `75` Turing, `80` A100, `89` Ada, `90` Hopper):
 
 ```bash
 export PATH="/usr/local/cuda-12.6/bin:$PATH" \

@@ -80,6 +80,20 @@ The desktop assistant path does **not** use `/ws`, `/health`, `/local-models`, l
 
 The Tauri host starts one `IpcService` around `ServerState`; it does not duplicate provider, tool, approval, MCP, attachment, session, or local-model logic. The same service powers the IPC commands and the HTTP/WebSocket routes.
 
+### CUDA (NVIDIA) desktop
+
+To run the desktop shell against the GPU (llama.cpp offloads, and the server
+auto-fits the plan to the memory actually free), use the wrapper instead of the
+plain Tauri command — it sets up the toolkit, the position-independent CUDA
+objects the cdylib needs, and a glibc/CUDA header shim:
+
+```bash
+npm run tauri:dev:cuda     # or: npm run tauri:build:cuda
+```
+
+It defaults `CMAKE_CUDA_ARCHITECTURES` to the detected GPU; override it with
+`CMAKE_CUDA_ARCHITECTURES=89 npm run tauri:build:cuda`.
+
 ## 5. Build and validate
 
 ```bash

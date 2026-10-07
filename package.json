@@ -16,7 +16,9 @@
     "start": "npm run dev",
     "tauri": "npm run tauri --prefix demo",
     "tauri:dev": "npm run tauri:dev --prefix demo",
-    "tauri:build": "npm run tauri:build --prefix demo"
+    "tauri:build": "npm run tauri:build --prefix demo",
+    "tauri:dev:cuda": "npm run tauri:dev:cuda --prefix demo",
+    "tauri:build:cuda": "npm run tauri:build:cuda --prefix demo"
   },
   "devDependencies": {
     "@tauri-apps/api": "^2.12.1",

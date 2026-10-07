@@ -12,6 +12,8 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
+    "tauri:dev:cuda": "node scripts/tauri-cuda.mjs dev",
+    "tauri:build:cuda": "node scripts/tauri-cuda.mjs build",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
