@@ -11,9 +11,11 @@ export default defineConfig(() => ({
   resolve: {
     dedupe: ["react", "react-dom"],
     alias: {
+      "@rigai/assistant-ui/tauri": new URL("../packages/assistant-ui/src/tauri/index.ts", import.meta.url).pathname,
+      "@rigai/assistant-ui/protocol": new URL("../packages/assistant-ui/src/protocol/index.ts", import.meta.url).pathname,
+      "@rigai/assistant-ui/http": new URL("../packages/assistant-ui/src/http/index.ts", import.meta.url).pathname,
       "@rigai/assistant-ui": new URL("../packages/assistant-ui/src/index.ts", import.meta.url).pathname,
-      "@haymant/transport-http": new URL("../packages/transport-http/src/index.ts", import.meta.url).pathname,
-    },
+      },
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

@@ -1,18 +1,18 @@
 # RIGA
 
-RIGA is a desktop-first coding-agent application built around a transport-neutral Rust kernel, Rig agent execution, a bidirectional WebSocket adapter, and a React/assistant-ui-inspired interface.
+RIGA is a desktop-first coding-agent application built around a transport-neutral Rust kernel, Rig agent execution, and a reusable `@rigai/assistant-ui` surface. Browser consumers use HTTP/WebSocket framing; desktop consumers use in-process Tauri IPC commands and events.
 
 > **Status:** early development (`0.1.0`). APIs, persistence formats, and package names may change before the first stable release.
 
 ## Architecture
 
 ```text
-React/Vite UI ── WebSocket ── riga-server ── riga-kernel ── Rig 0.43
-      │                         │                 │
-      ├─ composer + tools        ├─ HTTP/SSE      ├─ durable sessions
-      ├─ attachments             ├─ encrypted     ├─ event journal
-      └─ local preview           │  provider      └─ policy boundary
-                                └─ workspace tools
+@rigai/assistant-ui ── HTTP/WebSocket ──┐
+                  └── Tauri IPC ────────┼── riga-server ── riga-kernel ── Rig 0.43
+                                       │       │                 │
+                                       │       ├─ provider/tools  ├─ durable sessions
+                                       │       ├─ approvals/MCP   ├─ event journal
+                                       │       └─ persistence     └─ policy boundary
 ```
 
 The workspace is a **single Git repository and a multi-language monorepo**. It does not use Git submodules.
@@ -22,10 +22,10 @@ The workspace is a **single Git repository and a multi-language monorepo**. It d
 - `crates/riga-kernel` — transport-free agent kernel, state, events, policy, and persistence abstractions.
 - `crates/riga-server` — authenticated HTTP/WebSocket adapter, provider loop, tools, encrypted store, and temporary attachments.
 - `crates/riga-cli` — command-line adapter boundary.
-- `apps/riga` — thin Vite entry that mounts `@rigai/assistant-ui` inside a Tauri shell.
-- `packages/assistant-ui` — the assistant chat surface (transcript, tool timeline, composer, settings, model manager) and its stylesheet.
-- `packages/transport-http` — browser WebSocket transport client.
-- `packages/transport-tauri` — Tauri transport boundary.
+- `demo` — reference React + Tauri consumer and browser development app.
+- `packages/assistant-ui` — the assistant surface plus `protocol`, `http`, and `tauri` transport subpaths.
+- `crates/riga-server/src/ipc.rs` — reusable in-process service used by the Tauri host.
+- `packages/transport-http` and `packages/transport-tauri` — compatibility packages for older consumers.
 
 ## Requirements
 
@@ -49,18 +49,19 @@ The local GGUF context window is capped at `32768` tokens (the KV cache is sized
 
 Never commit `.env.local`, provider keys, `RIGA_TOKEN`, or uploaded files. The API key is encrypted at rest by the server store and is write-only from the browser.
 
-### Desktop shell
+### Reference demo and desktop shell
 
 ```bash
-npm install
-npm run tauri:dev
+npm install --prefix demo
+npm run dev --prefix demo       # browser HTTP/WebSocket mode
+npm run tauri dev --prefix demo # desktop Tauri IPC mode
 ```
 
-`tauri:dev` starts the kernel adapter and the Vite server through `beforeDevCommand`, then opens the native window against `http://127.0.0.1:1420`. Do not run `npm run dev` at the same time; port `1420` has `strictPort` enabled and both flows claim it. `npm run tauri:build` bundles a release app; that build hosts `riga-server` inside the shell and hands the surface its loopback origin through the `server_url` command.
+`demo/` is the reference consumer. Browser mode starts `riga-server` on `127.0.0.1:8787` and uses the Vite proxy. Tauri mode starts `riga-server` in-process and passes `createTauriTransport` to `AssistantUI`; assistant operations use only `invoke` and Tauri events, with no HTTP loopback fallback. See [`demo/README.md`](demo/README.md) for the complete step-by-step integration and provider/model checks.
 
 Linux desktop builds need the WebKitGTK development packages (`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`, plus the usual `build-essential` and `pkg-config`).
 
-The packaged build does not use the Vite proxy. Its webview loads from `tauri://localhost`, so the shell binds `riga-server` on `127.0.0.1:0` (release only) and passes that absolute origin to `AssistantUI`'s `serverUrl`. The server answers the webview's cross-origin `fetch` and `EventSource` calls with a permissive CORS policy, and the window CSP permits `http://127.0.0.1:*` and `ws://127.0.0.1:*`, so the WebSocket and the local-model manager work without a proxy. The browser build and `tauri:dev` pass no origin and keep resolving against the page origin, so that path is unchanged. `packages/transport-tauri` stays a stub; a native IPC transport is still roadmap work and is not required for the packaged app.
+The packaged build also uses the Tauri IPC path. Its webview does not need a server URL, HTTP proxy, browser WebSocket, or EventSource permission for assistant operations. `riga-server` remains the single application/runtime owner behind both transport adapters.
 
 ### GPU builds
 
@@ -142,7 +143,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 npm run check
 npm test
-npm run build --workspace @riga/desktop-ui
+npm install --prefix demo
+npm run build --prefix demo
+cargo check --manifest-path demo/src-tauri/Cargo.toml --locked
 ```
 
 ## Publishing
@@ -155,7 +158,7 @@ cargo publish --dry-run -p riga-server
 cargo publish --dry-run -p riga-cli
 ```
 
-The release workflow publishes crates on `v*` tags when `CARGO_REGISTRY_TOKEN` is configured. Public npm packages use the `@haymant` scope and publish through the release workflow when `NPM_TOKEN` is configured.
+The release workflow publishes crates on `v*` tags when `CARGO_REGISTRY_TOKEN` is configured. Public npm packages use the `@rigai` scope and publish through the release workflow when `NPM_TOKEN` is configured. The assistant package’s `protocol`, `http`, and `tauri` exports are part of the published package.
 
 Create a release tag only after the validation workflow is green:
 

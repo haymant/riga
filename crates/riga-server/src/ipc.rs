@@ -126,6 +126,75 @@ impl IpcService {
         })
     }
 
+    pub async fn list_mcp_registry(&self) -> Vec<catalog::McpServerSummary> {
+        self.state
+            .mcp_registry
+            .read()
+            .await
+            .iter()
+            .map(|record| record.summary.clone())
+            .collect()
+    }
+
+    pub async fn save_mcp_registry(
+        &self,
+        request: crate::McpRegistryRequest,
+    ) -> Result<Vec<catalog::McpServerSummary>, String> {
+        let name = request.name.trim();
+        if name.is_empty() || !matches!(request.transport.as_str(), "stdio" | "http") {
+            return Err("name and transport (stdio or http) are required".into());
+        }
+        if request.transport == "http" && request.url.as_deref().unwrap_or("").trim().is_empty() {
+            return Err("HTTP stream URL is required".into());
+        }
+        let summary = catalog::McpServerSummary {
+            name: name.into(),
+            command: request
+                .command
+                .clone()
+                .unwrap_or_else(|| "http-stream".into()),
+            args: request.args.clone(),
+            tools: if name.starts_with("riga-health-") {
+                vec!["health".into()]
+            } else {
+                Vec::new()
+            },
+            transport: Some(request.transport.clone()),
+            url: request.url.clone(),
+            api_key_configured: request
+                .api_key
+                .as_deref()
+                .is_some_and(|key| !key.is_empty()),
+        };
+        let record = catalog::McpServerRecord {
+            summary,
+            api_key: request.api_key.filter(|key| !key.is_empty()),
+        };
+        let mut registry = self.state.mcp_registry.write().await;
+        registry.retain(|existing| existing.summary.name != record.summary.name);
+        registry.push(record);
+        let snapshot = registry.clone();
+        drop(registry);
+        if let Some(store) = &self.state.secure_store {
+            store
+                .save("mcp_registry", &snapshot)
+                .map_err(|error| error.to_string())?;
+        } else {
+            std::fs::write(
+                self.state.workspace_root.join(".riga-mcp-registry.json"),
+                serde_json::to_vec_pretty(&snapshot).unwrap_or_default(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        Ok(snapshot.into_iter().map(|record| record.summary).collect())
+    }
+
+    pub fn subscribe_local_models(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::local_model::LocalModelEvent> {
+        self.state.local_models.subscribe()
+    }
+
     pub async fn start_run(
         &self,
         run_id: String,

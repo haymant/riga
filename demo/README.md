@@ -1,21 +1,96 @@
-# RIGA desktop demo
+# RIGA demo
 
-This directory is the first independent consumer application for RIGA. It is intentionally created with the official Tauri application generator before adding RIGA-specific code.
+`demo/` is the reference React + Tauri consumer for RIGA. It is generated with `create-tauri-app` and keeps the assistant UI thin: application behavior remains in `riga-server`, while the browser and desktop transports only frame requests and events.
 
 ## 1. Prerequisites
 
-Install:
-
-- Node.js 22+
-- npm
+- Node.js 22+ and npm
 - Rust 1.99.0+
-- Tauri desktop prerequisites for your operating system
+- Tauri prerequisites for the target operating system
+- An OpenAI-compatible endpoint, or a machine suitable for a local GGUF model
 
-On Ubuntu, the Tauri prerequisites include GTK/WebKit development packages and `librsvg2-dev`.
+On Ubuntu, install GTK/WebKit development packages and `librsvg2-dev`.
 
-## 2. Recreate the generated Tauri app
+## 2. Install the demo
 
 From the repository root:
+
+```bash
+npm install --prefix demo
+```
+
+During development, the demo uses the current transport-injection source package:
+
+```json
+"@rigai/assistant-ui": "file:../packages/assistant-ui"
+```
+
+After the next assistant-ui release containing the injection API, replace it with the published version, for example:
+
+```json
+"@rigai/assistant-ui": "^0.1.4"
+```
+
+The Rust demo currently uses path dependencies for `riga-kernel` and `riga-server`. Replace those paths with the corresponding published crate versions when the IPC surface is released.
+
+## 3. Browser development
+
+Run the kernel and Vite together:
+
+```bash
+npm run dev --prefix demo
+```
+
+Open <http://localhost:1420>. Browser mode uses the HTTP/WebSocket adapter and Vite proxies `/health`, `/catalog`, `/sessions`, `/mcp`, `/attachments`, `/local-models`, and `/ws` to `riga-server` on `127.0.0.1:8787`.
+
+To test an OpenAI-compatible provider:
+
+1. Open **Settings**.
+2. Choose the remote provider.
+3. Enter the endpoint, API key, model, API mode, and reasoning effort.
+4. Save the provider and send a message.
+
+To test a local model:
+
+1. Open **Settings → Local GGUF model**.
+2. Refresh the catalog and download a model.
+3. Wait for download progress to finish, then load the model.
+4. Choose **Use this model** and send a message.
+
+Provider settings and model state are persisted by the server’s configured backend.
+
+## 4. Desktop development with Tauri IPC
+
+Start the generated desktop shell with:
+
+```bash
+npm run tauri dev --prefix demo
+```
+
+The entrypoint detects the Tauri runtime and passes `createTauriTransport` to `AssistantUI`. Desktop assistant operations use only Tauri `invoke` commands and Tauri events:
+
+- `riga://run-event`
+- `riga://local-model-event`
+- `riga://provider-configured`
+- `riga://transport-error`
+
+The desktop assistant path does **not** use `/ws`, `/health`, `/local-models`, loopback URLs, `fetch`, `EventSource`, or browser WebSocket APIs. The Vite HTTP proxy is retained only for browser development.
+
+The Tauri host starts one `IpcService` around `ServerState`; it does not duplicate provider, tool, approval, MCP, attachment, session, or local-model logic. The same service powers the IPC commands and the HTTP/WebSocket routes.
+
+## 5. Build and validate
+
+```bash
+npm run typecheck --prefix demo
+npm run build --prefix demo
+cargo check --manifest-path demo/src-tauri/Cargo.toml --locked
+```
+
+The verified build produces `demo/dist/` and compiles the Tauri host with the in-process IPC service.
+
+## 6. Generated-app baseline
+
+To recreate the initial shell used for this demo:
 
 ```bash
 rm -rf demo
@@ -26,116 +101,4 @@ npm create tauri-app@latest demo -- \
   --yes
 ```
 
-The generator used for this app is `create-tauri-app@4.7.4`. It creates the React/Vite frontend, Rust Tauri host, icons, capability file, and build scripts.
-
-## 3. Install dependencies
-
-```bash
-npm install --prefix demo
-```
-
-The generated application remains a private package named `riga`. The first integration uses a related filesystem path rather than a published npm package:
-
-```json
-{
-  "dependencies": {
-    "@rigai/assistant-ui": "file:../packages/assistant-ui"
-  }
-}
-```
-
-This is deliberate. It lets the demo validate the current source package before the release workflow switches it to a registry version.
-
-## 4. Import the assistant UI
-
-The React entrypoint imports the reusable surface directly from the related package:
-
-```tsx
-import { AssistantUI } from "@rigai/assistant-ui";
-
-export function App() {
-  return <AssistantUI showSessionHistoryButton fullWidth />;
-}
-```
-
-`AssistantUI` owns its transcript, settings, session history controls, composer, model manager, and stylesheet. The host only supplies the surrounding layout and optional runtime properties.
-
-## 5. Import the kernel from the related Rust path
-
-The generated Tauri crate references the repository kernel without publishing a new crate first:
-
-```toml
-[dependencies]
-riga-kernel = { path = "../../crates/riga-kernel" }
-```
-
-The demo registers a small `kernel_health` command backed by `riga_kernel::Agent`. The header displays the returned health value, proving that the generated Tauri shell and the RIGA kernel are connected independently of the assistant transport.
-
-## 6. Validate the first integration
-
-From the repository root:
-
-```bash
-npm install --prefix demo
-npm run typecheck --prefix demo
-npm run build --prefix demo
-cargo check --manifest-path demo/src-tauri/Cargo.toml
-```
-
-For an interactive desktop check:
-
-```bash
-npm run tauri dev --prefix demo
-```
-
-Expected result:
-
-1. A window titled **RIGA** opens.
-2. The header shows a `kernel:` health result.
-3. The RIGA assistant surface renders below the header.
-4. Assistant requests can be tested through the Vite proxy using an OpenAI-compatible provider or a loaded local GGUF model.
-
-## 7. Run the web app with the kernel
-
-The browser development command starts both processes:
-
-```bash
-npm run dev
-```
-
-This runs:
-
-- `riga-server` on `http://127.0.0.1:8787`
-- Vite on `http://localhost:1420`
-
-Vite proxies `/ws`, `/catalog`, `/sessions`, `/mcp`, `/attachments`, `/health`, and `/local-models` to the kernel. Open <http://localhost:1420> for manual verification.
-
-### OpenAI-compatible endpoint
-
-1. Open **Settings** in the RIGA surface.
-2. Select the remote/OpenAI-compatible provider.
-3. Enter the endpoint, API key, model, API mode, and reasoning effort.
-4. Save the provider, then send a message.
-
-Provider settings are sent through the WebSocket and persisted by the RIGA server according to its configured persistence backend.
-
-### Local GGUF model
-
-1. Open **Settings** and select **Local GGUF model**.
-2. Refresh the curated catalog.
-3. Download a model, wait for the download event to finish, and load it.
-4. Choose **Use this model**, then send a message.
-
-The browser demo uses the same `/local-models` HTTP and event-stream routes as the desktop shell, so download and load behavior can be validated before packaging.
-
-## 8. Next integration stages
-
-The changes are intentionally staged:
-
-1. **Current:** generated Tauri app, related-path `riga-kernel`, related-path `@rigai/assistant-ui`.
-2. Add the thin embedded `riga-server` adapter and provide its runtime URL to `AssistantUI`.
-3. Validate Linux, Windows, and macOS builds from `demo/`.
-4. Replace filesystem dependencies with published npm and crates.io versions.
-5. Update the GitHub release workflow to build `demo/` and publish the RIGA desktop artifacts.
-
-The demo must pass its source-path validation before step 4 changes any dependency to a registry version.
+The generated shell was created by `create-tauri-app@4.7.4`; RIGA-specific integration is then added through the package and Rust dependencies described above.

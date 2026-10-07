@@ -17,7 +17,6 @@
     "react-dom": "^19.1.0",
     "@tauri-apps/api": "^2",
     "@rigai/assistant-ui": "file:../packages/assistant-ui",
-    "@haymant/transport-http": "file:../packages/transport-http",
     "@tauri-apps/plugin-opener": "^2"
   },
   "devDependencies": {

@@ -28,6 +28,16 @@ fn kernel_health(agent: State<'_, Agent>) -> Health {
 }
 
 #[tauri::command]
+fn riga_transport_connect() -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
+fn riga_transport_disconnect() -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
 async fn riga_health(service: State<'_, IpcService>) -> Result<HealthResponse, String> {
     Ok(service.health())
 }
@@ -50,6 +60,21 @@ async fn riga_create_session(
     request: CreateSessionRequest,
 ) -> Result<riga_kernel::state::Session, String> {
     service.create_session(request).await
+}
+
+#[tauri::command]
+async fn riga_list_mcp_registry(
+    service: State<'_, IpcService>,
+) -> Result<Vec<riga_server::catalog::McpServerSummary>, String> {
+    Ok(service.list_mcp_registry().await)
+}
+
+#[tauri::command]
+async fn riga_save_mcp_registry(
+    service: State<'_, IpcService>,
+    request: riga_server::McpRegistryRequest,
+) -> Result<Vec<riga_server::catalog::McpServerSummary>, String> {
+    service.save_mcp_registry(request).await
 }
 
 #[tauri::command]
@@ -92,6 +117,17 @@ async fn forward_events(
         let _ = app.emit("riga://run-event", event);
         if terminal {
             break;
+        }
+    }
+}
+
+async fn forward_local_model_events(
+    app: AppHandle,
+    mut events: tokio::sync::broadcast::Receiver<riga_server::local_model::LocalModelEvent>,
+) {
+    while let Ok(event) = events.recv().await {
+        if let Ok(payload) = serde_json::to_value(event) {
+            let _ = app.emit("riga://local-model-event", payload);
         }
     }
 }
@@ -181,16 +217,21 @@ async fn riga_upload_attachment(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let service = IpcService::new(ServerState::default());
+    let local_model_events = service.subscribe_local_models();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(Agent::new())
         .manage(service)
         .invoke_handler(tauri::generate_handler![
             kernel_health,
+            riga_transport_connect,
+            riga_transport_disconnect,
             riga_health,
             riga_catalog,
             riga_list_sessions,
             riga_create_session,
+            riga_list_mcp_registry,
+            riga_save_mcp_registry,
             riga_configure_provider,
             riga_start_run,
             riga_resume_run,
@@ -200,6 +241,13 @@ pub fn run() {
             riga_local_model_action,
             riga_upload_attachment,
         ])
+        .setup(move |app| {
+            tauri::async_runtime::spawn(forward_local_model_events(
+                app.handle().clone(),
+                local_model_events,
+            ));
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
