@@ -1,5 +1,6 @@
 import { Component, useEffect, useMemo, useRef, useState, type ReactNode, type SetStateAction } from "react";
-import { RigaWebSocketClient, LocalModelClient, formatBytes, reduceDownloadState, type DownloadState, type LocalModelOverview, type RigaEventEnvelope } from "./http";
+import { createHttpTransport, formatBytes, reduceDownloadState } from "./http";
+import type { DownloadState, LocalModelOverview, RigaEventEnvelope, RigaTransport, RigaTransportListeners } from "./protocol";
 import {
   Bot,
   Check,
@@ -70,27 +71,6 @@ function newId(): string {
   return `id-${Date.now().toString(36)}-${idCounter.toString(36)}`;
 }
 
-/** Absolute request URL: the server origin when out-of-band, else the relative
- *  path. An empty base URL keeps the browser build same-origin so the dev proxy
- *  and Vite's SPA fallback keep working unchanged. */
-function apiUrl(baseUrl: string, path: string): string {
-  return baseUrl ? `${baseUrl}${path}` : path;
-}
-
-/**
- * Resolve the run-control WebSocket from the server origin.
- *
- * With an empty base URL the page's own origin is used, which is the browser and
- * `tauri:dev` path behind the Vite proxy. The packaged desktop app passes the
- * loopback origin of the server it hosts, avoiding the `ws://<asset-host>/ws`
- * URL that a `tauri://` page would otherwise build.
- */
-function resolveWebSocketUrl(baseUrl: string): string {
-  const origin = baseUrl || `${window.location.protocol}//${window.location.host}`;
-  const url = new URL(origin);
-  const protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${url.host}/ws`;
-}
 
 type Role = "user" | "assistant" | "system";
 type Session = { id: string; title: string; meta: string; active?: boolean };
@@ -156,18 +136,20 @@ function loadLocal<T>(key: string, fallback: T): T {
   }
 }
 
-export type AssistantUIProps = AssistantUiOptions;
+export type AssistantUIProps = AssistantUiOptions & {
+  /** Supply a transport explicitly for desktop, tests, or another host runtime. */
+  transport?: RigaTransport;
+  /** Create a transport after the UI installs its event listeners. */
+  transportFactory?: (listeners: RigaTransportListeners) => RigaTransport;
+};
 
 function AssistantUIInner({
   showSessionHistoryButton = DEFAULT_ASSISTANT_UI_OPTIONS.showSessionHistoryButton,
   fullWidth: initialFullWidth = DEFAULT_ASSISTANT_UI_OPTIONS.fullWidth,
   serverUrl,
+  transport: suppliedTransport,
+  transportFactory,
 }: AssistantUIProps = {}) {
-  // Origin of the out-of-band RIGA server, or "" when same-origin. Everything
-  // below derives from it: the catalog, attachments, MCP registry, the
-  // local-model client, and the run-control WebSocket.
-  const apiBaseUrl = serverUrl ?? "";
-  const localModelClient = useMemo(() => new LocalModelClient(apiBaseUrl), [apiBaseUrl]);
   const [sessions, setSessions] = useState<Session[]>(() => loadLocal("riga.sessions.v1", initialSessions));
   const [sessionTranscripts, setSessionTranscripts] = useState<Record<string, TranscriptItem[]>>(() => loadLocal("riga.transcripts.v1", sessionHistories));
   const [draft, setDraft] = useState("");
@@ -218,7 +200,7 @@ function AssistantUIInner({
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [workspaceFiles, setWorkspaceFiles] = useState<FileCandidate[]>([]);
   const [mcpServers, setMcpServers] = useState<McpServerSummary[]>([]);
-  const transportRef = useRef<RigaWebSocketClient | null>(null);
+  const transportRef = useRef<RigaTransport | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
   const catalogRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
@@ -330,16 +312,14 @@ function AssistantUIInner({
   }, [catalogOpen]);
 
   useEffect(() => {
-    void fetch(apiUrl(apiBaseUrl, "/catalog")).then((response) => response.json()).then((value: { tools?: CatalogItem[]; agents?: AgentSummary[]; files?: FileCandidate[]; skills?: SkillSummary[]; mcp_servers?: McpServerSummary[] }) => {
-      setCatalogItems(value.tools ?? []);
-      setAgents(value.agents ?? []);
-      setWorkspaceFiles(value.files ?? []);
-      setSkills(value.skills ?? []);
-      setMcpServers(value.mcp_servers ?? []);
-    }).catch(() => undefined);
-    const client = new RigaWebSocketClient({
-      url: resolveWebSocketUrl(apiBaseUrl),
+    const listeners: RigaTransportListeners = {
       onStatus: setTransportStatus,
+      onLocalModelEvent: (event) => {
+        setDownloads((current) => reduceDownloadState(current, event));
+        if (event.type === "download_finished" || event.type === "download_failed") {
+          void transportRef.current?.listLocalModels().then(setLocalModels).catch(() => undefined);
+        }
+      },
       onProviderConfigured: (endpoint, model, effort, kind, api, subagent) => {
         // Endpoint and model are echoed even for a local provider so the remote
         // form survives a switch to local. `kind` decides what runs use.
@@ -432,11 +412,19 @@ function AssistantUIInner({
           setPendingApproval((current) => current && current.approvalId === resolved.approval_id ? null : current);
         }
       },
-    });
+    };
+    const client = suppliedTransport ?? transportFactory?.(listeners) ?? createHttpTransport(serverUrl ?? "", listeners);
     transportRef.current = client;
+    void client.catalog().then((value) => {
+      setCatalogItems((value.tools as CatalogItem[] | undefined) ?? []);
+      setAgents((value.agents as AgentSummary[] | undefined) ?? []);
+      setWorkspaceFiles((value.files as FileCandidate[] | undefined) ?? []);
+      setSkills((value.skills as SkillSummary[] | undefined) ?? []);
+      setMcpServers((value.mcp_servers as McpServerSummary[] | undefined) ?? []);
+    }).catch(() => undefined);
     client.connect().catch(() => setTransportStatus("error"));
     return () => client.close();
-  }, [apiBaseUrl]);
+  }, [serverUrl, suppliedTransport, transportFactory]);
 
   // A phone that was locked, a tab that was backgrounded, or a network that just
   // came back should reconnect at once rather than wait out a backoff timer that
@@ -455,12 +443,12 @@ function AssistantUIInner({
 
   const refreshLocalModels = useMemo(() => async () => {
     try {
-      setLocalModels(await localModelClient.overview());
+      setLocalModels(await transportRef.current?.listLocalModels() ?? null);
       setModelError(null);
     } catch (error) {
       setModelError(error instanceof Error ? error.message : "Local model manager is unavailable");
     }
-  }, [localModelClient]);
+  }, []);
 
   // The model manager is opened from Settings, so the catalog is fetched when
   // that panel first appears rather than on every render. The event subscription
@@ -478,18 +466,6 @@ function AssistantUIInner({
     if (transportStatus !== "connected") return;
     void refreshLocalModels();
   }, [transportStatus, refreshLocalModels]);
-
-  useEffect(() => {
-    const unsubscribe = localModelClient.subscribe((event) => {
-      setDownloads((current) => reduceDownloadState(current, event));
-      // A finished or failed transfer changes what is on disk, so re-read the
-      // authoritative list rather than guessing from the event.
-      if (event.type === "download_finished" || event.type === "download_failed") {
-        void refreshLocalModels();
-      }
-    });
-    return unsubscribe;
-  }, [refreshLocalModels]);
 
   async function runModelAction(label: string, action: () => Promise<void>) {
     setModelBusy(label);
@@ -577,12 +553,9 @@ function AssistantUIInner({
   async function uploadAttachments(files: FileList | null) {
     if (!files?.length) return;
     for (const file of Array.from(files)) {
-      const form = new FormData();
-      form.append("file", file, file.name);
       try {
-        const response = await fetch(apiUrl(apiBaseUrl, "/attachments"), { method: "POST", body: form });
-        const uploaded = (await response.json()) as Attachment & { error?: string };
-        if (!response.ok) throw new Error(uploaded.error ?? "attachment upload failed");
+        const uploaded = await transportRef.current?.uploadAttachment(file);
+        if (!uploaded) throw new Error("transport is not connected");
         setAttachments((current) => [...current, uploaded]);
         setToast(`${file.name} uploaded to the temporary workspace`);
       } catch (error) {
@@ -638,10 +611,9 @@ function AssistantUIInner({
       return;
     }
     try {
-      const response = await fetch(apiUrl(apiBaseUrl, "/mcp/registry"), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, transport: connectorDraft.transport, command: connectorDraft.transport === "stdio" ? connectorDraft.command.trim() : undefined, args: connectorDraft.args.trim() ? connectorDraft.args.trim().split(/\s+/) : [], url: connectorDraft.transport === "http" ? connectorDraft.url.trim() : undefined, api_key: connectorDraft.transport === "http" ? connectorDraft.apiKey.trim() || undefined : undefined }) });
-      const payload = await response.json().catch(() => ({})) as McpServerSummary & { error?: string };
-      if (!response.ok) { setToast(payload.error ?? `Connector could not be persisted (${response.status})`); return; }
-      const updated = [...allConnectors.filter((server) => server.name !== name), payload];
+      const payload = await transportRef.current?.saveMcpRegistry({ name, transport: connectorDraft.transport, command: connectorDraft.transport === "stdio" ? connectorDraft.command.trim() : undefined, args: connectorDraft.args.trim() ? connectorDraft.args.trim().split(/\s+/) : [], url: connectorDraft.transport === "http" ? connectorDraft.url.trim() : undefined, api_key: connectorDraft.transport === "http" ? connectorDraft.apiKey.trim() || undefined : undefined });
+      if (!payload) { setToast("Connector could not be persisted: transport is unavailable"); return; }
+      const updated = payload;
       setMcpServers(updated);
       setEditingConnector(null);
       setToast(`Connector ${name} saved`);
@@ -705,7 +677,7 @@ function AssistantUIInner({
               <button className="icon-button chat-header-button" aria-label="New chat" title="New chat" onClick={createSession}><Plus size={16} /></button>
             </div>
             {historyOpen && <div className="chat-popover history-popover"><div className="chat-popover-header"><strong>Chat history</strong><button className="outline-button" onClick={createSession}><Plus size={13} /> New chat</button></div><nav className="compact-session-list" aria-label="Chat history">{sessions.map((session) => <button key={session.id} className={`compact-session-item ${session.active ? "active" : ""}`} onClick={() => selectSession(session.id)}><MessageSquare size={14} /><span><strong>{session.title}</strong><small>{session.meta}</small></span></button>)}</nav></div>}
-            {settingsOpen && <section className="chat-popover settings-popover"><div className="settings-panel-header"><div><p className="eyebrow">RUNTIME / PROVIDER</p><h2>Connect your model.</h2><p>Endpoint and model restore after reload. The API key is sent over WebSocket and retained only in the server's encrypted store.</p></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><div className="provider-tabs"><button className={providerMode === "remote" ? "selected" : ""} onClick={() => setProviderMode("remote")}>OpenAI-compatible / OpenCode Go</button><button className={providerMode === "local" ? "selected" : ""} onClick={() => setProviderMode("local")}>Local GGUF model</button></div>{providerMode === "remote" ? <div className="provider-form"><label>API endpoint<input value={providerEndpoint} onChange={(event) => setProviderEndpoint(event.target.value)} placeholder="https://api.example.com/v1" /></label><label>API key <span>encrypted at rest</span><input type="password" value={providerApiKey} onChange={(event) => setProviderApiKey(event.target.value)} placeholder="sk-…" autoComplete="off" /></label><label>Model<input value={providerModel} onChange={(event) => setProviderModel(event.target.value)} placeholder="opencode-go / gpt-4o-mini" /></label><label>API<select value={providerApi} onChange={(event) => setProviderApi(event.target.value as "chat" | "responses")}><option value="chat">Chat completions (compatible)</option><option value="responses">Responses API (OpenAI)</option></select></label><label>Subagent model <span>optional</span><input value={subagentModel} onChange={(event) => setSubagentModel(event.target.value)} placeholder="cheap model for explore/plan" /></label><label>Reasoning effort<select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label><button className="approve-button settings-save" onClick={() => void saveProvider()}><Check size={15} /> Save securely</button></div> : <div className="local-model-panel"><div className="local-model-head"><div className="tool-symbol"><Bot size={17} /></div><div><strong>Local GGUF models</strong><p>Download a curated GGUF and run it in this process through llama.cpp. Runs on {localModels?.accelerator ?? "the local CPU"}{localModels?.accelerator?.includes("CPU") ? " — build with `--features cuda` for GPU offload." : "."}</p></div></div>{modelError && <p className="model-error">{modelError}</p>}<div className="model-section"><div className="model-section-title"><span>Downloaded</span><button className="outline-button" onClick={() => void refreshLocalModels()} disabled={modelBusy !== null}>Refresh</button></div>{!localModels && <p className="model-empty">Loading the model manager…</p>}{localModels?.installed.length === 0 && <p className="model-empty">No models yet. Download one below; it is verified against a pinned SHA-256 before use.</p>}{localModels?.installed.map((model) => { const state = downloads[model.id]; return <div className="model-row" key={model.path}><div className="model-row-main"><strong>{model.name}</strong><span>{formatBytes(model.size_bytes)} · {model.curated ? model.recommended_context ? `${model.recommended_context >= 1024 ? `${Math.round(model.recommended_context / 1024)}k` : model.recommended_context} ctx` : "curated GGUF" : "local GGUF"}</span></div><div className="model-row-actions">{state?.phase === "downloading" && <button className="outline-button" onClick={() => void runModelAction("cancel", () => localModelClient.cancelDownload(model.id))} disabled={modelBusy !== null}>{state.percent.toFixed(0)}% · Cancel</button>}{localModels.loaded === model.file_name ? <span className="model-loaded">Loaded</span> : <button className="approve-button" onClick={() => void runModelAction("load", () => localModelClient.load(model.path))} disabled={modelBusy !== null}>{modelBusy === "load" ? "Loading…" : "Load"}</button>}</div>{state?.phase === "downloading" && <div className="model-progress"><span style={{ width: `${Math.max(2, state.percent)}%` }} /></div>}{state?.phase === "failed" && <p className="model-error">{state.message}</p>}</div>; })}{localModels && <div className="model-section-title"><span>Curated catalog</span></div>}{localModels?.catalog.map((model) => { const state = downloads[model.id]; const already = localModels.installed.some((installed) => installed.id === model.id); return <div className="model-row" key={model.id}><div className="model-row-main"><strong>{model.name}</strong><span>{formatBytes(model.size_bytes)} · {model.quant} · {Math.round(model.recommended_context / 1024)}k ctx · <a href={model.license_url} target="_blank" rel="noreferrer">license</a></span></div><div className="model-row-actions">{already ? <span className="model-installed-tag">Installed</span> : state?.phase === "downloading" ? <button className="outline-button" onClick={() => void runModelAction("cancel", () => localModelClient.cancelDownload(model.id))} disabled={modelBusy !== null}>{state.percent.toFixed(0)}% · Cancel</button> : state?.phase === "finished" ? <span className="model-installed-tag">Ready</span> : <button className="approve-button" onClick={() => void runModelAction("download", () => localModelClient.download(model.id))} disabled={modelBusy !== null}>{modelBusy === "download" ? "Starting…" : "Download"}</button>}</div>{state?.phase === "downloading" && <div className="model-progress"><span style={{ width: `${Math.max(2, state.percent)}%` }} /></div>}{state?.phase === "failed" && <p className="model-error">{state.message}</p>}</div>; })}</div><button className="approve-button settings-save" onClick={() => void saveProvider()} disabled={!localModels?.loaded}><Check size={15} /> Use this model</button>{!localModels?.loaded && <p className="model-hint">Load a model above to enable local runs.</p>}</div>}</section>}
+            {settingsOpen && <section className="chat-popover settings-popover"><div className="settings-panel-header"><div><p className="eyebrow">RUNTIME / PROVIDER</p><h2>Connect your model.</h2><p>Endpoint and model restore after reload. The API key is sent over WebSocket and retained only in the server's encrypted store.</p></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><div className="provider-tabs"><button className={providerMode === "remote" ? "selected" : ""} onClick={() => setProviderMode("remote")}>OpenAI-compatible / OpenCode Go</button><button className={providerMode === "local" ? "selected" : ""} onClick={() => setProviderMode("local")}>Local GGUF model</button></div>{providerMode === "remote" ? <div className="provider-form"><label>API endpoint<input value={providerEndpoint} onChange={(event) => setProviderEndpoint(event.target.value)} placeholder="https://api.example.com/v1" /></label><label>API key <span>encrypted at rest</span><input type="password" value={providerApiKey} onChange={(event) => setProviderApiKey(event.target.value)} placeholder="sk-…" autoComplete="off" /></label><label>Model<input value={providerModel} onChange={(event) => setProviderModel(event.target.value)} placeholder="opencode-go / gpt-4o-mini" /></label><label>API<select value={providerApi} onChange={(event) => setProviderApi(event.target.value as "chat" | "responses")}><option value="chat">Chat completions (compatible)</option><option value="responses">Responses API (OpenAI)</option></select></label><label>Subagent model <span>optional</span><input value={subagentModel} onChange={(event) => setSubagentModel(event.target.value)} placeholder="cheap model for explore/plan" /></label><label>Reasoning effort<select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label><button className="approve-button settings-save" onClick={() => void saveProvider()}><Check size={15} /> Save securely</button></div> : <div className="local-model-panel"><div className="local-model-head"><div className="tool-symbol"><Bot size={17} /></div><div><strong>Local GGUF models</strong><p>Download a curated GGUF and run it in this process through llama.cpp. Runs on {localModels?.accelerator ?? "the local CPU"}{localModels?.accelerator?.includes("CPU") ? " — build with `--features cuda` for GPU offload." : "."}</p></div></div>{modelError && <p className="model-error">{modelError}</p>}<div className="model-section"><div className="model-section-title"><span>Downloaded</span><button className="outline-button" onClick={() => void refreshLocalModels()} disabled={modelBusy !== null}>Refresh</button></div>{!localModels && <p className="model-empty">Loading the model manager…</p>}{localModels?.installed.length === 0 && <p className="model-empty">No models yet. Download one below; it is verified against a pinned SHA-256 before use.</p>}{localModels?.installed.map((model) => { const state = downloads[model.id]; return <div className="model-row" key={model.path}><div className="model-row-main"><strong>{model.name}</strong><span>{formatBytes(model.size_bytes)} · {model.curated ? model.recommended_context ? `${model.recommended_context >= 1024 ? `${Math.round(model.recommended_context / 1024)}k` : model.recommended_context} ctx` : "curated GGUF" : "local GGUF"}</span></div><div className="model-row-actions">{state?.phase === "downloading" && <button className="outline-button" onClick={() => void runModelAction("cancel", async () => { await transportRef.current?.cancelDownload(model.id); })} disabled={modelBusy !== null}>{state.percent.toFixed(0)}% · Cancel</button>}{localModels.loaded === model.file_name ? <span className="model-loaded">Loaded</span> : <button className="approve-button" onClick={() => void runModelAction("load", async () => { await transportRef.current?.loadModel(model.path); })} disabled={modelBusy !== null}>{modelBusy === "load" ? "Loading…" : "Load"}</button>}</div>{state?.phase === "downloading" && <div className="model-progress"><span style={{ width: `${Math.max(2, state.percent)}%` }} /></div>}{state?.phase === "failed" && <p className="model-error">{state.message}</p>}</div>; })}{localModels && <div className="model-section-title"><span>Curated catalog</span></div>}{localModels?.catalog.map((model) => { const state = downloads[model.id]; const already = localModels.installed.some((installed) => installed.id === model.id); return <div className="model-row" key={model.id}><div className="model-row-main"><strong>{model.name}</strong><span>{formatBytes(model.size_bytes)} · {model.quant} · {Math.round(model.recommended_context / 1024)}k ctx · <a href={model.license_url} target="_blank" rel="noreferrer">license</a></span></div><div className="model-row-actions">{already ? <span className="model-installed-tag">Installed</span> : state?.phase === "downloading" ? <button className="outline-button" onClick={() => void runModelAction("cancel", async () => { await transportRef.current?.cancelDownload(model.id); })} disabled={modelBusy !== null}>{state.percent.toFixed(0)}% · Cancel</button> : state?.phase === "finished" ? <span className="model-installed-tag">Ready</span> : <button className="approve-button" onClick={() => void runModelAction("download", async () => { await transportRef.current?.downloadModel(model.id); })} disabled={modelBusy !== null}>{modelBusy === "download" ? "Starting…" : "Download"}</button>}</div>{state?.phase === "downloading" && <div className="model-progress"><span style={{ width: `${Math.max(2, state.percent)}%` }} /></div>}{state?.phase === "failed" && <p className="model-error">{state.message}</p>}</div>; })}</div><button className="approve-button settings-save" onClick={() => void saveProvider()} disabled={!localModels?.loaded}><Check size={15} /> Use this model</button>{!localModels?.loaded && <p className="model-hint">Load a model above to enable local runs.</p>}</div>}</section>}
           </header>
           <div ref={transcriptRef} className="transcript" aria-live="polite">
             {transcript.length === 0 && <div className="empty-state"><div className="empty-icon"><Bot size={26} /></div><h2>Start a coding run</h2><p>Describe the change, then review every tool action before it touches your workspace.</p></div>}
