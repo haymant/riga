@@ -271,10 +271,24 @@ impl IpcService {
     ) -> Result<(), String> {
         match action {
             "download" => {
-                self.state
-                    .local_models
-                    .start_download(model_id.ok_or("model_id is required")?)
-                    .await
+                let model_id = model_id.ok_or("model_id is required")?;
+                // The transfer outlives this command, exactly as it does over
+                // HTTP. Awaiting it here would keep the invoke promise — and so
+                // the UI's busy state — pending for the whole multi-gigabyte
+                // download, which also leaves the Cancel button disabled.
+                // Reject unknown or duplicate ids first, then detach and report
+                // through the local-model event stream.
+                if let Some(blocker) = self.state.local_models.download_blocker(model_id) {
+                    return Err(blocker);
+                }
+                let runtime = self.state.local_models.clone();
+                let model_id = model_id.to_owned();
+                tokio::spawn(async move {
+                    if let Err(error) = runtime.start_download(&model_id).await {
+                        tracing::error!(model_id = %model_id, %error, "local model download failed");
+                    }
+                });
+                Ok(())
             }
             "cancel" => self
                 .state
