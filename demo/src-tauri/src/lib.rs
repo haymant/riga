@@ -28,7 +28,15 @@ fn kernel_health(agent: State<'_, Agent>) -> Health {
 }
 
 #[tauri::command]
-fn riga_transport_connect() -> Result<(), String> {
+async fn riga_transport_connect(
+    app: AppHandle,
+    service: State<'_, IpcService>,
+) -> Result<(), String> {
+    // Restore the saved provider so the settings form survives a restart, the
+    // same way the WebSocket adapter receives it on `Hello`.
+    if let Some(configured) = service.provider().await? {
+        let _ = app.emit("riga://provider-configured", configured);
+    }
     Ok(())
 }
 

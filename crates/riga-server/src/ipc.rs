@@ -126,6 +126,23 @@ impl IpcService {
         })
     }
 
+    /// The provider currently stored, so the settings form can be restored on
+    /// connect. The API key is intentionally omitted: it is write-only from the
+    /// UI and is reused server-side when a later save leaves it blank.
+    pub async fn provider(&self) -> Result<Option<ProviderConfigured>, String> {
+        let Some(config) = secure_store::load_json::<ws::ProviderConfig>("provider").await? else {
+            return Ok(None);
+        };
+        Ok(Some(ProviderConfigured {
+            endpoint: config.endpoint,
+            model: config.model,
+            reasoning_effort: config.reasoning_effort,
+            kind: config.kind,
+            api: config.api,
+            subagent_model: config.subagent_model,
+        }))
+    }
+
     pub async fn list_mcp_registry(&self) -> Vec<catalog::McpServerSummary> {
         self.state
             .mcp_registry
