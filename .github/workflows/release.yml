@@ -216,6 +216,12 @@ jobs:
       - name: Configure CUDA build
         run: |
           echo "CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90" >> "$GITHUB_ENV"
+          # The demo crate is a cdylib (`libriga_demo.so`), so every object it
+          # links must be position-independent. llama.cpp's CUDA objects are not
+          # built with -fPIC by default, which fails the link with
+          # "relocation R_X86_64_PC32 cannot be used against symbol 'stderr'".
+          echo "CMAKE_POSITION_INDEPENDENT_CODE=ON" >> "$GITHUB_ENV"
+          echo "CMAKE_CUDA_FLAGS=-Xcompiler=-fPIC" >> "$GITHUB_ENV"
           if [ -n "${CUDA_PATH:-}" ]; then
             echo "CUDA_LIBRARY_PATH=${CUDA_PATH}" >> "$GITHUB_ENV"
           fi
@@ -256,7 +262,7 @@ jobs:
           tag="${{ inputs.tag }}"
           [ -n "$tag" ] || tag="${{ github.ref_name }}"
           shopt -s nullglob
-          files=(target/release/bundle/*/* target/*/release/bundle/*/*)
+          files=(demo/src-tauri/target/release/bundle/*/* demo/src-tauri/target/*/release/bundle/*/*)
           uploaded=0
           for file in "${files[@]}"; do
             [ -f "$file" ] || continue
@@ -267,6 +273,6 @@ jobs:
           done
           echo "Published $uploaded asset(s) to $tag"
           if [ "$uploaded" -eq 0 ]; then
-            echo "::error::No bundle files found under target/*/release/bundle"
+            echo "::error::No bundle files found under demo/src-tauri/target/*/release/bundle"
             exit 1
           fi
