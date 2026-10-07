@@ -185,6 +185,11 @@ struct LocalDeltaStream {
     decided: Option<bool>,
     /// True while inside a ` thinking…` block, whose text streams as reasoning.
     in_reasoning: bool,
+    /// Set by `generate` once the prompt is formatted. Read on the first token:
+    /// a template that opened the reasoning block means the output starts with
+    /// the reasoning and carries no opening tag of its own.
+    reasoning_expected: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    reasoning_checked: bool,
     streamed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -192,22 +197,35 @@ impl LocalDeltaStream {
     const MARKER: &'static str = "<tool_call>";
     /// Qwen3-style reasoning block; streamed as reasoning, not reply text.
     const REASONING_OPEN: &'static str = " thinking";
-    const REASONING_CLOSE: &'static str = "";
+    // `<` and `>` as escapes: the literal tag is stripped by some tooling.
+    const REASONING_CLOSE: &'static str = "\u{3c}/think\u{3e}";
 
     fn new(
         sender: mpsc::Sender<ToolTraceEvent>,
         streamed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        reasoning_expected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             sender,
             pending: String::new(),
             decided: None,
             in_reasoning: false,
+            reasoning_expected,
+            reasoning_checked: false,
             streamed,
         }
     }
 
     fn push(&mut self, delta: &str) {
+        if !self.reasoning_checked {
+            self.reasoning_checked = true;
+            if self
+                .reasoning_expected
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.in_reasoning = true;
+            }
+        }
         if self.decided == Some(true) {
             self.emit_text(delta);
             return;
@@ -2742,19 +2760,9 @@ async fn run_local_loop(
         role: turn.role.clone(),
         content: turn.content.clone(),
     }));
-    // Qwen3 is a hybrid reasoning model that otherwise spends most of a turn in a
-    // ` thinking` block before acting. Its soft switch disables that for tool use;
-    // other models are left untouched.
-    let qwen3 = local_models
-        .loaded_file_name()
-        .is_some_and(|name| name.to_ascii_lowercase().contains("qwen3"));
     messages.push(crate::local_model::ChatMessage {
         role: "user".into(),
-        content: if qwen3 {
-            format!("{prompt}\n/no_think")
-        } else {
-            prompt.to_owned()
-        },
+        content: prompt.to_owned(),
     });
     let mut final_text = String::new();
     let mut nudges = 0usize;
@@ -2794,14 +2802,19 @@ async fn run_local_loop(
             run_deadline,
             std::time::Instant::now() + LOCAL_TURN_WALL_CLOCK,
         );
+        // Set by `generate` once the prompt is formatted: whether the template
+        // opened a reasoning block. The streamer reads it on its first token.
+        let reasoning_expected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reasoning_flag = reasoning_expected.clone();
         let generated = tokio::task::spawn_blocking(move || {
-            let mut stream = LocalDeltaStream::new(stream_sender, streamed_flag);
+            let mut stream = LocalDeltaStream::new(stream_sender, streamed_flag, reasoning_flag);
             let result = runtime.generate(
                 &request,
                 LOCAL_MAX_TOKENS,
                 Some(turn_deadline),
                 Some(LOCAL_NO_PROGRESS),
                 worker_cancel.as_ref(),
+                &reasoning_expected,
                 |delta| stream.push(delta),
             );
             stream.finish();
@@ -4622,34 +4635,57 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let drain = |mut receiver: mpsc::Receiver<super::ToolTraceEvent>| {
-            let mut text = String::new();
+            let (mut text, mut reasoning) = (String::new(), String::new());
             while let Ok(event) = receiver.try_recv() {
-                if let super::ToolTraceEvent::Ui(RigaEvent::TextDelta { delta }) = event {
-                    text.push_str(&delta);
+                match event {
+                    super::ToolTraceEvent::Ui(RigaEvent::TextDelta { delta }) => {
+                        text.push_str(&delta)
+                    }
+                    super::ToolTraceEvent::Ui(RigaEvent::ReasoningDelta { delta }) => {
+                        reasoning.push_str(&delta)
+                    }
+                    _ => {}
                 }
             }
-            text
+            (text, reasoning)
         };
+        let no_reasoning = || Arc::new(AtomicBool::new(false));
 
         // Prose streams, including a short turn held back until it settles.
         let (sender, receiver) = mpsc::channel(16);
         let flag = Arc::new(AtomicBool::new(false));
-        let mut stream = super::LocalDeltaStream::new(sender, flag.clone());
+        let mut stream = super::LocalDeltaStream::new(sender, flag.clone(), no_reasoning());
         stream.push("The answer is ");
         stream.push("42.");
         stream.finish();
-        assert_eq!(drain(receiver), "The answer is 42.");
+        assert_eq!(drain(receiver).0, "The answer is 42.");
         assert!(flag.load(Ordering::Relaxed), "streaming must be recorded");
 
         // A tool-call turn is not shown at all, and must not mark the run as
         // streamed (the tool result is what carries it).
         let (sender, receiver) = mpsc::channel(16);
         let flag = Arc::new(AtomicBool::new(false));
-        let mut stream = super::LocalDeltaStream::new(sender, flag.clone());
+        let mut stream = super::LocalDeltaStream::new(sender, flag.clone(), no_reasoning());
         stream.push("<tool_call>{\"name\":\"read\",");
         stream.push("\"arguments\":{\"path\":\"a\"}}</tool_call>");
         stream.finish();
-        assert_eq!(drain(receiver), "");
+        assert_eq!(drain(receiver).0, "");
         assert!(!flag.load(Ordering::Relaxed));
+
+        // Reasoning streams as ReasoningDelta (never prose), and the tool call
+        // that follows stays out of the reply. The template opened the block, so
+        // the output carries no ` thinking` tag of its own.
+        let (sender, receiver) = mpsc::channel(16);
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut stream =
+            super::LocalDeltaStream::new(sender, flag.clone(), Arc::new(AtomicBool::new(true)));
+        stream.push("The user wants files.");
+        stream.push("\u{3c}/think\u{3e}");
+        stream.push("<tool_call>{\"name\":\"glob\",\"arguments\":{\"pattern\":\".\"}}</tool_call>");
+        stream.finish();
+        let (text, reasoning) = drain(receiver);
+        assert_eq!(reasoning, "The user wants files.");
+        assert_eq!(text, "");
+        assert!(!flag.load(Ordering::Relaxed), "reasoning is not reply text");
     }
 }

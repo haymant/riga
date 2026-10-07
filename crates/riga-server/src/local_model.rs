@@ -721,6 +721,9 @@ impl LocalModelRuntime {
 
     /// Run one completion against the loaded model, invoking `on_delta` for each
     /// decoded piece. Blocking: call from a blocking task.
+    // The parameters are all distinct generation controls; grouping them into a
+    // struct would only move the same fields elsewhere.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate<F>(
         &self,
         messages: &[ChatMessage],
@@ -728,6 +731,12 @@ impl LocalModelRuntime {
         deadline: Option<Instant>,
         no_progress: Option<Duration>,
         cancel: &AtomicBool,
+        // Set before the first token: whether the chat template opened a
+        // reasoning block, so the caller streams it as reasoning rather than
+        // reply text. A reasoning model (Qwen3) appends ` thinking` to the
+        // generation prompt, so its output *starts* with the reasoning and has
+        // no opening tag of its own.
+        reasoning_expected: &AtomicBool,
         mut on_delta: F,
     ) -> Result<Generated, String>
     where
@@ -761,6 +770,9 @@ impl LocalModelRuntime {
             .model
             .apply_chat_template(&template, &llama_messages, true)
             .map_err(|error| format!("Could not format the chat prompt: {error}"))?;
+        // A template that ends with ` thinking` has already opened the reasoning
+        // block; the model's first tokens are the reasoning itself.
+        reasoning_expected.store(prompt.trim_end().ends_with(" thinking"), Ordering::Relaxed);
         let tokens = loaded.model.vocab().tokenize(prompt.as_bytes(), true, true);
         if tokens.is_empty() {
             return Err("The model tokenizer returned an empty prompt".into());
