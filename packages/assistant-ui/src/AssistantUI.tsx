@@ -1,5 +1,5 @@
 import { Component, useEffect, useMemo, useRef, useState, type ReactNode, type SetStateAction } from "react";
-import { RigaWebSocketClient, LocalModelClient, formatBytes, reduceDownloadState, type DownloadState, type LocalModelOverview, type RigaEventEnvelope } from "@haymant/transport-http";
+import { RigaWebSocketClient, LocalModelClient, formatBytes, reduceDownloadState, type DownloadState, type LocalModelOverview, type RigaEventEnvelope } from "./http";
 import {
   Bot,
   Check,
