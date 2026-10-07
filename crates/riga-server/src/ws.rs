@@ -65,10 +65,10 @@ fn default_reasoning_effort() -> String {
 
 /// How a pending approval was answered.
 #[derive(Debug, Clone, Copy)]
-struct ApprovalReply {
-    approved: bool,
+pub(crate) struct ApprovalReply {
+    pub(crate) approved: bool,
     /// Approve this tool for the rest of the session, not just this call.
-    always: bool,
+    pub(crate) always: bool,
 }
 
 #[derive(Clone, Default)]
@@ -134,19 +134,19 @@ impl RunEvidence {
 
 /// How many run events a subscriber may fall behind before it is told it lagged
 /// and catches up from the journal instead.
-const RUN_EVENT_BUFFER: usize = 1024;
+pub(crate) const RUN_EVENT_BUFFER: usize = 1024;
 
 /// A run that is currently executing on the server.
 #[derive(Clone)]
 pub(crate) struct RunHandle {
     /// Live events. A socket subscribes to follow the run; the run outlives any
     /// individual subscriber.
-    events: tokio::sync::broadcast::Sender<RigaEventEnvelope>,
+    pub(crate) events: tokio::sync::broadcast::Sender<RigaEventEnvelope>,
     /// Set on `CancelRun`; the event loops poll it, including mid-decode.
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether this run uses the (single) local engine, so a second local run
     /// can be refused with a clear message instead of blocking on the mutex.
-    local: bool,
+    pub(crate) local: bool,
 }
 
 /// The runs in flight, keyed by run id. Lives in server state so every socket
@@ -316,7 +316,7 @@ pub(crate) struct ApprovalBroker {
 impl ApprovalBroker {
     /// Deliver a decision to the run waiting on `approval_id`. Returns whether
     /// a waiter was found, so a stray or duplicate decision is a no-op.
-    async fn resolve(&self, approval_id: &str, reply: ApprovalReply) -> bool {
+    pub(crate) async fn resolve(&self, approval_id: &str, reply: ApprovalReply) -> bool {
         let mut waiters = self.waiters.lock().await;
         if let Some(sender) = waiters.remove(approval_id) {
             let _ = sender.send(reply);
@@ -679,6 +679,101 @@ async fn forward_run<S>(
             }
         }
     }
+}
+
+/// Start a run without a WebSocket. The Tauri adapter subscribes to the same
+/// broadcast channel used by the HTTP adapter, so provider execution, tools,
+/// approvals, persistence, cancellation, and event ordering remain owned here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn start_ipc_run(
+    workspace_root: PathBuf,
+    mcp_runtime: McpRuntime,
+    local_models: std::sync::Arc<crate::local_model::LocalModelRuntime>,
+    transcripts: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, Vec<ConversationTurn>>>,
+    >,
+    secure_store: Option<std::sync::Arc<crate::secure_store::SecureStore>>,
+    broker: ApprovalBroker,
+    runs: RunRegistry,
+    run_id: String,
+    session_id: String,
+    prompt: String,
+) -> Result<tokio::sync::broadcast::Receiver<RigaEventEnvelope>, String> {
+    let provider: Option<ProviderConfig> = crate::secure_store::load_json("provider")
+        .await
+        .map_err(|error| error.to_string())?;
+    let config = resolve_run_provider(provider.as_ref(), local_models.loaded_file_name().is_some())
+        .map_err(|(_, message)| message.to_owned())?;
+    if config.is_local() && local_models.loaded_file_name().is_none() {
+        return Err("Load a local model in the model manager before starting a run.".into());
+    }
+    let history = {
+        let guard = transcripts.read().await;
+        trim_history(guard.get(&session_id).map(Vec::as_slice).unwrap_or(&[]))
+    };
+    let run_root = crate::workspace::ensure_worktree(&workspace_root, &session_id).await?;
+    let (events, cancel) = {
+        let mut guard = runs.lock().await;
+        if guard.contains_key(&run_id) {
+            return Err("That run is already in progress.".into());
+        }
+        if config.is_local() && guard.values().any(|handle| handle.local) {
+            return Err("A local model run is already in progress.".into());
+        }
+        let (events, _) = tokio::sync::broadcast::channel::<RigaEventEnvelope>(RUN_EVENT_BUFFER);
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        guard.insert(
+            run_id.clone(),
+            RunHandle {
+                events: events.clone(),
+                cancel: cancel.clone(),
+                local: config.is_local(),
+            },
+        );
+        (events, cancel)
+    };
+    let receiver = events.subscribe();
+    let run_id_task = run_id.clone();
+    let session_id_task = session_id.clone();
+    let prompt_task = prompt.clone();
+    let config_task = config.clone();
+    let mcp_task = mcp_runtime.clone();
+    let local_task = local_models.clone();
+    let history_task = history.clone();
+    let broker_task = broker.clone();
+    let transcripts_task = transcripts.clone();
+    let store_task = secure_store.clone();
+    let runs_task = runs.clone();
+    let events_task = events.clone();
+    tokio::spawn(async move {
+        let evidence = RunEvidence::with_cancel(cancel);
+        let mut channel = RunChannel::new(&run_id_task, &session_id_task, events_task);
+        let output = run_provider(
+            &mut channel,
+            &broker_task,
+            &config_task,
+            &run_root,
+            &prompt_task,
+            &mcp_task,
+            &local_task,
+            &history_task,
+            &evidence,
+        )
+        .await;
+        let mut turns = vec![ConversationTurn {
+            role: "user".into(),
+            content: prompt_task,
+        }];
+        if let Some(output) = output {
+            turns.push(ConversationTurn {
+                role: "assistant".into(),
+                content: output,
+            });
+        }
+        append_turns(&transcripts_task, &store_task, &session_id_task, &turns).await;
+        runs_task.lock().await.remove(&run_id_task);
+    });
+    Ok(receiver)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1394,7 +1489,7 @@ struct AgentResult {
 /// reconnects can replay what it missed and then follow the run live. The
 /// journal is written first so a frame that reaches a subscriber is already
 /// durable.
-struct RunChannel {
+pub(crate) struct RunChannel {
     journal: Option<riga_kernel::persistence::EventJournal>,
     events: tokio::sync::broadcast::Sender<RigaEventEnvelope>,
     run_id: String,
@@ -1420,7 +1515,7 @@ impl RunChannel {
     /// A channel that only broadcasts, for tests that must not touch the data
     /// directory. Production always journals.
     #[cfg(test)]
-    fn without_journal(
+    pub(crate) fn without_journal(
         run_id: &str,
         session_id: &str,
         events: tokio::sync::broadcast::Sender<RigaEventEnvelope>,
@@ -1436,7 +1531,7 @@ impl RunChannel {
 
     /// Broadcast one event, journaling it first unless it is ephemeral.
     /// `RunStarted` owns sequence 1.
-    fn emit(&mut self, event: RigaEvent) {
+    pub(crate) fn emit(&mut self, event: RigaEvent) {
         let envelope = envelope(&self.run_id, &self.session_id, self.sequence, event);
         self.sequence += 1;
         // Token and tool-output deltas are high-frequency and reconstructible:

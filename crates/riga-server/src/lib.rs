@@ -28,6 +28,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 pub mod catalog;
 pub mod health_stdio;
+pub mod ipc;
 pub mod local_model;
 pub mod mcp;
 pub mod secure_store;
@@ -38,8 +39,8 @@ pub const ADAPTER_NAME: &str = "riga-server";
 
 #[derive(Clone)]
 pub struct ServerState {
-    sessions: Arc<RwLock<Vec<Session>>>,
-    next_id: Arc<AtomicU64>,
+    pub(crate) sessions: Arc<RwLock<Vec<Session>>>,
+    pub(crate) next_id: Arc<AtomicU64>,
     pub(crate) workspace_root: PathBuf,
     pub(crate) secure_store: Option<Arc<secure_store::SecureStore>>,
     pub(crate) mcp_registry: Arc<RwLock<Vec<catalog::McpServerRecord>>>,
