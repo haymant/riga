@@ -27,6 +27,9 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 riga-kernel = { path = "../../crates/riga-kernel" }
 riga-server = { path = "../../crates/riga-server" }
+# Native-shell startup helpers (GTK/WebKitGTK display prep). Temporary path
+# dependency during development; a published `riga-shell` version replaces it.
+riga-shell = { path = "../../crates/riga-shell" }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }

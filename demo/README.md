@@ -31,7 +31,9 @@ After the next assistant-ui release containing the injection API, replace it wit
 "@rigai/assistant-ui": "^0.1.4"
 ```
 
-The Rust demo currently uses path dependencies for `riga-kernel` and `riga-server`. Replace those paths with the corresponding published crate versions when the IPC surface is released.
+The Rust demo currently uses path dependencies for `riga-kernel`, `riga-server`, and `riga-shell`. Replace those paths with the corresponding published crate versions when the IPC surface is released.
+
+`src-tauri/src/main.rs` calls `riga_shell::prepare_linux_display()` before the Tauri/GTK runtime starts. That helper (in `crates/riga-shell`) sets conservative cursor defaults and prefers XWayland when a `DISPLAY` is present, avoiding a Wayland cursor-theme assertion that otherwise aborts the app before the window appears. It is a native-shell concern, so it lives there rather than in `riga-kernel`, `riga-server`, or the web UI.
 
 ## 3. Browser development
 

@@ -4,6 +4,7 @@ members = [
   "crates/riga-kernel",
   "crates/riga-server",
   "crates/riga-cli",
+  "crates/riga-shell",
   "apps/riga/src-tauri",
 ]
 

@@ -63,6 +63,8 @@ Linux desktop builds need the WebKitGTK development packages (`libwebkit2gtk-4.1
 
 The packaged build also uses the Tauri IPC path. Its webview does not need a server URL, HTTP proxy, browser WebSocket, or EventSource permission for assistant operations. `riga-server` remains the single application/runtime owner behind both transport adapters.
 
+Every native shell calls `riga_shell::prepare_linux_display()` as the first statement in `main`, before the Tauri/GTK runtime starts. It lives in `crates/riga-shell` because it is a native-shell concern: it sets conservative cursor defaults and prefers XWayland when a `DISPLAY` is present, avoiding a Wayland cursor-theme assertion that otherwise aborts the app before the window appears. It deliberately is not in `riga-kernel` or `riga-server`, which also run headless (CLI, tests, HTTP), so a display side effect there would be wrong.
+
 ### GPU builds
 
 The local GGUF runtime links llama.cpp, which can offload to an NVIDIA GPU

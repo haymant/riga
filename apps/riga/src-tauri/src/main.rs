@@ -33,35 +33,6 @@ fn server_url(server_url: State<'_, ServerUrl>) -> String {
     server_url.0.clone()
 }
 
-/// Work around a GTK/WebKitGTK Wayland startup failure before the toolkit
-/// initializes.
-///
-/// Some Wayland sessions expose no cursor theme to GTK, and the current GTK
-/// runtime aborts while creating the first window — the process logs
-/// `Gdk-CRITICAL … gdk_wayland_window_set_dbus_properties_libgtk_only` and the
-/// webview stays blank. Set conservative cursor defaults, and prefer XWayland
-/// when a `DISPLAY` is also available, because that path is unaffected.
-#[cfg(target_os = "linux")]
-fn prepare_linux_display() {
-    if std::env::var_os("XCURSOR_THEME").is_none() {
-        // SAFETY: this runs on the main thread before Tauri/GTK starts any other
-        // thread or reads the environment, so nothing can observe the write
-        // concurrently.
-        unsafe { std::env::set_var("XCURSOR_THEME", "Adwaita") };
-    }
-    if std::env::var_os("XCURSOR_SIZE").is_none() {
-        // SAFETY: see the XCURSOR_THEME assignment above.
-        unsafe { std::env::set_var("XCURSOR_SIZE", "24") };
-    }
-    if std::env::var_os("GDK_BACKEND").is_none()
-        && std::env::var_os("WAYLAND_DISPLAY").is_some()
-        && std::env::var_os("DISPLAY").is_some()
-    {
-        // SAFETY: see the XCURSOR_THEME assignment above.
-        unsafe { std::env::set_var("GDK_BACKEND", "x11") };
-    }
-}
-
 /// Host `riga-server` inside the desktop process and return its origin.
 ///
 /// This is the whole reason the packaged app works: without a host, the webview
@@ -127,8 +98,8 @@ fn main() {
             .block_on(riga_server::health_stdio::serve());
         return;
     }
-    #[cfg(target_os = "linux")]
-    prepare_linux_display();
+    // Must run before the Tauri/GTK runtime starts; a no-op off Linux.
+    riga_shell::prepare_linux_display();
     let runtime_server_url = start_server();
     tauri::Builder::<tauri::Wry>::default()
         .plugin(tauri_plugin_opener::init())

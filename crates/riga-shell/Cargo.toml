@@ -1,0 +1,13 @@
+[package]
+name = "riga-shell"
+version.workspace = true
+# Edition 2021 on purpose: `std::env::set_var` is safe here, so this crate needs
+# no `unsafe` and stays under the workspace `unsafe_code = "forbid"`.
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+
+description = "Startup helpers shared by RIGA Tauri desktop shells"
+
+[lints]
+workspace = true

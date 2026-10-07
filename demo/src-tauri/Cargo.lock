@@ -4043,6 +4043,7 @@ version = "0.1.0"
 dependencies = [
  "riga-kernel",
  "riga-server",
+ "riga-shell",
  "serde",
  "serde_json",
  "tauri",
@@ -4092,6 +4093,10 @@ dependencies = [
  "tracing",
  "walkdir",
 ]
+
+[[package]]
+name = "riga-shell"
+version = "0.1.0"
 
 [[package]]
 name = "ring"

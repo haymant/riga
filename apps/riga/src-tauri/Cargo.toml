@@ -19,6 +19,8 @@ metal = ["riga-server/metal"]
 axum = "0.8"
 riga-kernel = { path = "../../../crates/riga-kernel" }
 riga-server = { path = "../../../crates/riga-server" }
+# Native-shell startup helpers (GTK/WebKitGTK display prep).
+riga-shell = { path = "../../../crates/riga-shell" }
 tauri = { version = "2.0", default-features = false, features = ["wry"] }
 # Tauri opens a second window for every `target="_blank"` link by default —
 # which the surface uses for the model-license links and all chat Markdown. The
@@ -30,14 +32,5 @@ tokio = { version = "1", features = ["net", "rt-multi-thread"] }
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }
 
-# These mirror the workspace lint policy. They are spelled out rather than
-# inherited because Cargo forbids a `lints.workspace = true` table that also
-# overrides a lint, and `unsafe_code` must be relaxed here: edition 2024 makes
-# `std::env::set_var` unsafe, and `prepare_linux_display` needs it to steer GTK
-# before the toolkit starts. Every such call site documents its invariant.
-[lints.rust]
-unsafe_code = "allow"
-
-[lints.clippy]
-all = "deny"
-correctness = "deny"
+[lints]
+workspace = true

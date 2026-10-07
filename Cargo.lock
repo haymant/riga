@@ -3934,6 +3934,7 @@ dependencies = [
  "axum",
  "riga-kernel",
  "riga-server",
+ "riga-shell",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
@@ -3984,6 +3985,10 @@ dependencies = [
  "tracing",
  "walkdir",
 ]
+
+[[package]]
+name = "riga-shell"
+version = "0.1.0"
 
 [[package]]
 name = "ring"
