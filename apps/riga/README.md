@@ -278,9 +278,11 @@ npm run tauri:build --workspace @riga/desktop-ui -- --features cuda --bundles de
 npm run tauri:build --workspace @riga/desktop-ui -- --features metal
 ```
 
-For a faster CUDA compile, point `CUDA_PATH` / `CUDAToolkit_ROOT` at the toolkit
-and set `CMAKE_CUDA_ARCHITECTURES` to your GPU's compute capability (for example
-`86` for an RTX 30-series card).
+For a faster CUDA compile, set `CMAKE_CUDA_ARCHITECTURES` to your GPU's compute
+capability (for example `86` for an RTX 30-series card). When several CUDA
+toolkits are installed, also set `CUDA_LIBRARY_PATH` to the matching
+`lib64`/`lib64/stubs` (the build script uses it for the linker search order, so
+`-lcuda`/`-lcudart_static` come from the intended toolkit).
 
 ## Extending
 

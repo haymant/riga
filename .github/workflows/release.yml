@@ -201,8 +201,17 @@ jobs:
       # llama.cpp defaults to compiling for a long list of architectures (with
       # PTX variants), which dominates the build. These cover Turing through
       # Hopper; the build script forwards `CMAKE_*` env vars as CMake defines.
-      - name: Limit CUDA architectures
-        run: echo "CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90" >> "$GITHUB_ENV"
+      #
+      # `CUDA_LIBRARY_PATH` is the only variable the build script uses for the
+      # linker search order. Pin it to the installed toolkit so `-lcuda` and
+      # `-lcudart_static` cannot bind to a newer preinstalled CUDA (which drops
+      # the `cudaGetDeviceProperties_v2` symbol) instead.
+      - name: Configure CUDA build
+        run: |
+          echo "CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90" >> "$GITHUB_ENV"
+          if [ -n "${CUDA_PATH:-}" ]; then
+            echo "CUDA_LIBRARY_PATH=${CUDA_PATH}/lib64:${CUDA_PATH}/lib64/stubs" >> "$GITHUB_ENV"
+          fi
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
