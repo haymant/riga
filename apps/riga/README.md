@@ -261,6 +261,27 @@ exposes `server_url`, and `src/main.tsx` passes the origin to
 `<AssistantUI serverUrl={…} />`. The development build skips the embedded server
 so there is exactly one kernel.
 
+## 6. GPU offload
+
+`riga-server` exposes `cuda` and `metal` features that forward to `llama-cpp-2`,
+and `apps/riga/src-tauri` re-exports them so `tauri build --features …` works.
+Both default to off, so the portable build stays CPU-only. At load time the
+model's GPU plan is auto-fitted to the free device memory
+(`LlamaModelParams::fit_params`), reserving a margin and falling back to
+CPU-only when no plan fits, rather than offloading every layer.
+
+```bash
+# NVIDIA (Linux / Windows)
+npm run tauri:build --workspace @riga/desktop-ui -- --features cuda --bundles deb
+
+# Apple Silicon
+npm run tauri:build --workspace @riga/desktop-ui -- --features metal
+```
+
+For a faster CUDA compile, point `CUDA_PATH` / `CUDAToolkit_ROOT` at the toolkit
+and set `CMAKE_CUDA_ARCHITECTURES` to your GPU's compute capability (for example
+`86` for an RTX 30-series card).
+
 ## Extending
 
 - **A new agent capability** belongs in the kernel. Add a method to `Agent` in

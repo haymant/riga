@@ -62,6 +62,34 @@ Linux desktop builds need the WebKitGTK development packages (`libwebkit2gtk-4.1
 
 The packaged build does not use the Vite proxy. Its webview loads from `tauri://localhost`, so the shell binds `riga-server` on `127.0.0.1:0` (release only) and passes that absolute origin to `AssistantUI`'s `serverUrl`. The server answers the webview's cross-origin `fetch` and `EventSource` calls with a permissive CORS policy, and the window CSP permits `http://127.0.0.1:*` and `ws://127.0.0.1:*`, so the WebSocket and the local-model manager work without a proxy. The browser build and `tauri:dev` pass no origin and keep resolving against the page origin, so that path is unchanged. `packages/transport-tauri` stays a stub; a native IPC transport is still roadmap work and is not required for the packaged app.
 
+### GPU builds
+
+The local GGUF runtime links llama.cpp, which can offload to an NVIDIA GPU
+(`cuda`) or Apple Silicon (`metal`). The release workflow builds Linux and
+Windows on CPU, macOS with Metal, and Linux with CUDA on demand: open the
+**Release RIGA desktop app** workflow and run it manually with **Build
+linux-cuda only** checked (a manual run builds only that variant; the CPU and
+macOS jobs run on tag pushes). At load time the model's GPU plan is auto-fitted
+to the memory actually free, so it does not blindly offload every layer.
+
+To build a CUDA variant locally, point the build at the CUDA toolkit and — for a
+much faster compile — at just your GPU's compute capability (`86` is Ampere /
+RTX 30-series; `75` Turing, `80` A100, `89` Ada, `90` Hopper):
+
+```bash
+export PATH="/usr/local/cuda-12.6/bin:$PATH" \
+       CUDA_PATH=/usr/local/cuda-12.6 \
+       CUDAToolkit_ROOT=/usr/local/cuda-12.6 \
+       CMAKE_CUDA_ARCHITECTURES=86
+npm run tauri:build --workspace @riga/desktop-ui -- --features cuda --bundles deb
+```
+
+The installer lands in `target/release/bundle/deb/` (the workspace target lives
+at the repository root). Drop `--bundles deb` to build every Linux format, but
+the rpm and AppImage steps are slow on the large CUDA binary. On an Apple
+Silicon Mac the same command with `--features metal` builds the Metal variant
+(no extra flags beyond Xcode's command-line tools).
+
 ## Provider configuration
 
 Configure an OpenAI-compatible endpoint, model, reasoning effort, and API key in the UI. Provider metadata is restored from the encrypted server store; the key is never returned to the browser in restoration frames.
