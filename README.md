@@ -79,7 +79,7 @@ RTX 30-series; `75` Turing, `80` A100, `89` Ada, `90` Hopper):
 ```bash
 export PATH="/usr/local/cuda-12.6/bin:$PATH" \
        CUDA_PATH=/usr/local/cuda-12.6 \
-       CUDA_LIBRARY_PATH="/usr/local/cuda-12.6/lib64:/usr/local/cuda-12.6/lib64/stubs" \
+       CUDA_LIBRARY_PATH=/usr/local/cuda-12.6 \
        CMAKE_CUDA_ARCHITECTURES=86
 npm run tauri:build --workspace @riga/desktop-ui -- --features cuda --bundles deb
 ```
@@ -92,7 +92,8 @@ Silicon Mac the same command with `--features metal` builds the Metal variant
 
 `CUDA_LIBRARY_PATH` matters when more than one CUDA toolkit is installed: it is
 the only variable the build script uses for the linker's library search order,
-so it pins `-lcuda`/`-lcudart_static` to that toolkit. Without it the linker
+so it pins `-lcuda`/`-lcudart_static` to that toolkit. Pass the CUDA **root**
+(the script appends `lib64` and `lib64/stubs` itself). Without it the linker
 falls back to `/usr/local/cuda`, and a newer toolkit there can fail the link
 with `undefined symbol: cudaGetDeviceProperties_v2` (CUDA 13 dropped the `_v2`
 suffix).
