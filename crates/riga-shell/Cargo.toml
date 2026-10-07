@@ -11,3 +11,6 @@ description = "Startup helpers shared by RIGA Tauri desktop shells"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3"

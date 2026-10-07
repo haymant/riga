@@ -1,7 +1,0 @@
-{
-  "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "main-window",
-  "description": "Core permissions for the main window. The kernel is reached over HTTP/WebSocket, not IPC, so no transport plugins are required.",
-  "windows": ["main"],
-  "permissions": ["core:default", "opener:default"]
-}

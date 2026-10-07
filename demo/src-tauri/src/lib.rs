@@ -224,6 +224,14 @@ async fn riga_upload_attachment(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Give the agent a deliberate, git-initialized workspace instead of the
+    // launcher's working directory (or `src-tauri` under `tauri dev`), so
+    // per-session worktrees engage and uploads stay out of the source tree.
+    if let Err(error) =
+        riga_shell::ensure_workspace(&riga_shell::default_data_dir().join("workspace"))
+    {
+        eprintln!("RIGA: could not prepare the desktop workspace: {error}");
+    }
     let service = IpcService::new(ServerState::default());
     let local_model_events = service.subscribe_local_models();
     tauri::Builder::default()

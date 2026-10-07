@@ -4,8 +4,7 @@
   "version": "0.1.0",
   "packageManager": "npm@10.9.2",
   "workspaces": [
-    "packages/*",
-    "apps/*"
+    "packages/*"
   ],
   "scripts": {
     "lint": "node scripts/lint.mjs",
@@ -13,13 +12,14 @@
     "check": "npm run lint && npm run typecheck",
     "test:e2e": "node scripts/test-e2e.mjs",
     "test": "vitest run --coverage",
-    "dev": "npm run dev --workspace @riga/desktop-ui",
+    "dev": "npm run dev --prefix demo",
     "start": "npm run dev",
-    "tauri": "npm run tauri --workspace @riga/desktop-ui",
-    "tauri:dev": "npm run tauri:dev --workspace @riga/desktop-ui",
-    "tauri:build": "npm run tauri:build --workspace @riga/desktop-ui"
+    "tauri": "npm run tauri --prefix demo",
+    "tauri:dev": "npm run tauri:dev --prefix demo",
+    "tauri:build": "npm run tauri:build --prefix demo"
   },
   "devDependencies": {
+    "@tauri-apps/api": "^2.12.1",
     "@vitest/coverage-v8": "^5.0.3",
     "typescript": "^5.7.3",
     "vitest": "^5.0.3"

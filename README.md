@@ -84,11 +84,11 @@ export PATH="/usr/local/cuda-12.6/bin:$PATH" \
        CUDA_PATH=/usr/local/cuda-12.6 \
        CUDA_LIBRARY_PATH=/usr/local/cuda-12.6 \
        CMAKE_CUDA_ARCHITECTURES=86
-npm run tauri:build --workspace @riga/desktop-ui -- --features cuda --bundles deb
+npm run tauri:build --prefix demo -- --features cuda --bundles deb
 ```
 
-The installer lands in `target/release/bundle/deb/` (the workspace target lives
-at the repository root). Drop `--bundles deb` to build every Linux format, but
+The installer lands in `demo/src-tauri/target/release/bundle/deb/` (the demo is
+its own Cargo workspace). Drop `--bundles deb` to build every Linux format, but
 the rpm and AppImage steps are slow on the large CUDA binary. On an Apple
 Silicon Mac the same command with `--features metal` builds the Metal variant
 (no extra flags beyond Xcode's command-line tools).
