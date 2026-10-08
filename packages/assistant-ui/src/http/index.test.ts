@@ -1,7 +1,27 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RigaHttpClient } from "./index";
 
-afterEach(() => vi.restoreAllMocks());
+const socketCalls: string[] = [];
+
+vi.mock("./websocket", () => ({
+  RigaWebSocketClient: class FakeWebSocketClient {
+    constructor(_options: unknown) {}
+    connect(): Promise<void> { socketCalls.push("connect"); return Promise.resolve(); }
+    wake(): void { socketCalls.push("wake"); }
+    close(): void { socketCalls.push("close"); }
+    configureProvider(..._args: unknown[]): Promise<void> { socketCalls.push("configureProvider"); return Promise.resolve(); }
+    startRun(..._args: unknown[]): Promise<void> { socketCalls.push("startRun"); return Promise.resolve(); }
+    resumeRun(..._args: unknown[]): Promise<void> { socketCalls.push("resumeRun"); return Promise.resolve(); }
+    cancelRun(..._args: unknown[]): Promise<void> { socketCalls.push("cancelRun"); return Promise.resolve(); }
+    respondToApproval(..._args: unknown[]): Promise<void> { socketCalls.push("respondToApproval"); return Promise.resolve(); }
+  },
+}));
+
+import { createHttpTransport, RigaHttpClient, RigaHttpTransport } from "./index";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  socketCalls.length = 0;
+});
 
 describe("RigaHttpClient", () => {
   it("requests health and session resources with the expected HTTP contract", async () => {
@@ -46,5 +66,51 @@ describe("RigaHttpClient", () => {
     vi.restoreAllMocks();
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
     await expect(new RigaHttpClient("http://riga.test").streamRunEvents("run", vi.fn())).rejects.toThrow("SSE request failed with 200");
+  });
+});
+
+describe("RigaHttpTransport", () => {
+  it("delegates resources, runs, MCP, attachments, and local models", async () => {
+    vi.stubGlobal("EventSource", class {
+      addEventListener(): void {}
+      close(): void {}
+    });
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      if (init?.method === "POST") return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    });
+    const localEvents: unknown[] = [];
+    const transport = new RigaHttpTransport("https://riga.test", { onLocalModelEvent: (event) => localEvents.push(event) });
+    await transport.connect();
+    transport.wake();
+    await transport.health();
+    await transport.catalog();
+    await transport.listSessions();
+    await transport.createSession({ title: "Test", workspace: "/tmp" });
+    await transport.configureProvider("https://model.test/v1", "key", "model", "low");
+    await transport.startRun("run", "session", "hello");
+    await transport.resumeRun("run", 1);
+    await transport.cancelRun("run");
+    await transport.respondToApproval("run", "approval", true, "once");
+    await transport.listMcpRegistry();
+    await transport.saveMcpRegistry({ name: "health", transport: "stdio", command: "health-mcp" });
+    await transport.uploadAttachment(new File(["hello"], "note.txt"), "session");
+    await transport.listLocalModels();
+    await transport.downloadModel("model");
+    await transport.cancelDownload("model");
+    await transport.loadModel("/tmp/model.gguf");
+    await transport.unloadModel();
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/catalog"))).toBe(true);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/attachments?session=session"))).toBe(true);
+    expect(socketCalls).toEqual(["connect", "wake", "configureProvider", "startRun", "resumeRun", "cancelRun", "respondToApproval"]);
+    expect(localEvents).toEqual([]);
+    transport.close();
+    expect(socketCalls.at(-1)).toBe("close");
+  });
+
+  it("returns the local-model subscription cleanup and factory transport", () => {
+    const transport = createHttpTransport("https://riga.test");
+    expect(transport).toBeInstanceOf(RigaHttpTransport);
+    expect(transport.subscribeLocalModels()).toBeTypeOf("function");
   });
 });

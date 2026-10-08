@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { RIGA_IPC_COMMANDS, RIGA_IPC_EVENTS, RigaTauriTransport, type TauriTransportOptions } from "./index";
+import { createTauriTransport, RIGA_IPC_COMMANDS, RIGA_IPC_EVENTS, RigaTauriTransport, type TauriTransportOptions } from "./index";
 
 type Handler = (event: { payload: unknown }) => void;
 
@@ -83,5 +83,29 @@ describe("RigaTauriTransport", () => {
     await transport.uploadAttachment(file, "session-1");
     expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.localModelAction && (call.args?.request as { action?: string } | undefined)?.action === "download")?.args).toEqual({ request: { action: "download", model_id: "model-1" } });
     expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.uploadAttachment)?.args).toEqual({ attachment: { name: "note.txt", bytes: [1, 2, 3], session_id: "session-1" } });
+  });
+
+  it("reports connection failures, reconnects on wake, and exposes the factory", async () => {
+    let fail = true;
+    const statuses: string[] = [];
+    const invoke = vi.fn(async <T>(command: string) => {
+      if (command === RIGA_IPC_COMMANDS.connect && fail) {
+        fail = false;
+        throw new Error("IPC unavailable");
+      }
+      return undefined as T;
+    });
+    const transport = createTauriTransport({
+      invoke: invoke as TauriTransportOptions["invoke"],
+      listen: async () => () => undefined,
+      listeners: { onStatus: (status) => statuses.push(status) },
+    });
+
+    await expect(transport.connect()).rejects.toThrow("IPC unavailable");
+    transport.wake();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(statuses).toEqual(["connecting", "error", "connecting", "connected"]);
+    expect(transport.subscribeLocalModels()).toBeTypeOf("function");
+    transport.close();
   });
 });
