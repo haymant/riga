@@ -333,6 +333,50 @@ mod tests {
     }
 
     #[test]
+    fn task_states_report_terminal_members_and_terminal_tasks_are_immutable() {
+        for state in [
+            TaskState::Pending,
+            TaskState::Running,
+            TaskState::WaitingForApproval,
+        ] {
+            assert!(!state.is_terminal(), "{state:?} should remain mutable");
+        }
+        for state in [
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Cancelled,
+        ] {
+            assert!(state.is_terminal(), "{state:?} should be terminal");
+        }
+
+        let mut tree = TaskTree::new();
+        let root = tree.root("orchestrator", "root", "m");
+        tree.set_state(&root, TaskState::WaitingForApproval)
+            .unwrap();
+        tree.settle(&root, false, "denied").unwrap();
+        let error = tree.set_state(&root, TaskState::Running).unwrap_err();
+        assert!(error.contains("already settled"), "{error}");
+        assert_eq!(
+            tree.record(&root).unwrap().result.as_deref(),
+            Some("denied")
+        );
+    }
+
+    #[test]
+    fn failed_settlement_preserves_failure_result_and_depth_handles_missing_parents() {
+        let mut tree = TaskTree::new();
+        let root = tree.root("orchestrator", "root", "m");
+        let child = tree.spawn(&root, "review", "inspect", "m").unwrap();
+        tree.settle(&child, false, "lint failed").unwrap();
+
+        let record = tree.record(&child).unwrap();
+        assert_eq!(record.state, TaskState::Failed);
+        assert_eq!(record.result.as_deref(), Some("lint failed"));
+        assert_eq!(tree.depth("missing"), None);
+        assert_eq!(tree.all().len(), 2);
+    }
+
+    #[test]
     fn todo_progress_counts_failed_but_not_cancelled() {
         let list = TodoList {
             title: None,

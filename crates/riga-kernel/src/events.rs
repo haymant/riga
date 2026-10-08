@@ -140,4 +140,37 @@ mod tests {
         };
         assert!(serde_json::to_string(&todos).unwrap().contains("\"done\""));
     }
+
+    #[test]
+    fn task_lifecycle_events_round_trip_all_decision_fields() {
+        let events = vec![
+            RigaEvent::TaskStatus {
+                task_id: "task-2".into(),
+                state: TaskState::WaitingForApproval,
+                elapsed_ms: 42,
+            },
+            RigaEvent::TaskCompleted {
+                task_id: "task-2".into(),
+                ok: false,
+                result: "approval denied".into(),
+            },
+            RigaEvent::ApprovalRequested {
+                approval_id: "approval-1".into(),
+                task_id: "task-2".into(),
+                tool: "write".into(),
+                summary: "modify a file".into(),
+            },
+            RigaEvent::ApprovalResolved {
+                approval_id: "approval-1".into(),
+                approved: false,
+                reason: Some("user declined".into()),
+            },
+        ];
+
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            let decoded: RigaEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded, event, "event failed to round-trip: {json}");
+        }
+    }
 }

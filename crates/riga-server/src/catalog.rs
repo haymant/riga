@@ -472,7 +472,9 @@ fn dispatch_handoff(input: &serde_json::Value) -> Result<String, String> {
     let request = input
         .get("prompt")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .ok_or("task dispatch requires a prompt")?;
     serde_json::to_string_pretty(&serde_json::json!({
         "dispatch": "accepted",
         "agent": profile.name,
@@ -972,5 +974,64 @@ mod tests {
             error.contains("update_plan") || error.contains("durable task storage"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn task_dispatch_accepts_alias_actions_and_name_field() {
+        for action in ["agent", "run"] {
+            let output = super::execute_task(&serde_json::json!({
+                "action": action,
+                "name": "scout",
+                "prompt": "inspect the workspace"
+            }))
+            .unwrap();
+            assert!(output.contains("\"agent\": \"explore\""), "{output}");
+        }
+    }
+
+    #[test]
+    fn task_dispatch_validates_agent_name_and_prompt() {
+        let missing_agent = super::execute_task(&serde_json::json!({
+            "action": "dispatch",
+            "prompt": "inspect"
+        }))
+        .unwrap_err();
+        assert!(missing_agent.contains("requires agent"), "{missing_agent}");
+
+        let unknown_agent = super::execute_task(&serde_json::json!({
+            "action": "dispatch",
+            "agent": "unknown",
+            "prompt": "inspect"
+        }))
+        .unwrap_err();
+        assert!(
+            unknown_agent.contains("unknown agent profile"),
+            "{unknown_agent}"
+        );
+
+        let missing_prompt = super::execute_task(&serde_json::json!({
+            "action": "dispatch",
+            "agent": "explore"
+        }))
+        .unwrap_err();
+        assert!(
+            missing_prompt.contains("requires a prompt"),
+            "{missing_prompt}"
+        );
+    }
+
+    #[test]
+    fn every_profile_alias_resolves_to_its_canonical_name() {
+        for (alias, expected) in [
+            ("scout", "explore"),
+            ("explorer", "explore"),
+            ("planner", "plan"),
+            ("executor", "build"),
+            ("worker", "build"),
+            ("reviewer", "review"),
+        ] {
+            assert_eq!(super::find_agent_profile(alias).unwrap().name, expected);
+        }
+        assert!(super::find_agent_profile("not-an-agent").is_none());
     }
 }

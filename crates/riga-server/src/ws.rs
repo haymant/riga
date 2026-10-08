@@ -2249,7 +2249,7 @@ async fn run_chat_loop(
 fn is_subagent_dispatch(input: &serde_json::Value) -> bool {
     matches!(
         input.get("action").and_then(serde_json::Value::as_str),
-        Some("dispatch") | Some("agent")
+        Some("dispatch") | Some("agent") | Some("run")
     ) && input
         .get("agent")
         .and_then(serde_json::Value::as_str)
@@ -3539,7 +3539,7 @@ fn tool_schemas() -> Vec<serde_json::Value> {
         function_schema(
             "task",
             "Run a specialized subagent (action \"dispatch\" with `agent` and `prompt`), list the subagent profiles (action \"agents\"), or manage durable task records (list/inspect/create/update). action \"agents\" only lists; it runs nothing.",
-            serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list","inspect","create","update","agents","agent_list","dispatch","agent"]},"agent":{"type":"string","enum":["explore","plan","build","review","scout","planner","executor","worker","reviewer"]},"prompt":{"type":"string"},"description":{"type":"string"},"name":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"task_id":{"type":"string"}},"required":[]}),
+            serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list","inspect","create","update","agents","agent_list","dispatch","agent","run"]},"agent":{"type":"string","enum":["explore","plan","build","review","scout","planner","executor","worker","reviewer"]},"prompt":{"type":"string"},"description":{"type":"string"},"name":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"task_id":{"type":"string"}},"required":[]}),
         ),
         function_schema(
             "skill",
@@ -4212,6 +4212,9 @@ mod tests {
         assert!(super::is_subagent_dispatch(
             &serde_json::json!({"action": "agent", "agent": "build", "prompt": "do it"})
         ));
+        assert!(super::is_subagent_dispatch(
+            &serde_json::json!({"action": "run", "agent": "review", "prompt": "check it"})
+        ));
         // Listing agents, or a dispatch with no agent, is not a subagent run.
         assert!(!super::is_subagent_dispatch(
             &serde_json::json!({"action": "agents"})
@@ -4256,16 +4259,18 @@ mod tests {
 
     #[test]
     fn read_only_profiles_cannot_write_or_dispatch() {
-        let explore = crate::catalog::find_agent_profile("explore").expect("explore profile");
-        let allowed = super::allowed_tools_for(&explore);
-        for forbidden in ["write", "bash", "task"] {
-            assert!(
-                !allowed.iter().any(|tool| tool == forbidden),
-                "explore must not be allowed `{forbidden}`: {allowed:?}"
-            );
+        for agent in ["explore", "plan", "review"] {
+            let profile = crate::catalog::find_agent_profile(agent).expect("read-only profile");
+            let allowed = super::allowed_tools_for(&profile);
+            for forbidden in ["write", "bash", "task", "shell"] {
+                assert!(
+                    !allowed.iter().any(|tool| tool == forbidden),
+                    "{agent} must not be allowed `{forbidden}`: {allowed:?}"
+                );
+            }
+            assert!(allowed.iter().any(|tool| tool == "read"));
+            assert!(allowed.iter().any(|tool| tool == "glob"));
         }
-        assert!(allowed.iter().any(|tool| tool == "read"));
-        assert!(allowed.iter().any(|tool| tool == "glob"));
     }
 
     #[test]
