@@ -3005,6 +3005,17 @@ const LOCAL_MAX_TOOL_CALLS: usize = 16;
 /// across tools.
 const MAX_SAME_TOOL_CALLS: usize = 6;
 
+/// How many consecutive turns may repeat the same tool-name set before the run
+/// stops. Catches a loop that varies the arguments, which the identical-call
+/// guard cannot see.
+const MAX_REPEATED_TURNS: usize = 3;
+
+/// Nudge sent after a turn that made more than one tool call, to push the model
+/// back to one call per reply.
+const ONE_TOOL_NUDGE: &str = "Reply with exactly ONE tool call per turn and wait for its result. \
+Do not emit several tool calls at once, and do not re-plan a step you already completed — if you \
+have the result, answer with plain prose and no tool_call block.";
+
 /// How many times the exact same call (name + arguments) may appear before the
 /// run stops. A model that repeats a call it already has the result for is
 /// looping, not working.
@@ -3554,6 +3565,10 @@ async fn run_local_loop(
     // Per tool name, so a varying-argument loop on one tool is caught too.
     let mut same_tool_calls: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    // No-progress guard: the same set of tool names turn after turn, even with
+    // different arguments, is a loop the identical-call guard cannot see.
+    let mut last_turn_signature: Option<String> = None;
+    let mut repeated_turns = 0usize;
     let mut turn = 0usize;
     loop {
         // Re-read the budget each turn so a `set_model_budget` call mid-run takes
@@ -3634,6 +3649,22 @@ async fn run_local_loop(
             ));
         }
         let (prose, tool_calls) = parse_local_tool_calls(&text);
+        if !tool_calls.is_empty() {
+            let mut names: Vec<&str> = tool_calls.iter().map(|call| call.name.as_str()).collect();
+            names.sort_unstable();
+            let signature = names.join(",");
+            if last_turn_signature.as_deref() == Some(signature.as_str()) {
+                repeated_turns += 1;
+                if repeated_turns >= MAX_REPEATED_TURNS {
+                    return Err(format!(
+                        "the local model repeated the same tool set `{signature}` {repeated_turns} turns in a row without finishing; stopping so it does not loop. Ask a narrower question or use a larger model."
+                    ));
+                }
+            } else {
+                repeated_turns = 0;
+                last_turn_signature = Some(signature);
+            }
+        }
         if !prose.is_empty() {
             final_text = prose.clone();
         }
@@ -3849,6 +3880,14 @@ async fn run_local_loop(
                     call.name
                 ));
             }
+        }
+        // The prompt asks for one call per reply; a model that batches several is
+        // usually confused and prone to re-planning. Nudge it back for next turn.
+        if tool_calls.len() > 1 {
+            messages.push(crate::local_model::ChatMessage {
+                role: "user".into(),
+                content: ONE_TOOL_NUDGE.into(),
+            });
         }
         // A turn whose only calls record run state (plan/todos/graph) and that
         // produced prose is the model's answer: re-prompting it only makes a weak
