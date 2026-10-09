@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AssistantUI } from "./AssistantUI";
 import type { RigaEventEnvelope, RigaTransport, RigaTransportListeners } from "./protocol";
@@ -121,7 +121,7 @@ describe("AssistantUI subagent task card", () => {
 
     expect(screen.getByRole("region", { name: "Agent subagents" })).toBeInTheDocument();
     expect(screen.getByText("Subagents")).toBeInTheDocument();
-    expect(screen.getByText("0/1")).toBeInTheDocument();
+    expect(screen.getAllByText("0/1").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText(/explore · Inspect the task implementation/)).toBeInTheDocument();
     expect(screen.getByText("read")).toBeInTheDocument();
     expect(screen.getByText(/crates\/riga-kernel\/src\/task\.rs/)).toBeInTheDocument();
@@ -134,7 +134,7 @@ describe("AssistantUI subagent task card", () => {
       },
     }, 6);
 
-    expect(screen.getByText("1/1")).toBeInTheDocument();
+    expect(screen.getAllByText("1/1").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("Found the TaskTree lifecycle and limits.")).toBeInTheDocument();
     expect(screen.getByText("✓")).toBeInTheDocument();
   });
@@ -169,5 +169,44 @@ describe("AssistantUI subagent task card", () => {
     expect(screen.getByText("review · Review the change")).toBeInTheDocument();
     expect(screen.getByText("review subagent failed: provider unavailable")).toBeInTheDocument();
     expect(screen.getByText("✕")).toBeInTheDocument();
+  });
+
+  it("collapses persistently and supports execution scope and node drill-down", async () => {
+    const testTransport = createTransport();
+    render(<AssistantUI transportFactory={testTransport.factory} />);
+    await waitFor(() => expect(screen.getByText("connected")).toBeInTheDocument());
+
+    testTransport.emit({ RunStarted: {} }, 1);
+    testTransport.emit({
+      GraphUpdated: {
+        graph: {
+          title: "Build change",
+          nodes: [
+            { id: "runtime", profile: "explore", description: "Inspect runtime", prompt: "inspect runtime", depends_on: [] },
+            { id: "review", profile: "review", description: "Review findings", prompt: "review findings", depends_on: ["runtime"] },
+          ],
+        },
+      },
+    }, 2);
+
+    expect(screen.getByText("Execution graph")).toBeInTheDocument();
+    expect(screen.getByText("0/2")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Execution" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "Evidence" })).toBeDisabled();
+    expect(screen.getByRole("tab", { name: "Knowledge" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: /explore.*Inspect runtime.*pending/ }));
+    expect(screen.getByText("runtime")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Session › Run ›" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Toggle Run Deck" }));
+    expect(screen.queryByText("Execution graph")).not.toBeInTheDocument();
+    expect(window.localStorage.getItem("riga.run-deck.riga.collapsed")).toBe("true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Toggle Run Deck" }));
+    expect(screen.getByText("Execution graph")).toBeInTheDocument();
+
+    expect(screen.getByRole("combobox", { name: "Run scope" })).toHaveValue("run-1");
+    expect(screen.getByRole("option", { name: "run-1 · active" })).toBeInTheDocument();
   });
 });

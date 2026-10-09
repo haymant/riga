@@ -93,7 +93,9 @@ type AgentPlanState = { title: string; steps: PlanStep[]; active_index: number }
 type TodoStatus = "pending" | "active" | "done" | "failed" | "cancelled";
 type TodoItemState = { id: string; text: string; description?: string; status: TodoStatus; reason?: string };
 type TodoListState = { title?: string; revision?: number; items: TodoItemState[] };
-type AgentTaskView = { id: string; agent: string; description: string; state: "running" | "done" | "failed"; result?: string };
+type AgentTaskView = { id: string; agent: string; description: string; state: "pending" | "running" | "waiting" | "blocked" | "done" | "failed"; result?: string; progress?: number; blockedBy?: string[]; elapsedMs?: number };
+type GraphLens = "execution" | "evidence" | "knowledge";
+type GraphNodeView = { id: string; profile: string; description: string; prompt: string; depends_on: string[]; state: AgentTaskView["state"]; progress?: number; blockedBy?: string[] };
 type PendingApproval = { approvalId: string; tool: string; summary: string };
 
 const initialSessions: Session[] = [
@@ -135,6 +137,12 @@ function loadLocal<T>(key: string, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+function isNarrowViewport(): boolean {
+  return typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? window.matchMedia("(max-width: 760px)").matches
+    : false;
 }
 
 export type AssistantUIProps = AssistantUiOptions & {
@@ -187,6 +195,12 @@ function AssistantUIInner({
   const [agentPlan, setAgentPlan] = useState<AgentPlanState | null>(null);
   const [agentTodos, setAgentTodos] = useState<TodoListState | null>(null);
   const [agentTasks, setAgentTasks] = useState<AgentTaskView[]>([]);
+  const [graphNodes, setGraphNodes] = useState<GraphNodeView[]>([]);
+  const [runIds, setRunIds] = useState<string[]>([]);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [graphLens, setGraphLens] = useState<GraphLens>("execution");
+  const [focusNode, setFocusNode] = useState<string | null>(null);
+  const [runDeckCollapsed, setRunDeckCollapsed] = useState(() => loadLocal(`riga.run-deck.${initialSessions.find((session) => session.active)?.id ?? "riga"}.collapsed`, isNarrowViewport()));
   const [theme, setTheme] = useState<"dark" | "light">(() => loadLocal("riga.theme.v1", "dark"));
   const [fullWidthEnabled, setFullWidthEnabled] = useState(initialFullWidth);
   const [transportStatus, setTransportStatus] = useState<"connecting" | "connected" | "closed" | "error">("connecting");
@@ -273,6 +287,17 @@ function AssistantUIInner({
   useEffect(() => {
     window.localStorage.setItem("riga.transcripts.v1", JSON.stringify(sessionTranscripts));
   }, [sessionTranscripts]);
+
+  useEffect(() => {
+    const key = `riga.run-deck.${activeSession.id}`;
+    setRunDeckCollapsed(loadLocal(`${key}.collapsed`, isNarrowViewport()));
+    setSelectedRunId(null);
+    setFocusNode(null);
+  }, [activeSession.id]);
+
+  useEffect(() => {
+    window.localStorage.setItem(`riga.run-deck.${activeSession.id}.collapsed`, JSON.stringify(runDeckCollapsed));
+  }, [activeSession.id, runDeckCollapsed]);
 
   useEffect(() => {
     const transcriptElement = transcriptRef.current;
@@ -409,8 +434,29 @@ function AssistantUIInner({
           setIsRunning(false);
           setTranscript((current) => [...current, { id: envelope.event_id, role: "system", text: `Agent run failed: ${(event as { RunFailed: { message: string } }).RunFailed.message}`, time: "now" }]);
         } else if (typeof event === "object" && event !== null && "RunStarted" in event) {
+          if (!runIds.includes(envelope.run_id)) setRunIds((current) => current.includes(envelope.run_id) ? current : [...current, envelope.run_id]);
+          setSelectedRunId(envelope.run_id);
+          setGraphNodes([]);
+          setAgentPlan(null);
+          setAgentTodos(null);
           setAgentTasks([]);
           setIsRunning(true);
+        } else if (typeof event === "object" && event !== null && "GraphUpdated" in event) {
+          const graph = (event as { GraphUpdated: { graph: { nodes: Array<{ id: string; profile: string; description: string; prompt: string; depends_on: string[] }> } } }).GraphUpdated.graph;
+          setGraphNodes(graph.nodes.map((node) => ({ ...node, state: "pending" })));
+        } else if (typeof event === "object" && event !== null && "TaskDependencyAdded" in event) {
+          const dependency = (event as { TaskDependencyAdded: { task_id: string; depends_on: string } }).TaskDependencyAdded;
+          setGraphNodes((current) => current.map((node) => node.id === dependency.task_id && !node.depends_on.includes(dependency.depends_on)
+            ? { ...node, depends_on: [...node.depends_on, dependency.depends_on] }
+            : node));
+        } else if (typeof event === "object" && event !== null && "TaskRunnable" in event) {
+          const runnable = (event as { TaskRunnable: { task_id: string } }).TaskRunnable;
+          setGraphNodes((current) => current.map((node) => node.id === runnable.task_id ? { ...node, state: "pending", blockedBy: [] } : node));
+          setAgentTasks((current) => current.map((task) => task.id === runnable.task_id ? { ...task, state: "pending", blockedBy: [] } : task));
+        } else if (typeof event === "object" && event !== null && "TaskBlocked" in event) {
+          const blocked = (event as { TaskBlocked: { task_id: string; blocked_by: string[] } }).TaskBlocked;
+          setGraphNodes((current) => current.map((node) => node.id === blocked.task_id ? { ...node, state: "blocked", blockedBy: blocked.blocked_by } : node));
+          setAgentTasks((current) => current.map((task) => task.id === blocked.task_id ? { ...task, state: "blocked", blockedBy: blocked.blocked_by } : task));
         } else if (typeof event === "object" && event !== null && "PlanUpdated" in event) {
           setAgentPlan((event as { PlanUpdated: { plan: AgentPlanState } }).PlanUpdated.plan);
         } else if (typeof event === "object" && event !== null && "TodoUpdated" in event) {
@@ -418,9 +464,16 @@ function AssistantUIInner({
         } else if (typeof event === "object" && event !== null && "TaskStarted" in event) {
           const task = (event as { TaskStarted: { task: { id: string; agent: string; description: string } } }).TaskStarted.task;
           setAgentTasks((current) => [...current.filter((item) => item.id !== task.id), { id: task.id, agent: task.agent, description: task.description, state: "running" }]);
+          setGraphNodes((current) => current.map((node) => node.id === task.id ? { ...node, state: "running" } : node));
+        } else if (typeof event === "object" && event !== null && "TaskStatus" in event) {
+          const status = (event as { TaskStatus: { task_id: string; state: string; elapsed_ms: number } }).TaskStatus;
+          const state = taskStateToView(status.state);
+          setAgentTasks((current) => current.map((task) => task.id === status.task_id ? { ...task, state, elapsedMs: status.elapsed_ms } : task));
+          setGraphNodes((current) => current.map((node) => node.id === status.task_id ? { ...node, state } : node));
         } else if (typeof event === "object" && event !== null && "TaskCompleted" in event) {
           const done = (event as { TaskCompleted: { task_id: string; ok: boolean; result: string } }).TaskCompleted;
           setAgentTasks((current) => current.map((item) => item.id === done.task_id ? { ...item, state: done.ok ? "done" : "failed", result: done.result } : item));
+          setGraphNodes((current) => current.map((node) => node.id === done.task_id ? { ...node, state: done.ok ? "done" : "failed" } : node));
         } else if (typeof event === "object" && event !== null && "ApprovalRequested" in event) {
           const request = (event as { ApprovalRequested: { approval_id: string; tool: string; summary: string } }).ApprovalRequested;
           setPendingApproval({ approvalId: request.approval_id, tool: request.tool, summary: request.summary });
@@ -704,7 +757,7 @@ function AssistantUIInner({
 
           {pendingApproval && <div className="approval-card"><div className="approval-icon"><ShieldCheck size={19} /></div><div className="approval-copy"><div className="approval-title"><strong>Approval required</strong><span>{pendingApproval.tool}</span></div><p>The agent wants to run <code>{pendingApproval.summary}</code>.</p></div><div className="approval-actions"><button className="deny-button" onClick={() => answerApproval(false, "once")}>Decline</button><button className="outline-button" onClick={() => answerApproval(true, "always")}>Always allow</button><button className="approve-button" onClick={() => answerApproval(true, "once")}><Check size={15} /> Allow once</button></div></div>}
 
-          {(agentPlan || agentTodos || agentTasks.length > 0) && <div className="agent-work"><AgentPlanCard plan={agentPlan} /><AgentTodoList list={agentTodos} /><AgentTaskList tasks={agentTasks} toolRuns={taskTools} /></div>}
+          {(agentPlan || agentTodos || agentTasks.length > 0 || graphNodes.length > 0) && <RunDeck collapsed={runDeckCollapsed} onToggle={() => setRunDeckCollapsed((value) => !value)} lens={graphLens} onLensChange={setGraphLens} runIds={runIds} selectedRunId={selectedRunId} onRunChange={setSelectedRunId} focusNode={focusNode} onFocusNode={setFocusNode} graphNodes={graphNodes} plan={agentPlan} todos={agentTodos} tasks={agentTasks} toolRuns={taskTools} />}
           <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" className="composer-model-name" value={providerKind === "local" ? LOCAL_MODEL_VALUE : providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{localModels?.loaded && <option value={LOCAL_MODEL_VALUE}>Local · {localModels.loaded}</option>}{Array.from(new Set([providerModel, "gpt-5-nano", "gpt-5-mini", "gpt-5-codex"])).filter(Boolean).map((model) => <option key={model} value={model}>{model}</option>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setCatalogOpen((value) => !value); setManualCatalog(true); setCatalogLayer("root"); setCatalogQuery(""); }}><Plus size={17} /></button><textarea value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${isRunning ? "stop-ready" : draft.trim() ? "send-ready" : ""}`} aria-label={isRunning ? "Stop run" : "Send message"} onClick={isRunning ? stopRun : sendMessage}>{isRunning ? <Square size={14} fill="currentColor" /> : <Send size={16} />}</button></div>{catalogOpen && <div className="catalog-menu" ref={catalogRef} role="listbox">
               <div className="catalog-menu-header">{catalogLayer === "connectors" && <button className="catalog-back" aria-label="Back to insert menu" onClick={() => setCatalogLayer("root")}><ChevronLeft size={14} /></button>}<strong>{activeTrigger ? `${activeTrigger.char === "@" ? "Mention" : "Command"} suggestions` : catalogLayer === "root" ? "Insert into composer" : "Connectors"}</strong><button className="catalog-close" aria-label="Close insert menu" onClick={() => setCatalogOpen(false)}><X size={14} /></button></div>
               <input className="catalog-search" autoFocus={catalogOpen} value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder={activeTrigger ? `Filter ${activeTrigger.char === "@" ? "files or agents" : "tools and skills"}…` : "Search tools, skills, connectors…"} aria-label="Search composer insert menu" />
@@ -914,12 +967,87 @@ function todoIcon(status: TodoStatus): string {
   }
 }
 
+function taskStateToView(state: string): AgentTaskView["state"] {
+  switch (state.toLowerCase()) {
+    case "pending": return "pending";
+    case "running": return "running";
+    case "waitingforapproval": return "waiting";
+    case "completed": return "done";
+    case "cancelled": return "failed";
+    case "failed": return "failed";
+    default: return "running";
+  }
+}
+
+function RunDeck({
+  collapsed,
+  onToggle,
+  lens,
+  onLensChange,
+  runIds,
+  selectedRunId,
+  onRunChange,
+  focusNode,
+  onFocusNode,
+  graphNodes,
+  plan,
+  todos,
+  tasks,
+  toolRuns,
+}: {
+  collapsed: boolean;
+  onToggle: () => void;
+  lens: GraphLens;
+  onLensChange: (value: GraphLens) => void;
+  runIds: string[];
+  selectedRunId: string | null;
+  onRunChange: (value: string) => void;
+  focusNode: string | null;
+  onFocusNode: (value: string | null) => void;
+  graphNodes: GraphNodeView[];
+  plan: AgentPlanState | null;
+  todos: TodoListState | null;
+  tasks: AgentTaskView[];
+  toolRuns: Record<string, Extract<TranscriptItem, { role: "tool" }>[] >;
+}) {
+  if (!plan && !todos && tasks.length === 0 && graphNodes.length === 0) return null;
+  const total = graphNodes.length || tasks.length;
+  const done = tasks.filter((task) => task.state === "done" || task.state === "failed").length;
+  const running = tasks.find((task) => task.state === "running" || task.state === "waiting");
+  const ready = graphNodes.filter((node) => node.state === "pending" && !(node.blockedBy?.length)).length;
+  const blocked = graphNodes.filter((node) => node.state === "blocked" || (node.blockedBy?.length ?? 0) > 0).length;
+  const visibleNodes = focusNode
+    ? graphNodes.filter((node) => node.id === focusNode || node.depends_on.includes(focusNode))
+    : graphNodes;
+  return (
+    <section className={`run-deck${collapsed ? " collapsed" : ""}`} aria-label="Run Deck">
+      <button type="button" className="run-deck-summary" aria-label="Toggle Run Deck" onClick={onToggle}>
+        <span className="run-deck-summary-title"><strong>Run Deck</strong><span>{lens[0].toUpperCase() + lens.slice(1)}</span>{selectedRunId ? <span>{selectedRunId}</span> : null}</span>
+        <span className="run-deck-summary-state"><strong>{done}/{total}</strong>{running ? <span>running {running.agent}</span> : null}{graphNodes.length > 0 ? <span>{ready} ready · {blocked} blocked</span> : null}<span aria-hidden>{collapsed ? "▸" : "▾"}</span></span>
+      </button>
+      {!collapsed && <div className="run-deck-body">
+        <div className="run-deck-controls" aria-label="Run Deck selectors">
+          <div className="run-deck-lenses" role="tablist" aria-label="Graph lens">
+            {(["execution", "evidence", "knowledge"] as GraphLens[]).map((value) => <button key={value} type="button" role="tab" aria-selected={lens === value} disabled={value !== "execution"} className={lens === value ? "selected" : ""} onClick={() => onLensChange(value)}>{value[0].toUpperCase() + value.slice(1)}</button>)}
+          </div>
+          <label className="run-deck-run-picker">Run scope<select aria-label="Run scope" value={selectedRunId ?? ""} onChange={(event) => onRunChange(event.target.value)}>{runIds.length === 0 && <option value="">Active run</option>}{runIds.map((runId) => <option key={runId} value={runId}>{runId === selectedRunId && runId === runIds[runIds.length - 1] ? `${runId} · active` : runId}</option>)}</select></label>
+        </div>
+        {focusNode && <div className="run-deck-breadcrumb"><button type="button" className="outline-button" onClick={() => onFocusNode(null)}>Session › Run ›</button><strong>{focusNode}</strong></div>}
+        {lens === "execution" && graphNodes.length > 0 && <section className="run-deck-graph-list" aria-label="Execution graph"><div className="agent-card-head"><strong>Execution graph</strong><span>{visibleNodes.length} node{visibleNodes.length === 1 ? "" : "s"}</span></div>{visibleNodes.map((node) => <button type="button" className={`run-deck-node node-${node.state}`} key={node.id} onClick={() => onFocusNode(node.id)}><span><strong>{node.profile}</strong><small>{node.description}</small></span><span className="run-deck-node-state">{node.state}{node.blockedBy?.length ? ` · blocked by ${node.blockedBy.join(", ")}` : ""}</span></button>)}</section>}
+        {lens === "evidence" && <div className="run-deck-empty">Evidence will appear when the run emits evidence.</div>}
+        {lens === "knowledge" && <div className="run-deck-empty">Knowledge will appear when the run emits reusable facts.</div>}
+        <div className="run-deck-cards"><AgentPlanCard plan={plan} /><AgentTodoList list={todos} /><AgentTaskList tasks={tasks} toolRuns={toolRuns} /></div>
+      </div>}
+    </section>
+  );
+}
+
 /** The subagents dispatched during this run. Mirrors the assistant-ui
  * SubagentList: one row per worker with its state, plus the summary it
  * returned. */
 function AgentTaskList({ tasks, toolRuns }: { tasks: AgentTaskView[]; toolRuns: Record<string, Extract<TranscriptItem, { role: "tool" }>[]> }) {
   if (tasks.length === 0) return null;
-  const done = tasks.filter((task) => task.state !== "running").length;
+  const done = tasks.filter((task) => task.state === "done" || task.state === "failed").length;
   const failed = tasks.filter((task) => task.state === "failed").length;
   return (
     <section className="agent-tasks" aria-label="Agent subagents">
@@ -930,10 +1058,10 @@ function AgentTaskList({ tasks, toolRuns }: { tasks: AgentTaskView[]; toolRuns: 
       <ul className="agent-steps">
         {tasks.map((task) => {
           const runs = toolRuns[task.id] ?? [];
-          const state = task.state === "running" ? "active" : task.state === "done" ? "done" : "failed";
+          const state = task.state === "running" || task.state === "waiting" ? "active" : task.state === "done" ? "done" : task.state === "failed" ? "failed" : task.state === "blocked" ? "blocked" : "pending";
           return (
             <li key={task.id} className={`agent-step todo-${state}`}>
-              <span className="agent-step-icon" aria-hidden>{task.state === "running" ? "•" : task.state === "done" ? "✓" : "✕"}</span>
+              <span className="agent-step-icon" aria-hidden>{task.state === "running" || task.state === "waiting" ? "•" : task.state === "done" ? "✓" : task.state === "failed" ? "✕" : task.state === "blocked" ? "!" : "○"}</span>
               <span className="agent-task-body">
                 {runs.length === 0 ? (
                   <span className="agent-step-label">{task.agent} · {task.description}</span>
@@ -950,6 +1078,8 @@ function AgentTaskList({ tasks, toolRuns }: { tasks: AgentTaskView[]; toolRuns: 
                     </ul>
                   </details>
                 )}
+                {task.progress !== undefined ? <span className="agent-task-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={task.progress}><span style={{ width: `${Math.max(0, Math.min(100, task.progress))}%` }} /></span> : null}
+                {task.blockedBy?.length ? <span className="agent-step-desc">Blocked by: {task.blockedBy.join(", ")}</span> : null}
                 {task.result ? <span className="agent-step-desc">{task.result.split("\n")[0]}</span> : null}
               </span>
             </li>
