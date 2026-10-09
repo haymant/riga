@@ -1,4 +1,4 @@
-import type { ProviderApi, ProviderKind, RigaEventEnvelope, RigaTransportListeners, TransportStatus } from "../protocol";
+import type { ActiveRun, ProviderApi, ProviderKind, RigaEventEnvelope, RigaTransportListeners, TransportStatus } from "../protocol";
 
 
 /** How long to wait for the server's `ready` frame before giving up and retrying. */
@@ -15,6 +15,7 @@ export type RigaWebSocketClientMessage =
   | { type: "start_run"; run_id: string; session_id: string; prompt: string }
   | { type: "resume_run"; run_id: string; after_sequence: number }
   | { type: "cancel_run"; run_id: string }
+  | { type: "list_active_runs" }
   | { type: "approval"; run_id: string; approval_id: string; approved: boolean; option?: "once" | "always" }
   | { type: "ping"; nonce: string };
 
@@ -23,6 +24,7 @@ export type RigaWebSocketServerMessage =
   | { type: "provider_configured"; endpoint: string; model: string; reasoning_effort: "low" | "medium" | "high"; kind?: ProviderKind; api?: ProviderApi; subagent_model?: string }
   | { type: "event"; envelope: RigaEventEnvelope }
   | { type: "run_cancelled"; run_id: string }
+  | { type: "active_runs"; runs: ActiveRun[] }
   | { type: "approval_recorded"; run_id: string; approval_id: string; approved: boolean }
   | { type: "pong"; nonce: string }
   | { type: "error"; code: string; message: string };
@@ -85,6 +87,7 @@ export class RigaWebSocketClient {
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closedByUser = false;
+  private pendingActiveRuns: ((runs: ActiveRun[]) => void) | null = null;
 
   connect(): Promise<void> {
     if (this.ready) return this.ready;
@@ -184,6 +187,9 @@ export class RigaWebSocketClient {
           // Older servers omit `kind`/`api`; a client written before those
           // existed must still read the frame as remote over chat completions.
           this.onProviderConfigured(parsed.endpoint, parsed.model, parsed.reasoning_effort, parsed.kind ?? "remote", parsed.api ?? "chat", parsed.subagent_model ?? "");
+        } else if (parsed.type === "active_runs") {
+          this.pendingActiveRuns?.(parsed.runs);
+          this.pendingActiveRuns = null;
         } else if (parsed.type === "error") {
           this.onStatus("error");
           this.onError(parsed.code, parsed.message);
@@ -263,6 +269,14 @@ export class RigaWebSocketClient {
   async cancelRun(runId: string): Promise<void> {
     await this.connect();
     this.send({ type: "cancel_run", run_id: runId });
+  }
+
+  async listActiveRuns(): Promise<ActiveRun[]> {
+    await this.connect();
+    return new Promise((resolve) => {
+      this.pendingActiveRuns = resolve;
+      this.send({ type: "list_active_runs" });
+    });
   }
 
   async respondToApproval(runId: string, approvalId: string, approved: boolean, option?: "once" | "always"): Promise<void> {

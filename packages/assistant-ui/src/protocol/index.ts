@@ -150,6 +150,7 @@ export interface RigaTransport {
   startRun(runId: string, sessionId: string, prompt: string): Promise<void>;
   resumeRun(runId: string, afterSequence: number): Promise<void>;
   cancelRun(runId: string): Promise<void>;
+  listActiveRuns(): Promise<ActiveRun[]>;
   respondToApproval(runId: string, approvalId: string, approved: boolean, option?: "once" | "always"): Promise<void>;
   listMcpRegistry(): Promise<McpServerSummary[]>;
   saveMcpRegistry(request: McpRegistryRequest): Promise<McpServerSummary[]>;
@@ -161,3 +162,5 @@ export interface RigaTransport {
   loadModel(path: string): Promise<void>;
   unloadModel(): Promise<void>;
 }
+
+export type ActiveRun = { run_id: string; session_id: string; local: boolean };

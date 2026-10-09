@@ -6,7 +6,10 @@ set -euo pipefail
 # example `npm run dev` from `demo/`).
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-source "$HOME/.cargo/env"
+if [[ -f "$HOME/.cargo/env" ]]; then
+  # rustup installs this file; distro-provided cargo does not need it.
+  source "$HOME/.cargo/env"
+fi
 
 # Load local settings (provider keys, RIGA_TOKEN, overrides). Writes and shell
 # are gated by the approval flow, not by environment variables.

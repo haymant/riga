@@ -71,6 +71,20 @@ describe("RigaWebSocketClient", () => {
     expect(JSON.parse(socket.sent.at(-1)!)).toEqual({ type: "resume_run", run_id: "run-1", after_sequence: 4 });
   });
 
+  it("lists active runs so a stale local run can be stopped", async () => {
+    const socket = new FakeSocket();
+    const client = new RigaWebSocketClient({ url: "ws://test/ws", socketFactory: () => socket, onEvent: vi.fn() });
+    const ready = client.connect();
+    socket.open();
+    socket.receive({ type: "ready", protocol_version: 1, server_version: "0.1.0" });
+    await ready;
+    const active = client.listActiveRuns();
+    await Promise.resolve();
+    expect(JSON.parse(socket.sent.at(-1)!)).toEqual({ type: "list_active_runs" });
+    socket.receive({ type: "active_runs", runs: [{ run_id: "run-live", session_id: "session-1", local: true }] });
+    await expect(active).resolves.toEqual([{ run_id: "run-live", session_id: "session-1", local: true }]);
+  });
+
   it("reconnects after a drop and resumes the interrupted run", async () => {
     vi.useFakeTimers();
     try {

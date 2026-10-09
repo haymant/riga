@@ -2,6 +2,7 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   Attachment,
+  ActiveRun,
   Catalog,
   CreateSessionRequest,
   Health,
@@ -108,6 +109,9 @@ export class RigaTauriTransport implements RigaTransport {
     return this.call(RIGA_IPC_COMMANDS.resumeRun, { runId, afterSequence });
   }
   cancelRun(runId: string): Promise<void> { return this.call(RIGA_IPC_COMMANDS.cancelRun, { runId }); }
+  // The current desktop IPC command set predates active-run discovery. Keep the
+  // transport compatible; the WebSocket transport provides the live registry.
+  listActiveRuns(): Promise<ActiveRun[]> { return Promise.resolve([]); }
   respondToApproval(runId: string, approvalId: string, approved: boolean, option?: "once" | "always"): Promise<void> {
     return this.call(RIGA_IPC_COMMANDS.approval, { request: { run_id: runId, approval_id: approvalId, approved, option } });
   }

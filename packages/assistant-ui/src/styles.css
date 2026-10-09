@@ -631,3 +631,55 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 .evidence-card code { color: var(--accent); font: 10px 'DM Mono', monospace; }
 .evidence-card span, .knowledge-card span { color: var(--text-muted); font: 10px 'DM Mono', monospace; }
 .run-evidence-cards, .run-knowledge-cards { display: grid; gap: 8px; }
+
+/* RunDeck card and inline footer control. */
+.run-deck { display: grid; gap: 8px; width: 100%; margin: 0 0 8px; padding: 0 12px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-soft); overflow: hidden; }
+.composer-footer .run-deck { width: auto; min-width: 0; margin: 0; padding: 0; border: 0; border-radius: 0; background: transparent; flex: 0 1 auto; }
+.run-deck-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 34px; padding: 0 0 7px; border-bottom: 1px solid var(--border); }
+.composer-footer .run-deck-header { min-height: 18px; padding: 0; border-bottom: 0; gap: 6px; }
+.run-deck-title, .run-deck-summary-state { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.run-deck-title strong { color: var(--text); font-size: 11px; }
+.run-deck-title > span, .run-deck-summary-state > span { color: var(--text-muted); font: 10px 'DM Mono', monospace; }
+.run-deck-summary-state { justify-content: flex-end; }
+.run-deck-toggle { border: 0; padding: 2px 4px; color: var(--text-muted); background: transparent; font: 12px 'DM Mono', monospace; cursor: pointer; }
+.run-deck-toggle:hover { color: var(--text); }
+.composer-footer .run-deck-title strong { font-size: 9px; }
+.composer-footer .run-deck-title > span, .composer-footer .run-deck-summary-state > span, .composer-footer .run-deck-summary-state > strong { font-size: 9px; }
+.run-deck-lenses { display: flex; gap: 8px; margin: 0 0 2px; border-bottom: 1px solid var(--border); padding: 0 2px 7px; }
+.run-deck-lenses button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 6px 4px 5px; color: var(--text-muted); background: transparent; font: 10px 'DM Mono', monospace; }
+.run-deck-lenses button.selected { color: var(--accent); border-bottom-color: var(--accent); box-shadow: none; }
+.run-stop-button { flex: 0 0 auto; width: 30px !important; height: 30px !important; padding: 0 !important; }
+/* Active RunDeck controls: make stale or recovered runs discoverable and stoppable. */
+.run-active-runs, .run-deck-live-hint { border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; background: var(--surface-raised); }
+.run-deck-live-hint { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--text-muted); font-size: 10px; }
+.active-run-list { list-style: none; display: grid; gap: 6px; margin: 8px 0 0; padding: 0; }
+.active-run-list li { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 0; border-top: 1px solid var(--border); }
+.active-run-list li:first-child { border-top: 0; padding-top: 0; }
+.active-run-list li > span { display: grid; gap: 2px; min-width: 0; }
+.active-run-list strong { overflow: hidden; color: var(--text); font: 10px 'DM Mono', monospace; text-overflow: ellipsis; white-space: nowrap; }
+.active-run-list small { color: var(--text-muted); font-size: 10px; }
+/* Shared action language: quiet field buttons, one primary action, and a neutral deny. */
+.outline-button, .approve-button, .deny-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 32px; border-radius: 8px; padding: 7px 11px; font-size: 11px; font-weight: 600; line-height: 1; transition: color .16s ease, background .16s ease, border-color .16s ease, box-shadow .16s ease; }
+.outline-button { color: var(--text); background: var(--surface-raised); border: 1px solid var(--border); }
+.outline-button:hover { color: var(--text); background: var(--surface-soft); border-color: var(--accent); }
+.deny-button { color: var(--text-muted); background: transparent; border: 1px solid var(--border); }
+.deny-button:hover { color: var(--text); background: var(--surface-soft); border-color: var(--text-muted); }
+.approve-button { color: #102219; background: var(--green); border: 1px solid color-mix(in srgb, var(--green) 75%, white); }
+.approve-button:hover { color: #102219; filter: brightness(1.07); box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 18%, transparent); }
+/* Settings-panel reference: paper card, muted mono labels, underline tabs, shared fields. */
+.settings-popover { padding: 16px; border-radius: 18px; background: var(--surface); border-color: var(--border); box-shadow: 0 20px 50px rgba(0,0,0,.22); }
+.settings-panel-header { gap: 16px; margin-bottom: 2px; }
+.settings-panel-header h2 { font-size: 19px; letter-spacing: -.02em; }
+.settings-panel-header p:not(.eyebrow) { max-width: 420px; line-height: 1.55; }
+.provider-tabs { gap: 0; margin: 16px 0 18px; padding: 0; border-bottom: 1px solid var(--border); }
+.provider-tabs button { min-height: 34px; margin-bottom: -1px; padding: 8px 11px 9px; color: var(--text-muted); border-bottom: 2px solid transparent; border-radius: 0; font: 10px 'DM Mono', monospace; }
+.provider-tabs button:hover { color: var(--text); background: var(--surface-soft); }
+.provider-tabs button.selected { color: var(--accent); border-bottom-color: var(--accent); background: transparent; }
+.provider-form { gap: 12px; }
+.provider-form label { color: var(--text-muted); gap: 6px; font: 10px 'DM Mono', monospace; }
+.provider-form input, .provider-form select { min-height: 34px; border-radius: 8px; background: var(--surface-raised); border-color: var(--border); color: var(--text); }
+.provider-form input:focus, .provider-form select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent); }
+.settings-save { height: auto; min-height: 34px; }
+.approval-actions button { min-height: 32px; }
+.connector-form-actions .outline-button, .connector-form-actions .approve-button, .model-row-actions .approve-button, .model-row-actions .outline-button { min-height: 30px; }
+@media (max-width: 760px) { .settings-popover { border-radius: 16px; padding: 14px; }.provider-tabs button { padding-inline: 9px; }.provider-form { grid-template-columns: 1fr; }.run-deck-live-hint { align-items: flex-start; flex-direction: column; } }

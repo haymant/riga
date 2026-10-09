@@ -150,6 +150,7 @@ pub(crate) const RUN_EVENT_BUFFER: usize = 1024;
 /// A run that is currently executing on the server.
 #[derive(Clone)]
 pub(crate) struct RunHandle {
+    pub(crate) session_id: String,
     /// Live events. A socket subscribes to follow the run; the run outlives any
     /// individual subscriber.
     pub(crate) events: tokio::sync::broadcast::Sender<RigaEventEnvelope>,
@@ -164,6 +165,13 @@ pub(crate) struct RunHandle {
 /// sees the same runs.
 pub(crate) type RunRegistry =
     std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, RunHandle>>>;
+
+#[derive(Debug, Serialize)]
+pub struct ActiveRun {
+    pub(crate) run_id: String,
+    pub(crate) session_id: String,
+    pub(crate) local: bool,
+}
 
 /// A frame that is streamed but not worth persisting.
 fn is_ephemeral(event: &RigaEvent) -> bool {
@@ -601,6 +609,7 @@ pub enum ClientMessage {
     CancelRun {
         run_id: String,
     },
+    ListActiveRuns,
     Approval {
         run_id: String,
         approval_id: String,
@@ -647,6 +656,9 @@ pub enum ServerMessage {
     },
     RunCancelled {
         run_id: String,
+    },
+    ActiveRuns {
+        runs: Vec<ActiveRun>,
     },
     ApprovalRecorded {
         run_id: String,
@@ -755,6 +767,19 @@ async fn forward_run<S>(
                             Ok(ClientMessage::Ping { nonce }) => {
                                 let _ = send(sender, ServerMessage::Pong { nonce }).await;
                             }
+                            Ok(ClientMessage::ListActiveRuns) => {
+                                let runs = runs
+                                    .lock()
+                                    .await
+                                    .iter()
+                                    .map(|(run_id, handle)| ActiveRun {
+                                        run_id: run_id.clone(),
+                                        session_id: handle.session_id.clone(),
+                                        local: handle.local,
+                                    })
+                                    .collect();
+                                let _ = send(sender, ServerMessage::ActiveRuns { runs }).await;
+                            }
                             Ok(ClientMessage::CancelRun { run_id }) => {
                                 if let Some(handle) = runs.lock().await.get(&run_id) {
                                     handle
@@ -821,6 +846,7 @@ pub(crate) async fn start_ipc_run(
         guard.insert(
             run_id.clone(),
             RunHandle {
+                session_id: session_id.clone(),
                 events: events.clone(),
                 cancel: cancel.clone(),
                 local: config.is_local(),
@@ -980,6 +1006,19 @@ pub(crate) async fn upgrade(
                     }
                     Ok(ClientMessage::Ping { nonce }) => {
                         let _ = send(&mut sender, ServerMessage::Pong { nonce }).await;
+                    }
+                    Ok(ClientMessage::ListActiveRuns) => {
+                        let runs = runs
+                            .lock()
+                            .await
+                            .iter()
+                            .map(|(run_id, handle)| ActiveRun {
+                                run_id: run_id.clone(),
+                                session_id: handle.session_id.clone(),
+                                local: handle.local,
+                            })
+                            .collect();
+                        let _ = send(&mut sender, ServerMessage::ActiveRuns { runs }).await;
                     }
                     Ok(ClientMessage::Approval {
                         run_id,
@@ -1182,6 +1221,7 @@ pub(crate) async fn upgrade(
                             guard.insert(
                                 run_id.clone(),
                                 RunHandle {
+                                    session_id: session_id.clone(),
                                     events: events.clone(),
                                     cancel: cancel.clone(),
                                     local: config.is_local(),
@@ -2003,6 +2043,8 @@ async fn call_openai_compatible(
             call_responses_api(
                 config,
                 workspace_root,
+                &coding_agent_system_prompt(workspace_root),
+                None,
                 prompt,
                 mcp_runtime,
                 trace_sender,
@@ -2596,21 +2638,36 @@ async fn dispatch_subagent(
             .await
         }
         _ => {
-            Box::pin(run_chat_loop(
-                &child_config,
-                workspace_root,
-                &system_prompt,
-                Some(&allowed),
-                prompt,
-                mcp_runtime,
-                trace_sender.clone(),
-                &[],
-                depth + 1,
-                broker,
-                Some(&task_id),
-                evidence,
-            ))
-            .await
+            if child_config.api == ProviderApi::Responses {
+                Box::pin(call_responses_api(
+                    &child_config,
+                    workspace_root,
+                    &system_prompt,
+                    Some(&allowed),
+                    prompt,
+                    mcp_runtime,
+                    trace_sender.clone(),
+                    &[],
+                    evidence,
+                ))
+                .await
+            } else {
+                Box::pin(run_chat_loop(
+                    &child_config,
+                    workspace_root,
+                    &system_prompt,
+                    Some(&allowed),
+                    prompt,
+                    mcp_runtime,
+                    trace_sender.clone(),
+                    &[],
+                    depth + 1,
+                    broker,
+                    Some(&task_id),
+                    evidence,
+                ))
+                .await
+            }
         }
     };
 
@@ -2880,13 +2937,13 @@ fn parse_one_local_tool_call(raw: &str) -> Option<ParsedToolCall> {
     let candidate: serde_json::Value = serde_json::from_str(raw)
         .or_else(|_| serde_json::from_str(&escape_json_control_chars(raw)))
         .ok()?;
-    let name = candidate
+    let mut name = candidate
         .get("name")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|name| !name.is_empty())?
         .to_owned();
-    let arguments = candidate
+    let mut arguments = candidate
         .get("arguments")
         .or_else(|| candidate.get("parameters"))
         .or_else(|| candidate.get("input"))
@@ -2894,10 +2951,19 @@ fn parse_one_local_tool_call(raw: &str) -> Option<ParsedToolCall> {
         .unwrap_or_else(|| serde_json::json!({}));
     // Small models often emit the arguments as a JSON *string* containing the
     // object. Unwrap that instead of failing the run over a quoting slip.
-    let arguments = match arguments {
+    arguments = match arguments {
         serde_json::Value::String(ref inner) => serde_json::from_str(inner).unwrap_or(arguments),
         other => other,
     };
+    // Small local models sometimes mistake the task action for the tool name
+    // and emit {"name":"dispatch","agent":...}. Normalize that common
+    // shape before tool lookup so it becomes the registered `task` tool.
+    if matches!(name.as_str(), "dispatch" | "agent" | "run") {
+        name = "task".into();
+        if let Some(object) = arguments.as_object_mut() {
+            object.entry("action").or_insert_with(|| serde_json::json!("dispatch"));
+        }
+    }
     Some(ParsedToolCall { name, arguments })
 }
 
@@ -2911,13 +2977,15 @@ fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition])
     let mut text = String::from(
         "\n\nYou can call tools. To call exactly one, reply with this and nothing else:\n\
          <tool_call>{\"name\": \"TOOL_NAME\", \"arguments\": {}}</tool_call>\n\n\
-         Use the exact argument names from the schemas below, and one item per call: a \
+         Use the exact tool names and argument names from the schemas below, and one item per call: a \
          write creates one file with \"path\" and \"content\"; a bash call runs one command \
          with \"command\". Do not send batches such as a \"files\" or \"commands\" array.\n\n\
          Examples:\n\
          <tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"src/app.js\"}}</tool_call>\n\
          <tool_call>{\"name\": \"write\", \"arguments\": {\"path\": \"src/app.js\", \"content\": \"console.log(1);\"}}</tool_call>\n\
          <tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"npm install\"}}</tool_call>\n\n\
+         Important: `task` is the tool name; `dispatch` is only its `action` value. \
+         Never emit a tool named `dispatch`.\n\n\
          If a tool returns no matches, an empty result, or an error, do not repeat \
          the same call. Try one genuinely different call, then answer with what you \
          have. Never call the same tool with the same arguments twice.\n\n\
@@ -2935,8 +3003,9 @@ fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition])
     text.push_str(
         "\nCall one tool per reply and wait for its result. If a tool call fails, read \
          the error and change the arguments before calling again; never repeat the same \
-         failing call. When you have the final answer, reply with plain prose and no \
-         tool_call block.\n",
+         failing call. Keep the final answer concise: use the requested format, prefer \
+         20-40 lines or fewer, and omit private chain-of-thought. When you have the final \
+         answer, reply with plain prose and no tool_call block.\n",
     );
     text
 }
@@ -3288,6 +3357,8 @@ async fn run_local_loop(
 async fn call_responses_api(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
+    system_prompt: &str,
+    allowed_tools: Option<&[String]>,
     prompt: &str,
     mcp_runtime: &McpRuntime,
     trace_sender: mpsc::Sender<ToolTraceEvent>,
@@ -3313,11 +3384,7 @@ async fn call_responses_api(
         .map_err(|e| e.to_string())?;
     // The Responses API accepts `input` as a string or a list of messages. Build
     // the list when there is history so prior turns are not lost.
-    let current = format!(
-        "{}\n\nUser request:\n{}",
-        coding_agent_system_prompt(workspace_root),
-        prompt
-    );
+    let current = format!("{}\n\nUser request:\n{}", system_prompt, prompt);
     let mut input = if history.is_empty() {
         serde_json::json!(current)
     } else {
@@ -3337,7 +3404,10 @@ async fn call_responses_api(
             // count toward this too, so give a normal turn real room.
             "max_output_tokens": 4096,
             "reasoning": { "effort": effort },
-            "tools": responses_tool_schemas(&mcp_runtime.tool_definitions().await),
+            "tools": responses_tool_schemas_for(
+                &mcp_runtime.tool_definitions().await,
+                allowed_tools,
+            ),
             // Stream so the assistant's prose reaches the client as it is
             // produced, the same way the chat-completions path does.
             "stream": true,
@@ -3581,6 +3651,21 @@ fn extract_response_text(response: &serde_json::Value) -> Result<String, String>
 
 fn responses_tool_schemas(mcp: &[rig_core::completion::ToolDefinition]) -> Vec<serde_json::Value> {
     crate::mcp::merge_response_tool_schemas(tool_schemas(), mcp.to_vec())
+}
+
+fn responses_tool_schemas_for(
+    mcp: &[rig_core::completion::ToolDefinition],
+    allowed: Option<&[String]>,
+) -> Vec<serde_json::Value> {
+    let mut tools = responses_tool_schemas(mcp);
+    if let Some(allowed) = allowed {
+        tools.retain(|tool| {
+            tool.get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| allowed.iter().any(|item| item == name))
+        });
+    }
+    tools
 }
 
 /// Build a chat request from an already-resolved tool list, so a subagent can
@@ -3838,6 +3923,7 @@ Tools:\n\
 - `grep` searches file contents; `read` reads one file. Read a file before editing it.\n\
 - `task` runs a subagent, but only when you call it with `action: \"dispatch\"`, an `agent`, and a `prompt`. The `action: \"agents\"` form only lists profiles — listing agents is not progress, so never report work done because you listed them. \
 When the user addresses an agent with `@explore`, `@plan`, `@build`, or `@review`, dispatch it with `action: \"dispatch\"` and the matching `agent` rather than doing the work yourself when the profile's remit fits.\n\
+- When coordinating multiple dependent agents or interpreting live/blocked RunDeck work, read `skills/rundeck/SKILL.md` first. It contains the graph workflow, exact dispatch forms, status meanings, and profile-specific prompt templates; do not ask read-only children to dispatch.\n\
 - `update_plan` records the checklist you are working through and `update_todos` keeps your working list current. \
 Call `update_plan` once right after exploring, then `update_todos` as work is discovered, started, finished, fails, or is dropped, instead of narrating progress in prose.\n\
 - `update_graph` publishes a machine-readable DAG with unique node ids, known profiles, prompts, and `depends_on` edges. Use it when the work has dependencies; dispatch a graph node with `task` action `dispatch`, its `node_id`, and the matching profile. A node remains blocked until every dependency completes.\n\
@@ -4332,6 +4418,17 @@ mod tests {
             assert_eq!(calls[0].arguments, expected, "for {raw}");
             assert!(prose.is_empty(), "protocol block leaked for {raw}");
         }
+    }
+
+    #[test]
+    fn local_models_may_use_dispatch_as_a_task_action_alias() {
+        let (_, calls) = parse_local_tool_calls(
+            r#"<tool_call>{"name":"dispatch","arguments":{"agent":"explore","prompt":"Study this repo"}}</tool_call>"#,
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "task");
+        assert_eq!(calls[0].arguments["action"], "dispatch");
+        assert_eq!(calls[0].arguments["agent"], "explore");
     }
 
     #[test]

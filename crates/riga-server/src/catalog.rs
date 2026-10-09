@@ -343,6 +343,7 @@ pub fn agent_profiles() -> Vec<AgentProfile> {
             "strong reasoning model",
             &[
                 "Never ask questions and never edit files.",
+                "You cannot dispatch another agent: the task tool is not available to this read-only profile. Return the plan to the parent orchestrator, which will dispatch build if implementation is needed.",
                 "Keep steps actionable at file and function level.",
                 "State risks and assumptions explicitly.",
             ],

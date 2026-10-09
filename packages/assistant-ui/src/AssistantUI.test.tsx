@@ -47,6 +47,7 @@ function createTransport() {
     startRun: async () => undefined,
     resumeRun: async () => undefined,
     cancelRun: async () => undefined,
+    listActiveRuns: async () => [],
     respondToApproval: async () => undefined,
     listMcpRegistry: async () => [],
     saveMcpRegistry: async () => [],
@@ -124,6 +125,7 @@ describe("AssistantUI subagent task card", () => {
       },
     }, 5);
 
+    fireEvent.click(screen.getByRole("button", { name: "Toggle Run Deck" }));
     expect(screen.getByRole("region", { name: "Agent subagents" })).toBeInTheDocument();
     expect(screen.getByText("Subagents")).toBeInTheDocument();
     expect(screen.getAllByText("0/1").length).toBeGreaterThanOrEqual(1);
@@ -170,6 +172,7 @@ describe("AssistantUI subagent task card", () => {
       },
     }, 2);
 
+    fireEvent.click(screen.getByRole("button", { name: "Toggle Run Deck" }));
     expect(screen.getByText("1/1 · 1 failed")).toBeInTheDocument();
     expect(screen.getByText("review · Review the change")).toBeInTheDocument();
     expect(screen.getByText("review subagent failed: provider unavailable")).toBeInTheDocument();
@@ -194,6 +197,7 @@ describe("AssistantUI subagent task card", () => {
       },
     }, 2);
 
+    fireEvent.click(screen.getByRole("button", { name: "Toggle Run Deck" }));
     expect(screen.getByText("Execution graph")).toBeInTheDocument();
     expect(screen.getByText("0/2")).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Execution" })).toHaveAttribute("aria-selected", "true");
@@ -213,5 +217,42 @@ describe("AssistantUI subagent task card", () => {
 
     expect(screen.getByRole("combobox", { name: "Run scope" })).toHaveValue("run-1");
     expect(screen.getByRole("option", { name: "run-1 · active" })).toBeInTheDocument();
+  });
+
+  it("resets the multiline composer after sending", async () => {
+    const testTransport = createTransport();
+    render(<AssistantUI transportFactory={testTransport.factory} />);
+    await waitFor(() => expect(screen.getByText("connected")).toBeInTheDocument());
+
+    const composer = screen.getByRole("textbox", { name: "" }) as HTMLTextAreaElement;
+    Object.defineProperty(composer, "scrollHeight", { configurable: true, value: 120 });
+    fireEvent.change(composer, { target: { value: "line one\nline two" } });
+    expect(composer.style.height).toBe("120px");
+
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    expect(composer.style.height).toBe("auto");
+  });
+
+  it("does not follow streamed text after the user scrolls up", async () => {
+    const testTransport = createTransport();
+    const { container } = render(<AssistantUI transportFactory={testTransport.factory} />);
+    await waitFor(() => expect(screen.getByText("connected")).toBeInTheDocument());
+
+    const transcript = container.querySelector(".transcript") as HTMLDivElement;
+    Object.defineProperties(transcript, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 500 },
+      scrollTop: { configurable: true, writable: true, value: 200 },
+    });
+    fireEvent.scroll(transcript);
+    vi.mocked(HTMLElement.prototype.scrollTo).mockClear();
+
+    testTransport.emit({ TextDelta: { delta: "streaming while reading history" } }, 1);
+    expect(HTMLElement.prototype.scrollTo).not.toHaveBeenCalled();
+
+    transcript.scrollTop = 500;
+    fireEvent.scroll(transcript);
+    testTransport.emit({ TextDelta: { delta: "follow from bottom" } }, 2);
+    await waitFor(() => expect(HTMLElement.prototype.scrollTo).toHaveBeenCalled());
   });
 });

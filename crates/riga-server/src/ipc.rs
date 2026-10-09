@@ -352,6 +352,7 @@ impl IpcService {
         self.state.runs.lock().await.insert(
             run_id.into(),
             ws::RunHandle {
+                session_id: session_id.into(),
                 events: events.clone(),
                 cancel: cancel.clone(),
                 local: false,

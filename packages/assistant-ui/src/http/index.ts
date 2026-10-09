@@ -1,5 +1,6 @@
 import type {
   Attachment,
+  ActiveRun,
   Catalog,
   CreateSessionRequest,
   Health,
@@ -72,6 +73,7 @@ export class RigaHttpTransport implements RigaTransport {
   startRun(...args: Parameters<RigaWebSocketClient["startRun"]>): Promise<void> { return this.socket.startRun(...args); }
   resumeRun(...args: Parameters<RigaWebSocketClient["resumeRun"]>): Promise<void> { return this.socket.resumeRun(...args); }
   cancelRun(...args: Parameters<RigaWebSocketClient["cancelRun"]>): Promise<void> { return this.socket.cancelRun(...args); }
+  listActiveRuns(): Promise<ActiveRun[]> { return this.socket.listActiveRuns(); }
   respondToApproval(...args: Parameters<RigaWebSocketClient["respondToApproval"]>): Promise<void> { return this.socket.respondToApproval(...args); }
   listMcpRegistry(): Promise<McpServerSummary[]> { return this.request("/mcp/registry"); }
   saveMcpRegistry(request: McpRegistryRequest): Promise<McpServerSummary[]> {
