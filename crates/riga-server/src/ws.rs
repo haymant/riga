@@ -3330,27 +3330,47 @@ fn parse_one_local_tool_call(raw: &str) -> Option<ParsedToolCall> {
 
 /// Infer a tool call from an object that carries only the arguments.
 ///
-/// Deliberately conservative: only a clear, unambiguous key maps to a tool, so a
-/// JSON example in the model's prose is left alone rather than executed.
+/// Models that drop the `{"name": …}` wrapper still use the right argument keys,
+/// so match the object against the built-in schemas: a tool is a candidate when
+/// every key is one of its properties and its `required` set is satisfied; the
+/// highest-scoring candidate wins. A JSON example in prose matches no schema and
+/// is left alone.
 fn infer_tool_call(object: &serde_json::Map<String, serde_json::Value>) -> Option<ParsedToolCall> {
-    let has = |key: &str| object.contains_key(key);
-    let name = if has("action") || has("agent") || has("node_id") {
-        "task"
-    } else if has("command") {
-        "bash"
-    } else if has("content") && has("path") {
-        "write"
-    } else if has("pattern") {
-        "glob"
-    } else if has("query") {
-        "grep"
-    } else if has("url") {
-        "web"
-    } else if has("path") {
-        "read"
-    } else {
+    if object.is_empty() {
         return None;
-    };
+    }
+    let mut best: Option<(String, usize)> = None;
+    for definition in builtin_tool_definitions() {
+        let Some(properties) = definition
+            .parameters
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+        else {
+            continue;
+        };
+        // Every key must be a property of this tool, or the shape is not it.
+        if object.keys().any(|key| !properties.contains_key(key)) {
+            continue;
+        }
+        let required: Vec<&str> = definition
+            .parameters
+            .get("required")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default();
+        if !required.iter().all(|key| object.contains_key(*key)) {
+            continue;
+        }
+        // Prefer the tool that explains the most keys and requires the most.
+        let score = object.len() + required.len();
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_score)| score > *best_score)
+        {
+            best = Some((definition.name.clone(), score));
+        }
+    }
+    let (name, _) = best?;
     let mut arguments = serde_json::Value::Object(object.clone());
     if name == "task"
         && let Some(map) = arguments.as_object_mut()
@@ -3358,10 +3378,7 @@ fn infer_tool_call(object: &serde_json::Map<String, serde_json::Value>) -> Optio
         map.entry("action")
             .or_insert_with(|| serde_json::json!("dispatch"));
     }
-    Some(ParsedToolCall {
-        name: name.into(),
-        arguments,
-    })
+    Some(ParsedToolCall { name, arguments })
 }
 
 /// Tool instructions for a local model, appended to the coding-agent prompt.
@@ -4924,11 +4941,11 @@ mod tests {
 
     #[test]
     fn a_block_with_no_name_is_rejected_rather_than_executed() {
-        // An object with no recognizable tool shape cannot be dispatched, and
+        // An object whose keys match no tool schema cannot be dispatched, and
         // guessing a tool would be worse than ignoring it.
         let (_, calls) = parse_local_tool_calls("<tool_call>{\"arguments\":{}}</tool_call>");
         assert!(calls.is_empty());
-        let (_, calls) = parse_local_tool_calls("<tool_call>{\"name\":\"  \"}</tool_call>");
+        let (_, calls) = parse_local_tool_calls("<tool_call>{\"unrecognized\":\"x\"}</tool_call>");
         assert!(calls.is_empty());
     }
 
@@ -5013,6 +5030,39 @@ mod tests {
         let (prose, calls) = parse_local_tool_calls("The task: find the largest files");
         assert!(calls.is_empty(), "{calls:?}");
         assert!(prose.contains("find the largest files"), "{prose}");
+    }
+
+    #[test]
+    fn arguments_only_objects_are_matched_to_a_tool_by_schema() {
+        // The wrapper-less shape Qwen2.5 Coder emits: the arguments alone, no
+        // `name`. Each is matched to the tool whose schema it fits.
+        let cases = [
+            (
+                r#"{"active_index":0,"steps":[{"id":"1","label":"find files"}],"title":"Find files"}"#,
+                "update_plan",
+            ),
+            (
+                r#"{"content":"plan text","path":"src/planning/plan.txt"}"#,
+                "write",
+            ),
+            (r#"{"command":"ls -la"}"#, "bash"),
+            (r#"{"pattern":"src/**"}"#, "glob"),
+            (r#"{"query":"needle"}"#, "grep"),
+            (r#"{"path":"a.txt"}"#, "read"),
+            (
+                r#"{"action":"dispatch","agent":"plan","prompt":"plan it"}"#,
+                "task",
+            ),
+        ];
+        for (raw, expected) in cases {
+            let (_, calls) = parse_local_tool_calls(&format!("```json\n{raw}\n```"));
+            assert_eq!(calls.len(), 1, "{raw} -> {calls:?}");
+            assert_eq!(calls[0].name, expected, "{raw}");
+        }
+        // A JSON example in prose matches no schema and stays prose.
+        let (prose, calls) = parse_local_tool_calls("```json\n{\"key\": \"value\"}\n```");
+        assert!(calls.is_empty(), "{calls:?}");
+        assert!(prose.contains("\"key\""), "{prose}");
     }
 
     #[test]
