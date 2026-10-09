@@ -77,6 +77,11 @@ afterEach(() => {
 
 beforeEach(() => {
   HTMLElement.prototype.scrollTo = vi.fn();
+  vi.stubGlobal("ResizeObserver", class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  });
 });
 
 describe("AssistantUI subagent task card", () => {
@@ -195,7 +200,7 @@ describe("AssistantUI subagent task card", () => {
     expect(screen.getByRole("tab", { name: "Evidence" })).toBeDisabled();
     expect(screen.getByRole("tab", { name: "Knowledge" })).toBeDisabled();
 
-    fireEvent.click(screen.getByRole("button", { name: /explore.*Inspect runtime.*pending/ }));
+    fireEvent.click(screen.getByRole("button", { name: /explore.*Inspect runtime.*ready/ }));
     expect(screen.getByText("runtime")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Session › Run ›" })).toBeInTheDocument();
 

@@ -29,6 +29,7 @@ import {
 import "./styles.css";
 import { Markdown } from "./Markdown";
 import { DEFAULT_ASSISTANT_UI_OPTIONS, type AssistantUiOptions } from "./options";
+import { RunGraphPanel } from "./RunGraphPanel";
 
 // Sentinel for the composer's local-model entry. Distinct from any remote model
 // id so selecting it is unambiguous.
@@ -1016,9 +1017,6 @@ function RunDeck({
   const running = tasks.find((task) => task.state === "running" || task.state === "waiting");
   const ready = graphNodes.filter((node) => node.state === "pending" && !(node.blockedBy?.length)).length;
   const blocked = graphNodes.filter((node) => node.state === "blocked" || (node.blockedBy?.length ?? 0) > 0).length;
-  const visibleNodes = focusNode
-    ? graphNodes.filter((node) => node.id === focusNode || node.depends_on.includes(focusNode))
-    : graphNodes;
   return (
     <section className={`run-deck${collapsed ? " collapsed" : ""}`} aria-label="Run Deck">
       <button type="button" className="run-deck-summary" aria-label="Toggle Run Deck" onClick={onToggle}>
@@ -1033,7 +1031,7 @@ function RunDeck({
           <label className="run-deck-run-picker">Run scope<select aria-label="Run scope" value={selectedRunId ?? ""} onChange={(event) => onRunChange(event.target.value)}>{runIds.length === 0 && <option value="">Active run</option>}{runIds.map((runId) => <option key={runId} value={runId}>{runId === selectedRunId && runId === runIds[runIds.length - 1] ? `${runId} · active` : runId}</option>)}</select></label>
         </div>
         {focusNode && <div className="run-deck-breadcrumb"><button type="button" className="outline-button" onClick={() => onFocusNode(null)}>Session › Run ›</button><strong>{focusNode}</strong></div>}
-        {lens === "execution" && graphNodes.length > 0 && <section className="run-deck-graph-list" aria-label="Execution graph"><div className="agent-card-head"><strong>Execution graph</strong><span>{visibleNodes.length} node{visibleNodes.length === 1 ? "" : "s"}</span></div>{visibleNodes.map((node) => <button type="button" className={`run-deck-node node-${node.state}`} key={node.id} onClick={() => onFocusNode(node.id)}><span><strong>{node.profile}</strong><small>{node.description}</small></span><span className="run-deck-node-state">{node.state}{node.blockedBy?.length ? ` · blocked by ${node.blockedBy.join(", ")}` : ""}</span></button>)}</section>}
+        {lens === "execution" && graphNodes.length > 0 && <RunGraphPanel nodes={graphNodes} focusNode={focusNode} onFocusNode={onFocusNode} />}
         {lens === "evidence" && <div className="run-deck-empty">Evidence will appear when the run emits evidence.</div>}
         {lens === "knowledge" && <div className="run-deck-empty">Knowledge will appear when the run emits reusable facts.</div>}
         <div className="run-deck-cards"><AgentPlanCard plan={plan} /><AgentTodoList list={todos} /><AgentTaskList tasks={tasks} toolRuns={toolRuns} /></div>

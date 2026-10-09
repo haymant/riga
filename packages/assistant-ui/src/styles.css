@@ -555,6 +555,15 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 .run-deck-node.node-done .run-deck-node-state { color: var(--green); }
 .run-deck-empty { border: 1px dashed var(--border); border-radius: 10px; padding: 12px; color: var(--text-muted); font-size: 11px; }
 .run-deck-cards { display: grid; gap: 8px; }
+.run-graph-panel { display: grid; gap: 7px; border: 1px solid var(--border); border-radius: 12px; padding: 11px 13px; background: var(--surface-raised); }
+.run-graph-canvas { height: 250px; overflow: hidden; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-soft); }
+.run-graph-canvas .react-flow { --xy-background-color: var(--surface-soft); --xy-node-background-color: var(--surface-raised); --xy-node-border: var(--border); --xy-edge-stroke: var(--text-muted); --xy-edge-stroke-width: 1.4; }
+.run-graph-canvas .react-flow__node { min-width: 130px; max-width: 190px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; color: var(--text); background: var(--surface-raised); font: 10px/1.35 'DM Mono', monospace; white-space: pre-line; }
+.run-graph-canvas .react-flow__node.node-done { border-color: var(--green); }
+.run-graph-canvas .react-flow__node.node-blocked, .run-graph-canvas .react-flow__node.node-failed { border-color: var(--amber); }
+.run-graph-canvas .react-flow__edge.execution-edge.blocked path { stroke: var(--amber); stroke-dasharray: 5 4; }
+.run-graph-canvas .react-flow__edge.execution-edge.satisfied path { stroke: var(--green); }
+.run-graph-fallback { display: none; gap: 5px; }
 .agent-plan, .agent-todos { border: 1px solid var(--border); border-radius: 12px; background: var(--surface-raised); padding: 11px 13px; }
 .agent-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .agent-card-head strong { color: var(--text); font-size: 11px; font-weight: 700; }
