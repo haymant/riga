@@ -3060,6 +3060,8 @@ fn parse_local_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
     let (prose, mut calls) = parse_tagged_tool_calls(text);
     let (prose, fenced) = parse_fenced_tool_calls(&prose);
     calls.extend(fenced);
+    let (prose, keyed) = parse_keyed_lines(&prose);
+    calls.extend(keyed);
     (prose, calls)
 }
 
@@ -3121,12 +3123,9 @@ fn parse_fenced_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
         } else {
             body
         };
-        let is_json = tag.is_empty() || tag.eq_ignore_ascii_case("json");
-        let call = if is_json {
-            parse_one_local_tool_call(body.trim())
-        } else {
-            None
-        };
+        // A `json` fence holds a JSON object; a `text` fence (Hermes) holds the
+        // loose `tool key:value …` form. Try both; anything else stays prose.
+        let call = parse_loose_tool_call(body.trim());
         match call {
             Some(call) => {
                 prose.push_str(&scan[..open]);
@@ -3138,6 +3137,111 @@ fn parse_fenced_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
     }
     prose.push_str(scan);
     (prose.trim().to_owned(), calls)
+}
+
+/// Try the JSON shape first, then the loose `tool key:value …` shape.
+fn parse_loose_tool_call(body: &str) -> Option<ParsedToolCall> {
+    parse_one_local_tool_call(body).or_else(|| parse_key_value_tool_call(body))
+}
+
+/// Argument keys the loose `tool key:value key:value` form may carry.
+///
+/// A token is a key only when it is one of these, so a colon inside a value (a
+/// URL, a `file:` path) is never mistaken for a new key.
+const LOOSE_ARGUMENT_KEYS: &[&str] = &[
+    "action",
+    "agent",
+    "prompt",
+    "description",
+    "path",
+    "content",
+    "command",
+    "pattern",
+    "query",
+    "url",
+    "name",
+    "title",
+    "status",
+    "task_id",
+    "node_id",
+    "parent_task_id",
+];
+
+/// Parse the loose form Hermes emits when it ignores the JSON protocol:
+/// `task action:dispatch agent:plan prompt:Plan the steps …`.
+///
+/// The first token is the tool name and the rest is `key:value` pairs where a
+/// value runs until the next recognized key. The first token after the name must
+/// be a key, so ordinary prose (`read the file`) is not mistaken for a call.
+fn parse_key_value_tool_call(line: &str) -> Option<ParsedToolCall> {
+    let line = line.trim();
+    let (name, rest) = line.split_once(char::is_whitespace)?;
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let mut args = serde_json::Map::new();
+    let mut key: Option<&str> = None;
+    let mut value = String::new();
+    let mut first = true;
+    for token in rest.split_whitespace() {
+        match split_loose_key(token) {
+            Some((next_key, next_value)) => {
+                if let Some(previous) = key.take() {
+                    args.insert(
+                        previous.to_owned(),
+                        serde_json::Value::String(value.trim().to_owned()),
+                    );
+                }
+                key = Some(next_key);
+                value = next_value.to_owned();
+            }
+            None => {
+                if first {
+                    return None;
+                }
+                value.push(' ');
+                value.push_str(token);
+            }
+        }
+        first = false;
+    }
+    let last = key?;
+    args.insert(
+        last.to_owned(),
+        serde_json::Value::String(value.trim().to_owned()),
+    );
+
+    let mut name = name.to_owned();
+    if matches!(name.as_str(), "dispatch" | "agent" | "run") {
+        name = "task".into();
+    }
+    if name == "task" {
+        args.entry("action")
+            .or_insert_with(|| serde_json::json!("dispatch"));
+    }
+    Some(ParsedToolCall {
+        name,
+        arguments: serde_json::Value::Object(args),
+    })
+}
+
+/// `key:value` when `key` is a recognized argument key.
+fn split_loose_key(token: &str) -> Option<(&str, &str)> {
+    let (key, value) = token.split_once(':')?;
+    LOOSE_ARGUMENT_KEYS.contains(&key).then_some((key, value))
+}
+
+/// Consume any whole line that is a loose `tool key:value …` call.
+fn parse_keyed_lines(text: &str) -> (String, Vec<ParsedToolCall>) {
+    let mut calls = Vec::new();
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        match parse_key_value_tool_call(line) {
+            Some(call) => calls.push(call),
+            None => kept.push(line),
+        }
+    }
+    (kept.join("\n").trim().to_owned(), calls)
 }
 
 /// Escape literal control characters inside JSON string values.
@@ -4843,6 +4947,43 @@ mod tests {
         assert!(calls.is_empty(), "{calls:?}");
         assert!(prose.contains("ls -la"), "{prose}");
         assert!(prose.contains("\"key\""), "{prose}");
+    }
+
+    #[test]
+    fn a_loose_key_value_task_call_is_parsed() {
+        // Hermes-3 shape 2: a `text` fence with the loose key:value form.
+        let (prose, calls) = parse_local_tool_calls(
+            "I'll dispatch the plan agent:\n\n```text\ntask action:dispatch agent:plan prompt:Plan steps to find the top 10 largest files in the workspace.\n```\n\nThen build.",
+        );
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].name, "task");
+        assert_eq!(calls[0].arguments["action"], "dispatch");
+        assert_eq!(calls[0].arguments["agent"], "plan");
+        assert_eq!(
+            calls[0].arguments["prompt"],
+            "Plan steps to find the top 10 largest files in the workspace."
+        );
+        assert!(prose.contains("Then build"), "{prose}");
+        assert!(!prose.contains("agent:plan"), "{prose}");
+    }
+
+    #[test]
+    fn a_loose_key_value_call_works_without_a_fence() {
+        let (_, calls) = parse_local_tool_calls("bash command:ls -la /tmp");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments["command"], "ls -la /tmp");
+    }
+
+    #[test]
+    fn loose_parsing_leaves_prose_alone() {
+        // No recognized key, or the token after the name is not a key.
+        let (prose, calls) = parse_local_tool_calls("read the file carefully");
+        assert!(calls.is_empty(), "{calls:?}");
+        assert_eq!(prose, "read the file carefully");
+        let (prose, calls) = parse_local_tool_calls("The task: find the largest files");
+        assert!(calls.is_empty(), "{calls:?}");
+        assert!(prose.contains("find the largest files"), "{prose}");
     }
 
     #[tokio::test]
