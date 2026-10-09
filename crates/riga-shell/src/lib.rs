@@ -68,8 +68,52 @@ pub fn ensure_workspace(workspace: &std::path::Path) -> std::io::Result<()> {
     if !workspace.join(".git").exists() {
         init_workspace_repo(workspace)?;
     }
+    // The workspace starts empty, so the bundled `skills/` never reach it and
+    // the composer's insert menu lists none. Seed them (a user's edited copy
+    // wins over the bundled one).
+    seed_bundled_skills(workspace, bundled_skills_source().as_deref());
     std::env::set_var("RIGA_WORKSPACE_ROOT", workspace);
     Ok(())
+}
+
+/// Where the shell's bundled skills live, if any.
+///
+/// `RIGA_SKILLS_DIR` overrides; otherwise the repository `skills/` next to this
+/// crate at build time. That is present under `tauri dev` and absent in a
+/// packaged app that does not ship the source tree, in which case there is
+/// simply nothing to seed.
+fn bundled_skills_source() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("RIGA_SKILLS_DIR") {
+        return Some(std::path::PathBuf::from(dir));
+    }
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills");
+    repo.is_dir().then_some(repo)
+}
+
+/// Copy each bundled `<name>/SKILL.md` into `<workspace>/skills/<name>/SKILL.md`.
+///
+/// An existing workspace skill is left untouched, so a user's edited copy wins.
+fn seed_bundled_skills(workspace: &std::path::Path, source: Option<&std::path::Path>) {
+    let Some(source) = source else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(source) else {
+        return;
+    };
+    let dest = workspace.join("skills");
+    for entry in entries.flatten() {
+        let from = entry.path();
+        if !from.join("SKILL.md").is_file() {
+            continue;
+        }
+        let to = dest.join(entry.file_name());
+        if to.join("SKILL.md").exists() {
+            continue;
+        }
+        if std::fs::create_dir_all(&to).is_ok() {
+            let _ = std::fs::copy(from.join("SKILL.md"), to.join("SKILL.md"));
+        }
+    }
 }
 
 /// `git init` plus an empty initial commit, so worktrees can fork from `HEAD`.
@@ -119,5 +163,31 @@ mod tests {
             Some(workspace.clone().into_os_string())
         );
         std::env::remove_var("RIGA_WORKSPACE_ROOT");
+    }
+
+    #[test]
+    fn ensure_workspace_seeds_bundled_skills_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("bundled");
+        std::fs::create_dir_all(source.join("demo")).unwrap();
+        std::fs::write(source.join("demo/SKILL.md"), "bundled").unwrap();
+
+        // An existing workspace skill wins over the bundled copy.
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("skills/demo")).unwrap();
+        std::fs::write(workspace.join("skills/demo/SKILL.md"), "local").unwrap();
+        super::seed_bundled_skills(&workspace, Some(&source));
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("skills/demo/SKILL.md")).unwrap(),
+            "local"
+        );
+
+        // A fresh workspace receives the bundled skill.
+        let fresh = dir.path().join("fresh");
+        super::seed_bundled_skills(&fresh, Some(&source));
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("skills/demo/SKILL.md")).unwrap(),
+            "bundled"
+        );
     }
 }

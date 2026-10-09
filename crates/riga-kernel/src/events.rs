@@ -60,10 +60,20 @@ pub enum RigaEvent {
     TaskRunnable {
         task_id: String,
     },
-    EvidenceAdded { evidence: Box<EvidenceNode> },
-    EvidenceLinked { claim_id: String, evidence_id: String },
-    KnowledgeCreated { knowledge: Box<KnowledgeNode> },
-    KnowledgeLinked { knowledge_id: String, evidence_id: String },
+    EvidenceAdded {
+        evidence: Box<EvidenceNode>,
+    },
+    EvidenceLinked {
+        claim_id: String,
+        evidence_id: String,
+    },
+    KnowledgeCreated {
+        knowledge: Box<KnowledgeNode>,
+    },
+    KnowledgeLinked {
+        knowledge_id: String,
+        evidence_id: String,
+    },
     /// A subagent task was dispatched.
     TaskStarted {
         task: Box<crate::task::TaskRecord>,
@@ -215,10 +225,31 @@ mod tests {
     #[test]
     fn evidence_and_knowledge_events_round_trip_over_the_wire() {
         let events = [
-            RigaEvent::EvidenceAdded { evidence: Box::new(EvidenceNode { id: "ev-1".into(), claim: "symbol exists".into(), source_ref: "src/lib.rs:12".into(), confidence: 90, task_id: Some("task-1".into()) }) },
-            RigaEvent::EvidenceLinked { claim_id: "claim-1".into(), evidence_id: "ev-1".into() },
-            RigaEvent::KnowledgeCreated { knowledge: Box::new(KnowledgeNode { id: "k-1".into(), fact: "the kernel is transport-neutral".into(), source_run_id: "run-1".into(), confidence: 85 }) },
-            RigaEvent::KnowledgeLinked { knowledge_id: "k-1".into(), evidence_id: "ev-1".into() },
+            RigaEvent::EvidenceAdded {
+                evidence: Box::new(EvidenceNode {
+                    id: "ev-1".into(),
+                    claim: "symbol exists".into(),
+                    source_ref: "src/lib.rs:12".into(),
+                    confidence: 90,
+                    task_id: Some("task-1".into()),
+                }),
+            },
+            RigaEvent::EvidenceLinked {
+                claim_id: "claim-1".into(),
+                evidence_id: "ev-1".into(),
+            },
+            RigaEvent::KnowledgeCreated {
+                knowledge: Box::new(KnowledgeNode {
+                    id: "k-1".into(),
+                    fact: "the kernel is transport-neutral".into(),
+                    source_run_id: "run-1".into(),
+                    confidence: 85,
+                }),
+            },
+            RigaEvent::KnowledgeLinked {
+                knowledge_id: "k-1".into(),
+                evidence_id: "ev-1".into(),
+            },
         ];
         for event in events {
             let json = serde_json::to_string(&event).unwrap();

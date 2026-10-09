@@ -54,6 +54,12 @@ const MAX_DECODE_BATCH: u32 = 2048;
 /// for a test.
 const _: () = assert!(MAX_DECODE_BATCH > 0 && MAX_DECODE_BATCH < MAX_CONTEXT);
 
+/// Output tokens reserved per turn so the prompt can never consume the whole
+/// window: every turn keeps room to finish a reasoning block and emit a tool
+/// call or an answer. When the prompt leaves less than this, the oldest
+/// non-system messages are dropped until it fits.
+const MIN_OUTPUT_TOKENS: u32 = 1_536;
+
 /// Device memory the auto-fit planner is told to leave unused, per device.
 ///
 /// llama.cpp's estimate of weights + KV cache is exact for the tensors it knows
@@ -188,7 +194,10 @@ fn requested_context(curated_max: Option<u32>, override_value: Option<&str>) -> 
     override_value
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or_else(|| curated_max.unwrap_or(DEFAULT_CONTEXT))
+        // Cap the default at `DEFAULT_CONTEXT`: a curated model may advertise a
+        // 32k window, but fitting that KV cache on a consumer GPU offloads fewer
+        // layers and decode crawls. `RIGA_LOCAL_CONTEXT` can raise it.
+        .unwrap_or_else(|| curated_max.unwrap_or(DEFAULT_CONTEXT).min(DEFAULT_CONTEXT))
 }
 
 /// Clamp a requested completion to the room the prompt leaves behind.
@@ -652,9 +661,17 @@ impl LocalModelRuntime {
                     format!("Model could not be loaded (the GGUF may be corrupt or exceed available memory): {error}")
                 },
             )?;
+            // `fit_params` rewrites `n_ctx` only when it was left unset; it is set
+            // explicitly here, so this is still `requested`. Read it back rather
+            // than reusing `requested`, so the fitted value stays authoritative if
+            // that behaviour changes.
+            let fitted_context = context_params
+                .n_ctx()
+                .map(std::num::NonZeroU32::get)
+                .unwrap_or(requested);
             // The GGUF header is the source of truth; the curated window and the
             // fitted window are only starting points that get clamped by it.
-            let context_size = resolve_context(model.n_ctx_train(), requested);
+            let context_size = resolve_context(model.n_ctx_train(), fitted_context);
             // Report the window actually resolved, so a short output budget can
             // be diagnosed against the real context instead of guessed at.
             tracing::info!(
@@ -747,29 +764,61 @@ impl LocalModelRuntime {
             .lock()
             .map_err(|_| "Model engine state is unavailable")?;
         let loaded = guard.as_ref().ok_or("Load a local model before chatting")?;
-        let llama_messages = messages
-            .iter()
-            .filter_map(|message| {
-                let role = match message.role.as_str() {
-                    "system" => "system",
-                    "assistant" => "assistant",
-                    "user" => "user",
-                    "tool" => "user",
-                    _ => return None,
-                };
-                LlamaChatMessage::new(role.to_owned(), message.content.clone()).ok()
-            })
-            .collect::<Vec<_>>();
-        if llama_messages.is_empty() {
-            return Err("Enter a message to start a conversation".into());
-        }
         let template = loaded.model.chat_template(None).map_err(|error| {
             format!("The model does not provide a supported chat template: {error}")
         })?;
-        let prompt = loaded
-            .model
-            .apply_chat_template(&template, &llama_messages, true)
-            .map_err(|error| format!("Could not format the chat prompt: {error}"))?;
+        // Build the prompt for a candidate message list. Trimming re-templates so
+        // the token count is measured on the same text llama.cpp will see.
+        let build_prompt = |messages: &[ChatMessage]| -> Result<(String, Vec<llama_cpp_2::token::LlamaToken>), String> {
+            let llama_messages = messages
+                .iter()
+                .filter_map(|message| {
+                    let role = match message.role.as_str() {
+                        "system" => "system",
+                        "assistant" => "assistant",
+                        "user" => "user",
+                        "tool" => "user",
+                        _ => return None,
+                    };
+                    LlamaChatMessage::new(role.to_owned(), message.content.clone()).ok()
+                })
+                .collect::<Vec<_>>();
+            if llama_messages.is_empty() {
+                return Err("Enter a message to start a conversation".into());
+            }
+            let prompt = loaded
+                .model
+                .apply_chat_template(&template, &llama_messages, true)
+                .map_err(|error| format!("Could not format the chat prompt: {error}"))?;
+            let tokens = loaded.model.vocab().tokenize(prompt.as_bytes(), true, true);
+            Ok((prompt, tokens))
+        };
+        let context_size = loaded.context_size;
+        // Token-aware budget: keep the system preamble and the newest messages,
+        // dropping the oldest non-system ones until the prompt leaves room to
+        // answer. Without this a small model that re-decodes a growing history
+        // every turn fills the window and the output budget collapses to nothing.
+        let mut working = messages.to_vec();
+        let (prompt, tokens) = loop {
+            let (prompt, tokens) = build_prompt(&working)?;
+            if tokens.is_empty() {
+                return Err("The model tokenizer returned an empty prompt".into());
+            }
+            let room = context_size.saturating_sub(tokens.len() as u32);
+            if room >= MIN_OUTPUT_TOKENS || working.len() <= 1 {
+                break (prompt, tokens);
+            }
+            match working
+                .iter()
+                .skip(1)
+                .position(|message| message.role != "system")
+            {
+                Some(offset) => {
+                    working.remove(offset + 1);
+                }
+                None => break (prompt, tokens),
+            }
+        };
         // A template that ends with ` thinking` has already opened the reasoning
         // block; the model's first tokens are the reasoning itself. Written as an
         // escape: literal angle-bracket tags get mangled by tooling.
@@ -777,11 +826,6 @@ impl LocalModelRuntime {
             prompt.trim_end().ends_with("\u{3c}think\u{3e}"),
             Ordering::Relaxed,
         );
-        let tokens = loaded.model.vocab().tokenize(prompt.as_bytes(), true, true);
-        if tokens.is_empty() {
-            return Err("The model tokenizer returned an empty prompt".into());
-        }
-        let context_size = loaded.context_size;
         let max_tokens = resolve_max_tokens(max_tokens, tokens.len() as u32, context_size)?;
         // Bound the decode batch independently of the context window. n_batch /
         // n_ubatch drive compute-buffer sizing, so tying them to n_ctx would turn
@@ -841,6 +885,7 @@ impl LocalModelRuntime {
         // cut off mid-thought, which the caller has to know.
         let mut ended_on_token = false;
         let mut timed_out = false;
+        let mut timeout: Option<TimeoutKind> = None;
         let mut generated_tokens = 0usize;
         // Reset per token, so a generation that stalls (a long decode, or a model
         // that stops emitting) is caught by the no-progress limit instead of
@@ -852,10 +897,14 @@ impl LocalModelRuntime {
                 break;
             }
             let now = Instant::now();
-            if deadline.is_some_and(|deadline| now >= deadline)
-                || no_progress.is_some_and(|limit| now.duration_since(last_progress) >= limit)
-            {
+            if deadline.is_some_and(|deadline| now >= deadline) {
                 timed_out = true;
+                timeout = Some(TimeoutKind::Deadline);
+                break;
+            }
+            if no_progress.is_some_and(|limit| now.duration_since(last_progress) >= limit) {
+                timed_out = true;
+                timeout = Some(TimeoutKind::NoProgress);
                 break;
             }
             let token = sampler.sample(&context, sample_row);
@@ -891,8 +940,18 @@ impl LocalModelRuntime {
             truncated: !ended_on_token,
             tokens: generated_tokens,
             timed_out,
+            timeout,
         })
     }
+}
+
+/// Which watchdog stopped generation short of the model's end token or the cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutKind {
+    /// The overall turn wall-clock elapsed: slow but still progressing.
+    Deadline,
+    /// No token was produced within the idle window: a real stall.
+    NoProgress,
 }
 
 /// One local completion.
@@ -908,6 +967,9 @@ pub struct Generated {
     /// True when the deadline or no-progress limit stopped generation, as opposed
     /// to the model's end token or the token cap.
     pub timed_out: bool,
+    /// Which watchdog fired, so the caller can say "slow" instead of always
+    /// reporting "stalled".
+    pub timeout: Option<TimeoutKind>,
 }
 
 fn is_gguf(path: &Path) -> bool {
@@ -1018,21 +1080,27 @@ mod tests {
     };
 
     #[test]
-    fn context_is_the_curated_window_unless_overridden() {
-        // Curated model: its own window.
-        assert_eq!(requested_context(Some(32_768), None), 32_768);
+    fn context_defaults_to_the_safe_window_unless_overridden() {
+        // A curated model's larger window is capped at the default: fitting a
+        // 32k KV cache on a consumer GPU offloads fewer layers and decode crawls.
+        assert_eq!(requested_context(Some(32_768), None), DEFAULT_CONTEXT);
+        // A curated window smaller than the default is respected.
+        assert_eq!(requested_context(Some(4_096), None), 4_096);
         // Non-curated model: the safe default.
         assert_eq!(requested_context(None, None), DEFAULT_CONTEXT);
         // An explicit override wins, and resolve_context still clamps it to the
         // GGUF's trained window.
         assert_eq!(requested_context(Some(32_768), Some("4096")), 4_096);
         assert_eq!(
-            resolve_context(131_072, requested_context(Some(32_768), Some("4096"))),
-            4_096
+            resolve_context(131_072, requested_context(Some(32_768), Some("16384"))),
+            16_384
         );
         // Junk or zero falls back rather than panicking in `clamp`.
-        assert_eq!(requested_context(Some(32_768), Some("nonsense")), 32_768);
-        assert_eq!(requested_context(Some(32_768), Some("0")), 32_768);
+        assert_eq!(
+            requested_context(Some(32_768), Some("nonsense")),
+            DEFAULT_CONTEXT
+        );
+        assert_eq!(requested_context(Some(32_768), Some("0")), DEFAULT_CONTEXT);
         // An override below the floor is clamped up, not accepted as-is.
         assert_eq!(
             resolve_context(131_072, requested_context(None, Some("1"))),

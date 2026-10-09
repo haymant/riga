@@ -1421,30 +1421,132 @@ async fn execute_tool(
                 .ok_or("glob requires pattern")?,
         ),
         "find_symbol" | "find_callers" | "find_references" | "find_tests" => {
-            let query = input.get("symbol").or_else(|| input.get("query")).and_then(serde_json::Value::as_str).ok_or_else(|| argument_error(name, "{\"symbol\": \"<name>\"}", &input))?;
+            let query = input
+                .get("symbol")
+                .or_else(|| input.get("query"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| argument_error(name, "{\"symbol\": \"<name>\"}", &input))?;
             crate::catalog::execute_repository_query(workspace_root, name, query).await
         }
         "add_evidence" => {
-            let evidence = riga_kernel::events::EvidenceNode { id: input.get("id").and_then(serde_json::Value::as_str).unwrap_or("evidence-1").into(), claim: input.get("claim").and_then(serde_json::Value::as_str).ok_or("add_evidence requires claim")?.into(), source_ref: input.get("source_ref").and_then(serde_json::Value::as_str).ok_or("add_evidence requires source_ref")?.into(), confidence: input.get("confidence").and_then(serde_json::Value::as_u64).unwrap_or(50).min(100) as u8, task_id: input.get("task_id").and_then(serde_json::Value::as_str).map(str::to_owned) };
-            if let Some(stream) = &output_stream { stream.trace_sender.send(ToolTraceEvent::Ui(riga_kernel::events::RigaEvent::EvidenceAdded { evidence: Box::new(evidence.clone()) })).await.map_err(|_| "tool lifecycle stream closed")?; }
+            let evidence = riga_kernel::events::EvidenceNode {
+                id: input
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("evidence-1")
+                    .into(),
+                claim: input
+                    .get("claim")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("add_evidence requires claim")?
+                    .into(),
+                source_ref: input
+                    .get("source_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("add_evidence requires source_ref")?
+                    .into(),
+                confidence: input
+                    .get("confidence")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(50)
+                    .min(100) as u8,
+                task_id: input
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+            };
+            if let Some(stream) = &output_stream {
+                stream
+                    .trace_sender
+                    .send(ToolTraceEvent::Ui(
+                        riga_kernel::events::RigaEvent::EvidenceAdded {
+                            evidence: Box::new(evidence.clone()),
+                        },
+                    ))
+                    .await
+                    .map_err(|_| "tool lifecycle stream closed")?;
+            }
             serde_json::to_string(&evidence).map_err(|e| e.to_string())
         }
         "link_evidence" => {
-            let claim_id = input.get("claim_id").and_then(serde_json::Value::as_str).ok_or("link_evidence requires claim_id")?;
-            let evidence_id = input.get("evidence_id").and_then(serde_json::Value::as_str).ok_or("link_evidence requires evidence_id")?;
-            if let Some(stream) = &output_stream { stream.trace_sender.send(ToolTraceEvent::Ui(riga_kernel::events::RigaEvent::EvidenceLinked { claim_id: claim_id.into(), evidence_id: evidence_id.into() })).await.map_err(|_| "tool lifecycle stream closed")?; }
+            let claim_id = input
+                .get("claim_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("link_evidence requires claim_id")?;
+            let evidence_id = input
+                .get("evidence_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("link_evidence requires evidence_id")?;
+            if let Some(stream) = &output_stream {
+                stream
+                    .trace_sender
+                    .send(ToolTraceEvent::Ui(
+                        riga_kernel::events::RigaEvent::EvidenceLinked {
+                            claim_id: claim_id.into(),
+                            evidence_id: evidence_id.into(),
+                        },
+                    ))
+                    .await
+                    .map_err(|_| "tool lifecycle stream closed")?;
+            }
             Ok(format!("linked evidence {evidence_id} to claim {claim_id}"))
         }
         "remember" => {
-            let knowledge = riga_kernel::events::KnowledgeNode { id: input.get("id").and_then(serde_json::Value::as_str).unwrap_or("knowledge-1").into(), fact: input.get("fact").and_then(serde_json::Value::as_str).ok_or("remember requires fact")?.into(), source_run_id: String::new(), confidence: input.get("confidence").and_then(serde_json::Value::as_u64).unwrap_or(50).min(100) as u8 };
-            if let Some(stream) = &output_stream { stream.trace_sender.send(ToolTraceEvent::Ui(riga_kernel::events::RigaEvent::KnowledgeCreated { knowledge: Box::new(knowledge.clone()) })).await.map_err(|_| "tool lifecycle stream closed")?; }
+            let knowledge = riga_kernel::events::KnowledgeNode {
+                id: input
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("knowledge-1")
+                    .into(),
+                fact: input
+                    .get("fact")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("remember requires fact")?
+                    .into(),
+                source_run_id: String::new(),
+                confidence: input
+                    .get("confidence")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(50)
+                    .min(100) as u8,
+            };
+            if let Some(stream) = &output_stream {
+                stream
+                    .trace_sender
+                    .send(ToolTraceEvent::Ui(
+                        riga_kernel::events::RigaEvent::KnowledgeCreated {
+                            knowledge: Box::new(knowledge.clone()),
+                        },
+                    ))
+                    .await
+                    .map_err(|_| "tool lifecycle stream closed")?;
+            }
             serde_json::to_string(&knowledge).map_err(|e| e.to_string())
         }
         "link_knowledge" => {
-            let knowledge_id = input.get("knowledge_id").and_then(serde_json::Value::as_str).ok_or("link_knowledge requires knowledge_id")?;
-            let evidence_id = input.get("evidence_id").and_then(serde_json::Value::as_str).ok_or("link_knowledge requires evidence_id")?;
-            if let Some(stream) = &output_stream { stream.trace_sender.send(ToolTraceEvent::Ui(riga_kernel::events::RigaEvent::KnowledgeLinked { knowledge_id: knowledge_id.into(), evidence_id: evidence_id.into() })).await.map_err(|_| "tool lifecycle stream closed")?; }
-            Ok(format!("linked knowledge {knowledge_id} to evidence {evidence_id}"))
+            let knowledge_id = input
+                .get("knowledge_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("link_knowledge requires knowledge_id")?;
+            let evidence_id = input
+                .get("evidence_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("link_knowledge requires evidence_id")?;
+            if let Some(stream) = &output_stream {
+                stream
+                    .trace_sender
+                    .send(ToolTraceEvent::Ui(
+                        riga_kernel::events::RigaEvent::KnowledgeLinked {
+                            knowledge_id: knowledge_id.into(),
+                            evidence_id: evidence_id.into(),
+                        },
+                    ))
+                    .await
+                    .map_err(|_| "tool lifecycle stream closed")?;
+            }
+            Ok(format!(
+                "linked knowledge {knowledge_id} to evidence {evidence_id}"
+            ))
         }
         "grep" => {
             crate::catalog::execute_grep(
@@ -2961,7 +3063,9 @@ fn parse_one_local_tool_call(raw: &str) -> Option<ParsedToolCall> {
     if matches!(name.as_str(), "dispatch" | "agent" | "run") {
         name = "task".into();
         if let Some(object) = arguments.as_object_mut() {
-            object.entry("action").or_insert_with(|| serde_json::json!("dispatch"));
+            object
+                .entry("action")
+                .or_insert_with(|| serde_json::json!("dispatch"));
         }
     }
     Some(ParsedToolCall { name, arguments })
@@ -3137,8 +3241,17 @@ async fn run_local_loop(
         let truncated = generated.truncated;
         generated_total += generated.tokens;
         if generated.timed_out {
+            let reason = match generated.timeout {
+                Some(crate::local_model::TimeoutKind::NoProgress) => {
+                    "produced no token within the idle window (a real stall)"
+                }
+                Some(crate::local_model::TimeoutKind::Deadline) => {
+                    "hit the per-turn time limit while still generating (slow, not stalled)"
+                }
+                None => "was stopped by a watchdog",
+            };
             return Err(format!(
-                "The local model stalled and was stopped after {generated_total} tokens. It may be too large for this prompt; try a smaller prompt, a faster build, or a shorter request."
+                "The local model {reason} after {generated_total} tokens. A slow local model can over-run a turn on a long reasoning block; try a smaller prompt, a shorter request, or a faster build (CUDA/Metal)."
             ));
         }
         if generated_total >= LOCAL_RUN_TOKEN_BUDGET {
@@ -3354,6 +3467,7 @@ async fn run_local_loop(
     Err("local model exceeded the maximum tool-call turns".into())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_responses_api(
     config: &ProviderConfig,
     workspace_root: &std::path::Path,
