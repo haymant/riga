@@ -19,7 +19,10 @@ use std::{
 
 use encoding_rs::UTF_8;
 use llama_cpp_2::{
-    context::{LlamaContext, params::LlamaContextParams},
+    context::{
+        LlamaContext,
+        params::{KvCacheType, LlamaContextParams},
+    },
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{LlamaChatMessage, LlamaModel, params::LlamaModelParams},
@@ -39,9 +42,12 @@ const MIN_CONTEXT: u32 = 1024;
 /// would crawl.
 const MAX_CONTEXT: u32 = 32_768;
 
-/// Context used for a GGUF that is not in the curated catalog and therefore has
-/// no curated window to go on.
-const DEFAULT_CONTEXT: u32 = 8_192;
+/// Default context window, used both as the fallback for a GGUF with no curated
+/// entry and as the cap on a curated model's larger window. 16k leaves room for
+/// a long reasoning block plus the prompt; the KV cache is q8_0 (see
+/// `context_params_with`), so it still fits a consumer GPU. `RIGA_LOCAL_CONTEXT`
+/// overrides it.
+const DEFAULT_CONTEXT: u32 = 16_384;
 
 /// Tokens decoded per `llama_decode` call. Deliberately not tied to the
 /// context size: llama.cpp sizes its compute buffers from `n_ubatch`, so a
@@ -354,10 +360,31 @@ fn requested_context(curated_max: Option<u32>, override_value: Option<&str>) -> 
     override_value
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|value| *value > 0)
-        // Cap the default at `DEFAULT_CONTEXT`: a curated model may advertise a
-        // 32k window, but fitting that KV cache on a consumer GPU offloads fewer
-        // layers and decode crawls. `RIGA_LOCAL_CONTEXT` can raise it.
+        // Cap the default at `DEFAULT_CONTEXT` and let `RIGA_LOCAL_CONTEXT` raise
+        // it: a curated model may advertise 128k, but a window that large does not
+        // fit a consumer GPU and decode crawls.
         .unwrap_or_else(|| curated_max.unwrap_or(DEFAULT_CONTEXT).min(DEFAULT_CONTEXT))
+}
+
+/// Context params for the KV cache.
+///
+/// On a GPU build FlashAttention is enabled and the KV cache is q8_0: quantized V
+/// requires FlashAttention, and q8_0 roughly halves the cache versus f16 with
+/// negligible quality loss, so a 16k window fits where f16 would force fewer
+/// offloaded layers. A CPU-only build keeps the defaults.
+fn context_params_with(n_ctx: u32, batch_size: u32) -> LlamaContextParams {
+    let params = LlamaContextParams::default()
+        .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
+        .with_n_batch(batch_size)
+        .with_n_ubatch(batch_size);
+    if cfg!(any(feature = "cuda", feature = "metal")) {
+        params
+            .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED)
+            .with_type_k(KvCacheType::Q8_0)
+            .with_type_v(KvCacheType::Q8_0)
+    } else {
+        params
+    }
 }
 
 /// Clamp a requested completion to the room the prompt leaves behind.
@@ -777,10 +804,7 @@ impl LocalModelRuntime {
             )
             .clamp(MIN_CONTEXT, MAX_CONTEXT);
             let batch_size = requested.min(MAX_DECODE_BATCH);
-            let mut context_params = LlamaContextParams::default()
-                .with_n_ctx(std::num::NonZeroU32::new(requested))
-                .with_n_batch(batch_size)
-                .with_n_ubatch(batch_size);
+            let mut context_params = context_params_with(requested, batch_size);
 
             // Fit the GPU plan to the memory actually available instead of
             // offloading every layer (`u32::MAX`), which OOMs any card that
@@ -1004,10 +1028,7 @@ impl LocalModelRuntime {
         // aborts the process instead of returning an error, hence the chunked
         // prompt evaluation below.
         let batch_size = context_size.min(MAX_DECODE_BATCH);
-        let context_params = LlamaContextParams::default()
-            .with_n_ctx(std::num::NonZeroU32::new(context_size))
-            .with_n_batch(batch_size)
-            .with_n_ubatch(batch_size);
+        let context_params = context_params_with(context_size, batch_size);
         let mut context: LlamaContext =
             loaded
                 .model

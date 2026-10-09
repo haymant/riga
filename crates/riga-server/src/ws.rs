@@ -3407,7 +3407,7 @@ async fn run_local_loop(
             }
             if truncated {
                 answer.push_str(&format!(
-                    "\n\n[truncated] The local model reached its {}-token output limit, so this reply is cut off.",
+                    "\n\n[truncated] The local model reached this turn's {}-token output limit (the smaller of the run budget and the context room), so the reply is cut off. Raise it with set_model_budget, or use a larger context via RIGA_LOCAL_CONTEXT.",
                     budget.max_tokens
                 ));
             }
