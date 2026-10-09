@@ -380,9 +380,9 @@ fn requested_context(curated_max: Option<u32>, override_value: Option<&str>) -> 
 /// requires FlashAttention, and q8_0 roughly halves the cache versus f16 with
 /// negligible quality loss, so a 16k window fits where f16 would force fewer
 /// offloaded layers. A CPU-only build keeps the defaults.
-fn context_params_with(n_ctx: Option<u32>, batch_size: u32) -> LlamaContextParams {
+fn context_params_with(n_ctx: u32, batch_size: u32) -> LlamaContextParams {
     let params = LlamaContextParams::default()
-        .with_n_ctx(n_ctx.and_then(std::num::NonZeroU32::new))
+        .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
         .with_n_batch(batch_size)
         .with_n_ubatch(batch_size);
     if cfg!(any(feature = "cuda", feature = "metal")) {
@@ -803,17 +803,17 @@ impl LocalModelRuntime {
                 .to_owned();
             let curated = CATALOG.iter().find(|entry| entry.file_name == file_name);
 
-            // An explicit `RIGA_LOCAL_CONTEXT` is honored and `fit_params` reduces
-            // layers to fit it. Without one, hand fit `n_ctx = 0` so it picks the
-            // largest window that fits the free VRAM, bounded by the model's own
-            // trained window — a bigger card automatically gets a bigger context.
-            let override_raw = std::env::var("RIGA_LOCAL_CONTEXT").ok();
-            let explicit = parse_context_override(override_raw.as_deref());
-            let requested =
-                requested_context(curated.map(|entry| entry.max_context), override_raw.as_deref())
-                    .clamp(MIN_CONTEXT, MAX_CONTEXT);
+            // The window to run with: `RIGA_LOCAL_CONTEXT` if set, else the capped
+            // default. `fit_params` reduces GPU layers to fit it rather than
+            // shrinking the window, so the model never lands on CPU with a huge
+            // KV cache — which is what `n_ctx = 0` auto-select can do.
+            let requested = requested_context(
+                curated.map(|entry| entry.max_context),
+                std::env::var("RIGA_LOCAL_CONTEXT").ok().as_deref(),
+            )
+            .clamp(MIN_CONTEXT, MAX_CONTEXT);
             let batch_size = requested.min(MAX_DECODE_BATCH);
-            let mut context_params = context_params_with(explicit.map(|_| requested), batch_size);
+            let mut context_params = context_params_with(requested, batch_size);
 
             // Fit the GPU plan to the memory actually available instead of
             // offloading every layer (`u32::MAX`), which OOMs any card that
@@ -854,9 +854,6 @@ impl LocalModelRuntime {
                         "local model auto-fit found no GPU plan; loading on CPU"
                     );
                     params = Box::pin(LlamaModelParams::default().with_n_gpu_layers(0));
-                    // No GPU plan: use the capped default window, not whatever
-                    // `fit_params` left when it was asked to auto-select.
-                    context_params = context_params_with(Some(requested), batch_size);
                 }
             }
             let model = LlamaModel::load_from_file(&backend, &model_path, &params).map_err(
@@ -1038,7 +1035,7 @@ impl LocalModelRuntime {
         // aborts the process instead of returning an error, hence the chunked
         // prompt evaluation below.
         let batch_size = context_size.min(MAX_DECODE_BATCH);
-        let context_params = context_params_with(Some(context_size), batch_size);
+        let context_params = context_params_with(context_size, batch_size);
         let mut context: LlamaContext =
             loaded
                 .model
@@ -1545,12 +1542,9 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_context_leaves_n_ctx_unset_so_fit_picks_the_window() {
-        // `None` lets `fit_params` choose the largest window that fits; `Some`
-        // keeps an explicit window and reduces layers instead.
-        assert!(context_params_with(None, 2_048).n_ctx().is_none());
+    fn context_params_carry_the_requested_window() {
         assert_eq!(
-            context_params_with(Some(16_384), 2_048)
+            context_params_with(16_384, 2_048)
                 .n_ctx()
                 .map(std::num::NonZeroU32::get),
             Some(16_384)

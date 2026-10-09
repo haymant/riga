@@ -3057,6 +3057,14 @@ fn strip_reasoning(text: &str) -> String {
 /// two passes share one scan: the first collects calls, the second strips the
 /// blocks, so they can never disagree about which blocks were recognised.
 fn parse_local_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
+    let (prose, mut calls) = parse_tagged_tool_calls(text);
+    let (prose, fenced) = parse_fenced_tool_calls(&prose);
+    calls.extend(fenced);
+    (prose, calls)
+}
+
+/// Extract `<tool_call>{…}</tool_call>` blocks, the format the prompt asks for.
+fn parse_tagged_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
     const OPEN: &str = "<tool_call>";
     const CLOSE: &str = "</tool_call>";
     let mut calls = Vec::new();
@@ -3078,6 +3086,55 @@ fn parse_local_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
         }
         prose.push_str(&scan[..start]);
         scan = &after_open[end + CLOSE.len()..];
+    }
+    prose.push_str(scan);
+    (prose.trim().to_owned(), calls)
+}
+
+/// Extract tool calls the model wrote as a fenced JSON block instead of a
+/// `<tool_call>` block.
+///
+/// Hermes 3 and similar models routinely answer with a `json` fenced block
+/// (`{"action":"dispatch","agent":"plan",…}`) and never call the tool otherwise.
+/// Only JSON fences whose body parses to a recognizable tool call are consumed;
+/// anything else stays prose.
+fn parse_fenced_tool_calls(text: &str) -> (String, Vec<ParsedToolCall>) {
+    let mut calls = Vec::new();
+    let mut prose = String::with_capacity(text.len());
+    let mut scan = text;
+    while let Some(open) = scan.find("```") {
+        let after = &scan[open + 3..];
+        let Some(close) = after.find("```") else {
+            break;
+        };
+        let inner = &after[..close];
+        let (tag, body) = match inner.find('\n') {
+            Some(newline) => (inner[..newline].trim(), &inner[newline + 1..]),
+            None => ("", inner),
+        };
+        // A single-line fence may still carry a `json` tag before the object.
+        let body = body.trim_start();
+        let body = if tag.is_empty() {
+            body.strip_prefix("json")
+                .map(str::trim_start)
+                .unwrap_or(body)
+        } else {
+            body
+        };
+        let is_json = tag.is_empty() || tag.eq_ignore_ascii_case("json");
+        let call = if is_json {
+            parse_one_local_tool_call(body.trim())
+        } else {
+            None
+        };
+        match call {
+            Some(call) => {
+                prose.push_str(&scan[..open]);
+                calls.push(call);
+            }
+            None => prose.push_str(&scan[..open + 3 + close + 3]),
+        }
+        scan = &after[close + 3..];
     }
     prose.push_str(scan);
     (prose.trim().to_owned(), calls)
@@ -3124,36 +3181,83 @@ fn parse_one_local_tool_call(raw: &str) -> Option<ParsedToolCall> {
     let candidate: serde_json::Value = serde_json::from_str(raw)
         .or_else(|_| serde_json::from_str(&escape_json_control_chars(raw)))
         .ok()?;
-    let mut name = candidate
+    let object = candidate.as_object()?;
+
+    // An explicit `name` is authoritative.
+    if let Some(name) = object
         .get("name")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
-        .filter(|name| !name.is_empty())?
-        .to_owned();
-    let mut arguments = candidate
-        .get("arguments")
-        .or_else(|| candidate.get("parameters"))
-        .or_else(|| candidate.get("input"))
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    // Small models often emit the arguments as a JSON *string* containing the
-    // object. Unwrap that instead of failing the run over a quoting slip.
-    arguments = match arguments {
-        serde_json::Value::String(ref inner) => serde_json::from_str(inner).unwrap_or(arguments),
-        other => other,
-    };
-    // Small local models sometimes mistake the task action for the tool name
-    // and emit {"name":"dispatch","agent":...}. Normalize that common
-    // shape before tool lookup so it becomes the registered `task` tool.
-    if matches!(name.as_str(), "dispatch" | "agent" | "run") {
-        name = "task".into();
-        if let Some(object) = arguments.as_object_mut() {
-            object
-                .entry("action")
-                .or_insert_with(|| serde_json::json!("dispatch"));
+        .filter(|name| !name.is_empty())
+    {
+        let mut name = name.to_owned();
+        let mut arguments = object
+            .get("arguments")
+            .or_else(|| object.get("parameters"))
+            .or_else(|| object.get("input"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        // Small models often emit the arguments as a JSON *string* containing the
+        // object. Unwrap that instead of failing the run over a quoting slip.
+        arguments = match arguments {
+            serde_json::Value::String(ref inner) => {
+                serde_json::from_str(inner).unwrap_or(arguments)
+            }
+            other => other,
+        };
+        // Small local models sometimes mistake the task action for the tool name
+        // and emit {"name":"dispatch","agent":...}. Normalize that common
+        // shape before tool lookup so it becomes the registered `task` tool.
+        if matches!(name.as_str(), "dispatch" | "agent" | "run") {
+            name = "task".into();
+            if let Some(object) = arguments.as_object_mut() {
+                object
+                    .entry("action")
+                    .or_insert_with(|| serde_json::json!("dispatch"));
+            }
         }
+        return Some(ParsedToolCall { name, arguments });
     }
-    Some(ParsedToolCall { name, arguments })
+
+    // No `name`: infer the tool from the argument shape. Models that ignore the
+    // `<tool_call>{"name": …}` wrapper still tend to use the right argument keys.
+    infer_tool_call(object)
+}
+
+/// Infer a tool call from an object that carries only the arguments.
+///
+/// Deliberately conservative: only a clear, unambiguous key maps to a tool, so a
+/// JSON example in the model's prose is left alone rather than executed.
+fn infer_tool_call(object: &serde_json::Map<String, serde_json::Value>) -> Option<ParsedToolCall> {
+    let has = |key: &str| object.contains_key(key);
+    let name = if has("action") || has("agent") || has("node_id") {
+        "task"
+    } else if has("command") {
+        "bash"
+    } else if has("content") && has("path") {
+        "write"
+    } else if has("pattern") {
+        "glob"
+    } else if has("query") {
+        "grep"
+    } else if has("url") {
+        "web"
+    } else if has("path") {
+        "read"
+    } else {
+        return None;
+    };
+    let mut arguments = serde_json::Value::Object(object.clone());
+    if name == "task"
+        && let Some(map) = arguments.as_object_mut()
+    {
+        map.entry("action")
+            .or_insert_with(|| serde_json::json!("dispatch"));
+    }
+    Some(ParsedToolCall {
+        name: name.into(),
+        arguments,
+    })
 }
 
 /// Tool instructions for a local model, appended to the coding-agent prompt.
@@ -3178,6 +3282,7 @@ fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition])
          To let a subagent use a tool it lacks, call `grant_tools` (for example \
          {\"profile\": \"plan\", \"tools\": [\"bash\"]}); the user is asked to approve. \
          `reset_tools` clears those grants.\n\n\
+         Emit the call directly, not inside a markdown code fence.\n\n\
          Important: `task` is the tool name; `dispatch` is only its `action` value. \
          Never emit a tool named `dispatch`.\n\n\
          If a tool returns no matches, an empty result, or an error, do not repeat \
@@ -4686,12 +4791,58 @@ mod tests {
 
     #[test]
     fn a_block_with_no_name_is_rejected_rather_than_executed() {
-        // An unnamed call cannot be dispatched, and guessing a tool would be
-        // worse than ignoring it.
+        // An object with no recognizable tool shape cannot be dispatched, and
+        // guessing a tool would be worse than ignoring it.
         let (_, calls) = parse_local_tool_calls("<tool_call>{\"arguments\":{}}</tool_call>");
         assert!(calls.is_empty());
         let (_, calls) = parse_local_tool_calls("<tool_call>{\"name\":\"  \"}</tool_call>");
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn a_fenced_json_dispatch_is_parsed_as_a_task_call() {
+        // Hermes-3 shape: the arguments alone, inside a ```json fence, with no
+        // `<tool_call>` wrapper and no `name`.
+        let (prose, calls) = parse_local_tool_calls(
+            "First, I'll dispatch the plan agent:\n\n```json\n{\"action\": \"dispatch\", \"agent\": \"plan\", \"prompt\": \"plan it\"}\n```\n\nThen I'll wait.",
+        );
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].name, "task");
+        assert_eq!(calls[0].arguments["agent"], "plan");
+        assert_eq!(calls[0].arguments["action"], "dispatch");
+        assert!(prose.contains("Then I'll wait"), "{prose}");
+        assert!(
+            !prose.contains("\"action\""),
+            "the fence is consumed: {prose}"
+        );
+    }
+
+    #[test]
+    fn a_fenced_named_call_or_bare_shape_is_parsed() {
+        let (_, calls) = parse_local_tool_calls(
+            "```json\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.txt\"}}\n```",
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+
+        // No name: the argument keys name the tool.
+        let (_, calls) = parse_local_tool_calls("```json\n{\"command\": \"ls -la\"}\n```");
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments["command"], "ls -la");
+        let (_, calls) = parse_local_tool_calls("```json\n{\"path\": \"a.txt\"}\n```");
+        assert_eq!(calls[0].name, "read");
+        let (_, calls) = parse_local_tool_calls("```json\n{\"pattern\": \"src/**\"}\n```");
+        assert_eq!(calls[0].name, "glob");
+    }
+
+    #[test]
+    fn a_non_tool_fence_stays_prose() {
+        let (prose, calls) = parse_local_tool_calls(
+            "Run this:\n\n```bash\nls -la\n```\n\nConfig:\n\n```json\n{\"key\": \"value\"}\n```\n",
+        );
+        assert!(calls.is_empty(), "{calls:?}");
+        assert!(prose.contains("ls -la"), "{prose}");
+        assert!(prose.contains("\"key\""), "{prose}");
     }
 
     #[tokio::test]
