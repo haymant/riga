@@ -2997,6 +2997,14 @@ const MAX_CONSECUTIVE_TOOL_FAILURES: usize = 3;
 /// budget; this stops it even when every call is a *different* pattern.
 const LOCAL_MAX_TOOL_CALLS: usize = 16;
 
+/// How many times a single tool may be called in one run before it stops.
+///
+/// A model that keeps calling the same tool with *different* arguments (a fresh
+/// `find`, `bash`, `read`, …) evades the identical-call guard and loops until the
+/// whole-run cap. This bounds a single tool without capping legitimate variety
+/// across tools.
+const MAX_SAME_TOOL_CALLS: usize = 6;
+
 /// How many times the exact same call (name + arguments) may appear before the
 /// run stops. A model that repeats a call it already has the result for is
 /// looping, not working.
@@ -3543,6 +3551,9 @@ async fn run_local_loop(
     // Across turns: a call the model already made must not be re-run.
     let mut tool_calls_total = 0usize;
     let mut seen_calls: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Per tool name, so a varying-argument loop on one tool is caught too.
+    let mut same_tool_calls: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut turn = 0usize;
     loop {
         // Re-read the budget each turn so a `set_model_budget` call mid-run takes
@@ -3693,6 +3704,17 @@ async fn run_local_loop(
             if tool_calls_total > LOCAL_MAX_TOOL_CALLS {
                 return Err(format!(
                     "the local model made more than {LOCAL_MAX_TOOL_CALLS} tool calls without finishing; stopping so it does not loop. Ask a narrower question or use a larger model."
+                ));
+            }
+            let same_tool = {
+                let entry = same_tool_calls.entry(call.name.clone()).or_insert(0usize);
+                *entry += 1;
+                *entry
+            };
+            if same_tool > MAX_SAME_TOOL_CALLS {
+                return Err(format!(
+                    "the local model called `{}` {same_tool} times in this run without finishing; stopping so it does not loop. Ask a narrower question or use a larger model.",
+                    call.name
                 ));
             }
             let repeats = {
