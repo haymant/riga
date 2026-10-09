@@ -88,17 +88,20 @@ A live task is not the same as a durable task record. Durable actions (`create`,
 | Profile | Model | Default tools | Can write/dispatch? |
 |---|---|---|---|
 | `explore` / `scout` | cheap/fast (subagent model) | read, glob, grep, skill, bash | No / No |
-| `plan` / `planner` | strong reasoning (subagent model) | read, glob, grep, skill, bash | No / No |
+| `plan` / `planner` | strong reasoning (subagent model) | read, glob, grep, skill | No / No |
 | `build` / `executor` | capable coding (main model) | read, write, glob, grep, bash, task, skill | Yes / Yes |
 | `review` / `reviewer` | strong reasoning (subagent model) | read, glob, grep, skill, bash | No / No |
 
 Every profile also gets the run-state tools: `update_plan`, `update_todos`,
 `update_graph`, `set_model_budget`, `grant_tools`, `reset_tools`.
 
-`bash` is available to **every** profile but each call is **approval-gated**, so
-a read-only agent can run `find`/`ls`/`git` once you approve it. `write` and
-`task` are only on `build`. The model is chosen by `subagent_model_for`: the
-configured `subagent_model` for read-only profiles, else the main model.
+`bash` is available to `explore`, `review`, and `build`, but each call is
+**approval-gated**, so a recon agent can run `find`/`ls`/`git` once you approve.
+`plan` deliberately has **no shell**: a planner that can execute loops on its own
+plan's commands instead of returning a plan — dispatch `build` to run them.
+`write` and `task` are only on `build`. The model is chosen by
+`subagent_model_for`: the configured `subagent_model` for read-only profiles,
+else the main model.
 
 ### Granting tools to a subagent (HITL)
 

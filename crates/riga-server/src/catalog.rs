@@ -363,10 +363,14 @@ pub fn agent_profiles() -> Vec<AgentProfile> {
             &["planner"],
             true,
             "Turn requirements and exploration findings into a concrete implementation plan.",
-            &["read", "glob", "grep", "skill", "bash"],
+            // No `bash`: a planner must not execute. With shell access it ran the
+            // plan's own commands and looped on them instead of returning a plan;
+            // `explore` and `build` are the profiles that run commands.
+            &["read", "glob", "grep", "skill"],
             "strong reasoning model",
             &[
                 "Never ask questions and never edit files.",
+                "Produce the plan only: do not run shell commands, write files, or dispatch agents. Read and search to inform the plan if needed.",
                 "You cannot dispatch another agent: the task tool is not available to this read-only profile. Return the plan to the parent orchestrator, which will dispatch build if implementation is needed.",
                 "Keep steps actionable at file and function level.",
                 "State risks and assumptions explicitly.",

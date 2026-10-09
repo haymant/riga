@@ -3371,12 +3371,13 @@ fn infer_tool_call(object: &serde_json::Map<String, serde_json::Value>) -> Optio
 /// Hermes/Qwen convention these checkpoints were tuned on, which is why it is
 /// used here instead of inventing a new one.
 fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition]) -> String {
+    // The exact shape Qwen2.5/3 and Hermes 3 templates emit when they are given
+    // tools: a `# Tools` section, the signatures inside `<tools>`, then the
+    // `<tool_call>` instruction. Matching it is what makes the model actually
+    // emit a call instead of inventing a shape.
     let mut text = String::from(
-        "\n\nYou are a function-calling AI model. The available functions are listed inside \
-         <tools></tools> XML tags. To call one, reply with a JSON object inside \
-         <tool_call></tool_call> tags and nothing else:\n\
-         <tool_call>{\"name\": \"TOOL_NAME\", \"arguments\": {}}</tool_call>\n\n\
-         <tools>\n",
+        "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n\
+         You are provided with function signatures within <tools></tools> XML tags:\n<tools>",
     );
     for definition in definitions {
         let entry = serde_json::json!({
@@ -3387,19 +3388,22 @@ fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition])
                 "parameters": definition.parameters,
             }
         });
-        text.push_str(&serde_json::to_string(&entry).unwrap_or_default());
         text.push('\n');
+        text.push_str(&serde_json::to_string(&entry).unwrap_or_default());
     }
     text.push_str(
-        "</tools>\n\n\
-         Use the exact function and argument names from `parameters`. Call one function per \
-         reply and wait for its result. Emit the call directly, not inside a markdown code \
-         fence. `task` is the tool name; `dispatch` is only its `action` value — never emit a \
-         tool named `dispatch`.\n\n\
+        "\n</tools>\n\n\
+         For each function call, return a json object with function name and arguments within \
+         <tool_call></tool_call> XML tags:\n\
+         <tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n\
+         Use the exact function and argument names from `parameters`. Call one function per reply \
+         and wait for its result. Emit the call directly, not inside a markdown code fence. \
+         `task` is the tool name; `dispatch` is only its `action` value — never emit a tool named \
+         `dispatch`.\n\n\
          Examples:\n\
-         <tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"src/app.js\"}}</tool_call>\n\
-         <tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"npm install\"}}</tool_call>\n\
-         <tool_call>{\"name\": \"task\", \"arguments\": {\"action\": \"dispatch\", \"agent\": \"plan\", \"prompt\": \"plan it\"}}</tool_call>\n\n\
+         <tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"src/app.js\"}}\n</tool_call>\n\
+         <tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"npm install\"}}\n</tool_call>\n\
+         <tool_call>\n{\"name\": \"task\", \"arguments\": {\"action\": \"dispatch\", \"agent\": \"plan\", \"prompt\": \"plan it\"}}\n</tool_call>\n\n\
          To pick a capability tier or resize this run, call `set_model_budget` \
          ({\"tier\": \"compact\"} or {\"enlarge\": true}); it takes effect next turn. To let a \
          subagent use a tool it lacks, call `grant_tools` ({\"profile\": \"plan\", \"tools\": \
@@ -5050,7 +5054,7 @@ mod tests {
             parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
         }];
         let text = local_tool_instructions(&defs);
-        assert!(text.contains("function-calling"), "{text}");
+        assert!(text.contains("# Tools"), "{text}");
         assert!(text.contains("<tools>"), "{text}");
         assert!(text.contains("</tools>"), "{text}");
         assert!(text.contains("\"name\":\"read\""), "{text}");
@@ -5411,11 +5415,11 @@ mod tests {
 
     #[test]
     fn read_only_profiles_cannot_write_or_dispatch() {
-        for agent in ["explore", "plan", "review"] {
+        // `explore` and `review` may run approval-gated shell commands for
+        // reconnaissance; neither can write or dispatch.
+        for agent in ["explore", "review"] {
             let profile = crate::catalog::find_agent_profile(agent).expect("read-only profile");
             let allowed = super::allowed_tools_for(&profile, None);
-            // Read-only profiles cannot mutate or dispatch; `bash` is allowed
-            // but every call is approval-gated.
             for forbidden in ["write", "task", "shell"] {
                 assert!(
                     !allowed.iter().any(|tool| tool == forbidden),
@@ -5428,6 +5432,22 @@ mod tests {
                     "{agent} should be allowed `{expected}`: {allowed:?}"
                 );
             }
+        }
+        // `plan` plans: it reads and searches, but must not run commands or it
+        // loops on the plan's own shell steps instead of returning a plan.
+        let plan = crate::catalog::find_agent_profile("plan").expect("plan profile");
+        let allowed = super::allowed_tools_for(&plan, None);
+        for forbidden in ["write", "task", "shell", "bash"] {
+            assert!(
+                !allowed.iter().any(|tool| tool == forbidden),
+                "plan must not be allowed `{forbidden}`: {allowed:?}"
+            );
+        }
+        for expected in ["read", "glob", "grep", "skill"] {
+            assert!(
+                allowed.iter().any(|tool| tool == expected),
+                "plan should be allowed `{expected}`: {allowed:?}"
+            );
         }
     }
 
