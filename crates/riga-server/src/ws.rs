@@ -3278,13 +3278,37 @@ fn escape_json_control_chars(raw: &str) -> String {
     out
 }
 
+/// Parse a tool-call object leniently.
+///
+/// Models emit malformed JSON in predictable ways: real newlines inside strings,
+/// prose around the object, or a trailing comma. Try the plain parse, the
+/// control-char-escaped parse, then the outermost `{…}` substring.
+fn parse_json_lenient(raw: &str) -> Option<serde_json::Value> {
+    let raw = raw.trim();
+    if let Ok(value) = serde_json::from_str(raw) {
+        return Some(value);
+    }
+    let escaped = escape_json_control_chars(raw);
+    if let Ok(value) = serde_json::from_str(&escaped) {
+        return Some(value);
+    }
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let slice = &raw[start..=end];
+    if let Ok(value) = serde_json::from_str(slice) {
+        return Some(value);
+    }
+    serde_json::from_str(&escape_json_control_chars(slice)).ok()
+}
+
 fn parse_one_local_tool_call(raw: &str) -> Option<ParsedToolCall> {
     // A model that writes a file body with real newlines produces invalid JSON
     // (control characters are not allowed inside a JSON string). Retry once with
     // those characters escaped rather than failing the whole run.
-    let candidate: serde_json::Value = serde_json::from_str(raw)
-        .or_else(|_| serde_json::from_str(&escape_json_control_chars(raw)))
-        .ok()?;
+    let candidate = parse_json_lenient(raw)?;
     let object = candidate.as_object()?;
 
     // An explicit `name` is authoritative.
@@ -3411,8 +3435,8 @@ fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition])
     text.push_str(
         "\n</tools>\n\n\
          For each function call, return a json object with function name and arguments within \
-         <tool_call></tool_call> XML tags:\n\
-         <tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n\
+         <tool_call></tool_call> XML tags, for example:\n\
+         <tool_call>\n{\"name\": \"bash\", \"arguments\": {\"command\": \"ls -la\"}}\n</tool_call>\n\n\
          Use the exact function and argument names from `parameters`. Call one function per reply \
          and wait for its result. Emit the call directly, not inside a markdown code fence. \
          `task` is the tool name; `dispatch` is only its `action` value — never emit a tool named \
@@ -5047,6 +5071,17 @@ mod tests {
         let (prose, calls) = parse_local_tool_calls("The task: find the largest files");
         assert!(calls.is_empty(), "{calls:?}");
         assert!(prose.contains("find the largest files"), "{prose}");
+    }
+
+    #[test]
+    fn a_prose_wrapped_tool_call_object_is_salvaged() {
+        // A model that wraps the object in prose still yields a call.
+        let (_, calls) = parse_local_tool_calls(
+            "<tool_call>Sure: {\"name\": \"read\", \"arguments\": {\"path\": \"a.txt\"}} ok</tool_call>",
+        );
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments["path"], "a.txt");
     }
 
     #[test]

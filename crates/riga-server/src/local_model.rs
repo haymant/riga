@@ -55,6 +55,13 @@ const DEFAULT_CONTEXT: u32 = 16_384;
 /// of activations for one call. The prompt is decoded in chunks of this size.
 const MAX_DECODE_BATCH: u32 = 2048;
 
+/// Physical batch. llama.cpp sizes its compute buffers from `n_ubatch`, and a
+/// 2048-token ubatch costs about 1 GiB of VRAM — VRAM the auto-fit then cannot
+/// give to model layers. 512 keeps the compute buffer small so more layers fit
+/// on the GPU; prefill is a little slower but decode (what an agent loop spends
+/// its time on) is unaffected.
+const MAX_UBATCH: u32 = 512;
+
 /// Compile-time guard on that bound. Tying `n_ubatch` to `n_ctx` is exactly what
 /// this decoupling exists to prevent, so it fails the build instead of waiting
 /// for a test.
@@ -269,10 +276,12 @@ impl LocalBudget {
 /// Device memory the auto-fit planner is told to leave unused, per device.
 ///
 /// llama.cpp's estimate of weights + KV cache is exact for the tensors it knows
-/// about but not for runtime graph temporaries, driver pools, or another process
-/// taking VRAM between the fit and the load. A fixed 1 GiB margin absorbs that
-/// gap; without it a "fits on paper" plan can still OOM at `cudaMalloc`.
-const FIT_MARGIN_BYTES: usize = 1024 * 1024 * 1024;
+/// about but not for the compute buffer it allocates when the context is created
+/// (about 1 GiB at the default ubatch), driver pools, or another process taking
+/// VRAM between the fit and the load. 1.5 GiB reserves room for the compute
+/// buffer plus fragmentation; a tighter margin produced a plan that offloaded
+/// too many layers and then stalled at context creation.
+const FIT_MARGIN_BYTES: usize = 1536 * 1024 * 1024;
 
 /// Minimum wall-clock gap between download progress broadcasts. Ten per second
 /// is past the point where a progress bar looks continuous.
@@ -384,7 +393,7 @@ fn context_params_with(n_ctx: u32, batch_size: u32) -> LlamaContextParams {
     let params = LlamaContextParams::default()
         .with_n_ctx(std::num::NonZeroU32::new(n_ctx))
         .with_n_batch(batch_size)
-        .with_n_ubatch(batch_size);
+        .with_n_ubatch(batch_size.min(MAX_UBATCH));
     if cfg!(any(feature = "cuda", feature = "metal")) {
         params
             .with_flash_attention_policy(llama_cpp_sys_2::LLAMA_FLASH_ATTN_TYPE_ENABLED)
@@ -1549,5 +1558,12 @@ mod tests {
                 .map(std::num::NonZeroU32::get),
             Some(16_384)
         );
+    }
+
+    #[test]
+    fn context_params_cap_the_ubatch_to_bound_the_compute_buffer() {
+        let params = context_params_with(16_384, 2_048);
+        assert_eq!(params.n_batch(), 2_048);
+        assert_eq!(params.n_ubatch(), 512);
     }
 }
