@@ -274,54 +274,24 @@ const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(
 
 const CATALOG: &[CuratedModel] = &[
     CuratedModel {
-        id: "qwen2.5-1.5b-instruct",
-        name: "Qwen2.5 1.5B Instruct",
-        file_name: "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
-        download_url: "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
-        size_bytes: 986_048_768,
-        sha256: "1adf0b11065d8ad2e8123ea110d1ec956dab4ab038eab665614adba04b6c3370",
+        id: "qwen3-4b-instruct",
+        name: "Qwen3 4B",
+        file_name: "Qwen_Qwen3-4B-Q4_K_M.gguf",
+        download_url: "https://huggingface.co/bartowski/Qwen_Qwen3-4B-GGUF/resolve/main/Qwen_Qwen3-4B-Q4_K_M.gguf",
+        size_bytes: 2_497_280_960,
+        sha256: "fbe1d5edd4ce802ae3ae7c7e4ab7d09789d697fdac1fc7929f8df4ca3c41bae3",
         max_context: 32_768,
-        license_url: "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct",
+        license_url: "https://huggingface.co/Qwen/Qwen3-4B",
     },
     CuratedModel {
-        id: "gemma-2-2b-it",
-        name: "Gemma 2 2B IT",
-        file_name: "gemma-2-2b-it-Q4_K_M.gguf",
-        download_url: "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf",
-        size_bytes: 1_708_582_752,
-        sha256: "e0aee85060f168f0f2d8473d7ea41ce2f3230c1bc1374847505ea599288a7787",
-        max_context: 8_192,
-        license_url: "https://ai.google.dev/gemma/terms",
-    },
-    CuratedModel {
-        id: "llama-3.2-3b-instruct",
-        name: "Llama 3.2 3B Instruct",
-        file_name: "Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-        download_url: "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf",
-        size_bytes: 2_019_377_696,
-        sha256: "6c1a2b41161032677be168d354123594c0e6e67d2b9227c84f296ad037c728ff",
-        max_context: 131_072,
-        license_url: "https://www.llama.com/llama3_2/license/",
-    },
-    CuratedModel {
-        id: "phi-3.5-mini-instruct",
-        name: "Phi-3.5 Mini Instruct",
-        file_name: "Phi-3.5-mini-instruct-Q4_K_M.gguf",
-        download_url: "https://huggingface.co/bartowski/Phi-3.5-mini-instruct-GGUF/resolve/main/Phi-3.5-mini-instruct-Q4_K_M.gguf",
-        size_bytes: 2_393_232_672,
-        sha256: "e4165e3a71af97f1b4826f6e0574b88cb6d7e0c5b403f895c62d4c913bbe01a5",
-        max_context: 131_072,
-        license_url: "https://huggingface.co/microsoft/Phi-3.5-mini-instruct",
-    },
-    CuratedModel {
-        id: "qwen2.5-3b-instruct",
-        name: "Qwen2.5 3B Instruct",
-        file_name: "Qwen2.5-3B-Instruct-Q4_K_M.gguf",
-        download_url: "https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF/resolve/main/Qwen2.5-3B-Instruct-Q4_K_M.gguf",
-        size_bytes: 1_929_903_264,
-        sha256: "9c9f56a391a3abbd5b89d0245bf6106081bcc3173119d4229235dd9d23253f94",
+        id: "qwen2.5-coder-7b-instruct",
+        name: "Qwen2.5 Coder 7B Instruct",
+        file_name: "Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
+        download_url: "https://huggingface.co/bartowski/Qwen2.5-Coder-7B-Instruct-GGUF/resolve/main/Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf",
+        size_bytes: 4_683_074_336,
+        sha256: "1664fccab734674a50763490a8c6931b70e3f2f8ec10031b54806d30e5f956b6",
         max_context: 32_768,
-        license_url: "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct",
+        license_url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct",
     },
     CuratedModel {
         id: "phi-4-mini-instruct",
@@ -334,24 +304,14 @@ const CATALOG: &[CuratedModel] = &[
         license_url: "https://huggingface.co/microsoft/Phi-4-mini-instruct",
     },
     CuratedModel {
-        id: "gemma-3n-e2b-it",
-        name: "Gemma 3n E2B IT",
-        file_name: "gemma-3n-E2B-it-Q4_K_M.gguf",
-        download_url: "https://huggingface.co/unsloth/gemma-3n-E2B-it-GGUF/resolve/main/gemma-3n-E2B-it-Q4_K_M.gguf",
-        size_bytes: 3_026_881_888,
-        sha256: "189d42b4303cb1078ea8d00963f437cd6d884069b7ba2ba80b38cd09585dc415",
-        max_context: 32_768,
-        license_url: "https://ai.google.dev/gemma/terms",
-    },
-    CuratedModel {
-        id: "qwen3-4b-instruct",
-        name: "Qwen3 4B",
-        file_name: "Qwen_Qwen3-4B-Q4_K_M.gguf",
-        download_url: "https://huggingface.co/bartowski/Qwen_Qwen3-4B-GGUF/resolve/main/Qwen_Qwen3-4B-Q4_K_M.gguf",
-        size_bytes: 2_497_280_960,
-        sha256: "fbe1d5edd4ce802ae3ae7c7e4ab7d09789d697fdac1fc7929f8df4ca3c41bae3",
-        max_context: 32_768,
-        license_url: "https://huggingface.co/Qwen/Qwen3-4B",
+        id: "hermes-3-llama-3.1-8b",
+        name: "Hermes 3 8B (Llama 3.1)",
+        file_name: "Hermes-3-Llama-3.1-8B-Q4_K_M.gguf",
+        download_url: "https://huggingface.co/bartowski/Hermes-3-Llama-3.1-8B-GGUF/resolve/main/Hermes-3-Llama-3.1-8B-Q4_K_M.gguf",
+        size_bytes: 4_920_734_624,
+        sha256: "44b5c529dffaf34657a4c44a7919e5958b4270fbd365eed3b87d3444b45a378a",
+        max_context: 131_072,
+        license_url: "https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-8B",
     },
 ];
 
@@ -498,9 +458,16 @@ impl LocalModelRuntime {
     }
 
     pub fn list_installed(&self) -> Result<Vec<InstalledModel>, String> {
-        let directory = self.models_dir();
+        Self::list_models_in(&self.models_dir())
+    }
+
+    /// Scan `directory` for GGUF files, matching curated entries by file name and
+    /// listing anything else as a user-provided model.
+    pub(crate) fn list_models_in(
+        directory: &std::path::Path,
+    ) -> Result<Vec<InstalledModel>, String> {
         let mut models = Vec::new();
-        let entries = fs::read_dir(&directory)
+        let entries = fs::read_dir(directory)
             .map_err(|error| format!("Could not scan models folder: {error}"))?;
         for entry in entries {
             let entry = entry.map_err(|error| error.to_string())?;
@@ -1314,7 +1281,7 @@ mod tests {
 
     #[test]
     fn curated_catalog_has_unique_fully_hashed_entries() {
-        assert_eq!(CATALOG.len(), 8);
+        assert_eq!(CATALOG.len(), 4);
         let mut ids = std::collections::HashSet::new();
         let mut file_names = std::collections::HashSet::new();
         for model in CATALOG {
@@ -1334,14 +1301,10 @@ mod tests {
         // downloads. A regression means a download URL was repointed at a
         // different quantization, which invalidates the number.
         let expected = [
-            ("qwen2.5-1.5b-instruct", 32_768),
-            ("gemma-2-2b-it", 8_192),
-            ("llama-3.2-3b-instruct", 131_072),
-            ("phi-3.5-mini-instruct", 131_072),
-            ("qwen2.5-3b-instruct", 32_768),
-            ("phi-4-mini-instruct", 131_072),
-            ("gemma-3n-e2b-it", 32_768),
             ("qwen3-4b-instruct", 32_768),
+            ("qwen2.5-coder-7b-instruct", 32_768),
+            ("phi-4-mini-instruct", 131_072),
+            ("hermes-3-llama-3.1-8b", 131_072),
         ];
         assert_eq!(
             CATALOG
@@ -1350,8 +1313,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
-        // Gemma 2 is the only curated model below the ceiling; everything else is
-        // either at it or above and must be truncated.
+        // The 128k windows are truncated to our ceiling by `resolve_context`.
         assert_eq!(resolve_context(8_192, 8_192), 8_192);
         assert_eq!(resolve_context(131_072, 131_072), MAX_CONTEXT);
         assert_eq!(resolve_context(32_768, 32_768), 32_768);
@@ -1512,5 +1474,32 @@ mod tests {
             .apply(&serde_json::json!({"tier": "gigantic"}))
             .expect_err("unknown tier rejected");
         assert!(error.contains("unknown capability tier"), "{error}");
+    }
+
+    #[test]
+    fn list_installed_recognizes_curated_and_manually_copied_models() {
+        // A model the user dropped into the models directory must still show up,
+        // flagged as not curated, alongside a curated download.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("my-custom-model.gguf"), b"x").unwrap();
+        let curated = CATALOG[0].file_name;
+        std::fs::write(dir.path().join(curated), b"x").unwrap();
+
+        let installed = LocalModelRuntime::list_models_in(dir.path()).unwrap();
+
+        assert_eq!(installed.len(), 2);
+        let manual = installed
+            .iter()
+            .find(|model| model.file_name == "my-custom-model.gguf")
+            .expect("manual model is listed");
+        assert!(!manual.curated, "a manually copied model is not curated");
+        assert_eq!(manual.id, "my-custom-model.gguf");
+        assert_eq!(manual.name, "my-custom-model.gguf");
+        let known = installed
+            .iter()
+            .find(|model| model.file_name == curated)
+            .expect("curated model is listed");
+        assert!(known.curated);
+        assert_eq!(known.id, CATALOG[0].id);
     }
 }
