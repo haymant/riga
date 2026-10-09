@@ -28,6 +28,21 @@ pub enum RigaEvent {
     TodoUpdated {
         list: Box<crate::task::TodoList>,
     },
+    /// The planner published the current execution DAG.
+    GraphUpdated {
+        graph: Box<crate::task::Graph>,
+    },
+    TaskDependencyAdded {
+        task_id: String,
+        depends_on: String,
+    },
+    TaskBlocked {
+        task_id: String,
+        blocked_by: Vec<String>,
+    },
+    TaskRunnable {
+        task_id: String,
+    },
     /// A subagent task was dispatched.
     TaskStarted {
         task: Box<crate::task::TaskRecord>,
@@ -79,7 +94,9 @@ pub struct RigaEventEnvelope {
 #[cfg(test)]
 mod tests {
     use super::{RigaEvent, RigaEventEnvelope};
-    use crate::task::{Plan, PlanStep, TaskRecord, TaskState, TodoItem, TodoList, TodoStatus};
+    use crate::task::{
+        Graph, GraphNode, Plan, PlanStep, TaskRecord, TaskState, TodoItem, TodoList, TodoStatus,
+    };
 
     #[test]
     fn task_and_plan_events_round_trip_over_the_wire() {
@@ -171,6 +188,39 @@ mod tests {
             let json = serde_json::to_string(&event).unwrap();
             let decoded: RigaEvent = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, event, "event failed to round-trip: {json}");
+        }
+    }
+
+    #[test]
+    fn graph_events_round_trip_over_the_wire() {
+        let events = [
+            RigaEvent::GraphUpdated {
+                graph: Box::new(Graph {
+                    title: "x".into(),
+                    nodes: vec![GraphNode {
+                        id: "runtime".into(),
+                        profile: "explore".into(),
+                        description: "inspect".into(),
+                        prompt: "inspect".into(),
+                        depends_on: vec![],
+                    }],
+                }),
+            },
+            RigaEvent::TaskDependencyAdded {
+                task_id: "build".into(),
+                depends_on: "runtime".into(),
+            },
+            RigaEvent::TaskRunnable {
+                task_id: "runtime".into(),
+            },
+            RigaEvent::TaskBlocked {
+                task_id: "build".into(),
+                blocked_by: vec!["runtime".into()],
+            },
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<RigaEvent>(&json).unwrap(), event);
         }
     }
 }

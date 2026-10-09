@@ -84,6 +84,13 @@ struct RunEvidence {
     /// the loop that spawned it. Carrying it here rather than as another
     /// parameter keeps the dozens of loop call sites unchanged.
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    graph: std::sync::Arc<tokio::sync::Mutex<GraphRuntime>>,
+}
+
+#[derive(Default)]
+struct GraphRuntime {
+    graph: Option<riga_kernel::task::Graph>,
+    states: std::collections::HashMap<String, riga_kernel::task::TaskState>,
 }
 
 impl RunEvidence {
@@ -130,6 +137,10 @@ impl RunEvidence {
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    fn graph(&self) -> std::sync::Arc<tokio::sync::Mutex<GraphRuntime>> {
+        self.graph.clone()
+    }
 }
 
 /// How many run events a subscriber may fall behind before it is told it lagged
@@ -158,7 +169,9 @@ pub(crate) type RunRegistry =
 fn is_ephemeral(event: &RigaEvent) -> bool {
     matches!(
         event,
-        RigaEvent::TextDelta { .. } | RigaEvent::ToolOutputDelta { .. }
+        RigaEvent::TextDelta { .. }
+            | RigaEvent::ReasoningDelta { .. }
+            | RigaEvent::ToolOutputDelta { .. }
     )
 }
 
@@ -1293,6 +1306,7 @@ enum ToolTraceEvent {
 struct ToolOutputStream {
     call_id: String,
     trace_sender: mpsc::Sender<ToolTraceEvent>,
+    graph: std::sync::Arc<tokio::sync::Mutex<GraphRuntime>>,
 }
 
 impl ToolOutputStream {
@@ -1422,6 +1436,97 @@ async fn execute_tool(
             }
             let (done, total) = list.progress();
             Ok(format!("Todo list updated: {done}/{total} complete."))
+        }
+        "update_graph" => {
+            let graph: riga_kernel::task::Graph = serde_json::from_value(input)
+                .map_err(|error| format!("update_graph arguments are invalid: {error}"))?;
+            graph
+                .validate()
+                .map_err(|error| format!("update_graph rejected graph: {error}"))?;
+            for node in &graph.nodes {
+                if crate::catalog::find_agent_profile(&node.profile).is_none() {
+                    return Err(format!(
+                        "update_graph rejected unknown profile `{}`",
+                        node.profile
+                    ));
+                }
+            }
+            let (ready, blocked) = {
+                let mut runtime = output_stream
+                    .as_ref()
+                    .ok_or("update_graph requires a live run")?
+                    .graph
+                    .lock()
+                    .await;
+                runtime.graph = Some(graph.clone());
+                runtime.states = graph
+                    .nodes
+                    .iter()
+                    .map(|node| (node.id.clone(), riga_kernel::task::TaskState::Pending))
+                    .collect();
+                let ready = graph.ready_nodes(&runtime.states);
+                let blocked = graph
+                    .nodes
+                    .iter()
+                    .filter(|node| !ready.contains(&node.id))
+                    .map(|node| (node.id.clone(), node.depends_on.clone()))
+                    .collect::<Vec<_>>();
+                (ready, blocked)
+            };
+            let ready_count = ready.len();
+            if let Some(stream) = &output_stream {
+                stream
+                    .trace_sender
+                    .send(ToolTraceEvent::Ui(
+                        riga_kernel::events::RigaEvent::GraphUpdated {
+                            graph: Box::new(graph.clone()),
+                        },
+                    ))
+                    .await
+                    .map_err(|_| "tool lifecycle stream closed")?;
+                for node in &graph.nodes {
+                    for dependency in &node.depends_on {
+                        stream
+                            .trace_sender
+                            .send(ToolTraceEvent::Ui(
+                                riga_kernel::events::RigaEvent::TaskDependencyAdded {
+                                    task_id: node.id.clone(),
+                                    depends_on: dependency.clone(),
+                                },
+                            ))
+                            .await
+                            .map_err(|_| "tool lifecycle stream closed")?;
+                    }
+                }
+                for task_id in ready {
+                    stream
+                        .trace_sender
+                        .send(ToolTraceEvent::Ui(
+                            riga_kernel::events::RigaEvent::TaskRunnable { task_id },
+                        ))
+                        .await
+                        .map_err(|_| "tool lifecycle stream closed")?;
+                }
+                for (task_id, blocked_by) in blocked {
+                    if !blocked_by.is_empty() {
+                        stream
+                            .trace_sender
+                            .send(ToolTraceEvent::Ui(
+                                riga_kernel::events::RigaEvent::TaskBlocked {
+                                    task_id,
+                                    blocked_by,
+                                },
+                            ))
+                            .await
+                            .map_err(|_| "tool lifecycle stream closed")?;
+                    }
+                }
+            }
+            Ok(format!(
+                "Graph updated: {} node(s), {} ready.",
+                graph.nodes.len(),
+                ready_count
+            ))
         }
         "skill" => {
             if let Some(name) = input
@@ -2198,6 +2303,7 @@ async fn run_chat_loop(
                             Some(ToolOutputStream {
                                 call_id: call.call_id.clone(),
                                 trace_sender: trace_sender.clone(),
+                                graph: evidence.graph(),
                             }),
                         )
                         .await
@@ -2335,10 +2441,62 @@ async fn dispatch_subagent(
         .ok_or("task dispatch requires a prompt")?;
     let profile = crate::catalog::find_agent_profile(agent)
         .ok_or_else(|| format!("unknown agent `{agent}`"))?;
-    let task_id = format!(
-        "task-{}",
-        TASK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    );
+    let graph_node_id = input
+        .get("node_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if let Some(node_id) = &graph_node_id {
+        let graph = evidence.graph();
+        let mut runtime = graph.lock().await;
+        let published = runtime
+            .graph
+            .as_ref()
+            .ok_or("task dispatch references a node but no graph has been published")?;
+        let node = published
+            .nodes
+            .iter()
+            .find(|node| &node.id == node_id)
+            .ok_or_else(|| format!("task dispatch references unknown graph node `{node_id}`"))?;
+        if node.profile != profile.name {
+            return Err(format!(
+                "graph node `{node_id}` requires profile `{}`, not `{}`",
+                node.profile, profile.name
+            ));
+        }
+        let blocked_by: Vec<String> = node
+            .depends_on
+            .iter()
+            .filter(|dependency| {
+                runtime.states.get(*dependency) != Some(&riga_kernel::task::TaskState::Completed)
+            })
+            .cloned()
+            .collect();
+        if !blocked_by.is_empty() {
+            let _ = trace_sender
+                .send(ToolTraceEvent::Ui(
+                    riga_kernel::events::RigaEvent::TaskBlocked {
+                        task_id: node_id.clone(),
+                        blocked_by: blocked_by.clone(),
+                    },
+                ))
+                .await;
+            return Err(format!(
+                "task `{node_id}` is blocked by incomplete dependencies: {}",
+                blocked_by.join(", ")
+            ));
+        }
+        runtime
+            .states
+            .insert(node_id.clone(), riga_kernel::task::TaskState::Running);
+    }
+    let task_id = graph_node_id.clone().unwrap_or_else(|| {
+        format!(
+            "task-{}",
+            TASK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    });
     let description: String = input
         .get("description")
         .and_then(serde_json::Value::as_str)
@@ -2358,7 +2516,10 @@ async fn dispatch_subagent(
     };
     let started = riga_kernel::task::TaskRecord {
         id: task_id.clone(),
-        parent_id: Some(format!("depth-{depth}")),
+        parent_id: input
+            .get("parent_task_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned),
         agent: profile.name.clone(),
         description: description.clone(),
         model: child_model,
@@ -2370,6 +2531,16 @@ async fn dispatch_subagent(
         .send(ToolTraceEvent::Ui(
             riga_kernel::events::RigaEvent::TaskStarted {
                 task: Box::new(started),
+            },
+        ))
+        .await;
+
+    let _ = trace_sender
+        .send(ToolTraceEvent::Ui(
+            riga_kernel::events::RigaEvent::TaskStatus {
+                task_id: task_id.clone(),
+                state: riga_kernel::task::TaskState::Running,
+                elapsed_ms: 0,
             },
         ))
         .await;
@@ -2421,6 +2592,30 @@ async fn dispatch_subagent(
         Ok(result) => (true, result.output),
         Err(error) => (false, error),
     };
+    if graph_node_id.is_some() {
+        evidence.graph().lock().await.states.insert(
+            task_id.clone(),
+            if ok {
+                riga_kernel::task::TaskState::Completed
+            } else {
+                riga_kernel::task::TaskState::Failed
+            },
+        );
+    }
+    let terminal_state = if ok {
+        riga_kernel::task::TaskState::Completed
+    } else {
+        riga_kernel::task::TaskState::Failed
+    };
+    let _ = trace_sender
+        .send(ToolTraceEvent::Ui(
+            riga_kernel::events::RigaEvent::TaskStatus {
+                task_id: task_id.clone(),
+                state: terminal_state,
+                elapsed_ms: 0,
+            },
+        ))
+        .await;
     let _ = trace_sender
         .send(ToolTraceEvent::Ui(
             riga_kernel::events::RigaEvent::TaskCompleted {
@@ -2467,7 +2662,11 @@ fn subagent_system_prompt(
 /// The tools a subagent may call. A read-only profile never gets write, shell,
 /// or nested dispatch, so it cannot exceed its remit by accident.
 fn allowed_tools_for(profile: &crate::catalog::AgentProfile) -> Vec<String> {
-    let mut allowed = vec!["update_plan".to_owned(), "update_todos".to_owned()];
+    let mut allowed = vec![
+        "update_plan".to_owned(),
+        "update_todos".to_owned(),
+        "update_graph".to_owned(),
+    ];
     if profile.read_only {
         allowed.extend(["read", "glob", "grep", "skill"].map(str::to_owned));
         return allowed;
@@ -3010,6 +3209,7 @@ async fn run_local_loop(
                             Some(ToolOutputStream {
                                 call_id: call_id.clone(),
                                 trace_sender: trace_sender.clone(),
+                                graph: evidence.graph(),
                             }),
                         )
                         .await
@@ -3202,6 +3402,7 @@ async fn call_responses_api(
                 Some(ToolOutputStream {
                     call_id: call_id.to_owned(),
                     trace_sender: trace_sender.clone(),
+                    graph: evidence.graph(),
                 }),
             )
             .await;
@@ -3539,7 +3740,7 @@ fn tool_schemas() -> Vec<serde_json::Value> {
         function_schema(
             "task",
             "Run a specialized subagent (action \"dispatch\" with `agent` and `prompt`), list the subagent profiles (action \"agents\"), or manage durable task records (list/inspect/create/update). action \"agents\" only lists; it runs nothing.",
-            serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list","inspect","create","update","agents","agent_list","dispatch","agent","run"]},"agent":{"type":"string","enum":["explore","plan","build","review","scout","planner","executor","worker","reviewer"]},"prompt":{"type":"string"},"description":{"type":"string"},"name":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"task_id":{"type":"string"}},"required":[]}),
+            serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list","inspect","create","update","agents","agent_list","dispatch","agent","run"]},"agent":{"type":"string","enum":["explore","plan","build","review","scout","planner","executor","worker","reviewer"]},"prompt":{"type":"string"},"description":{"type":"string"},"name":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"task_id":{"type":"string"},"node_id":{"type":"string"},"parent_task_id":{"type":"string"}},"required":[]}),
         ),
         function_schema(
             "skill",
@@ -3555,6 +3756,11 @@ fn tool_schemas() -> Vec<serde_json::Value> {
             "update_todos",
             "Replace your visible working list with the current items. Call it when work is discovered, started, finished, fails, or is dropped.",
             serde_json::json!({"type":"object","properties":{"title":{"type":"string"},"revision":{"type":"integer"},"items":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"description":{"type":"string"},"status":{"type":"string","enum":["pending","active","done","failed","cancelled"]},"reason":{"type":"string"}},"required":["id","text","status"]}}},"required":["items"]}),
+        ),
+        function_schema(
+            "update_graph",
+            "Publish the current execution DAG. Each node needs a unique id, a known profile, a prompt, and optional dependency ids.",
+            serde_json::json!({"type":"object","properties":{"title":{"type":"string"},"nodes":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"profile":{"type":"string","enum":["explore","plan","build","review"]},"description":{"type":"string"},"prompt":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"}}},"required":["id","profile","description","prompt"]}}},"required":["title","nodes"]}),
         ),
     ]
 }
@@ -3608,6 +3814,7 @@ Tools:\n\
 When the user addresses an agent with `@explore`, `@plan`, `@build`, or `@review`, dispatch it with `action: \"dispatch\"` and the matching `agent` rather than doing the work yourself when the profile's remit fits.\n\
 - `update_plan` records the checklist you are working through and `update_todos` keeps your working list current. \
 Call `update_plan` once right after exploring, then `update_todos` as work is discovered, started, finished, fails, or is dropped, instead of narrating progress in prose.\n\
+- `update_graph` publishes a machine-readable DAG with unique node ids, known profiles, prompts, and `depends_on` edges. Use it when the work has dependencies; dispatch a graph node with `task` action `dispatch`, its `node_id`, and the matching profile. A node remains blocked until every dependency completes.\n\
 - When the user names a specific MCP server, prefer its qualified tool alias beginning with `mcp_` (for example `mcp_riga_health_stdio_health`) over a built-in.\n\n",
     );
     prompt.push_str(&format!("Workspace root: {}\n", workspace.display()));
@@ -4134,6 +4341,7 @@ mod tests {
         let stream = super::ToolOutputStream {
             call_id: "call-1".into(),
             trace_sender: sender,
+            graph: std::sync::Arc::new(tokio::sync::Mutex::new(super::GraphRuntime::default())),
         };
         let result = super::execute_tool(
             std::path::Path::new("."),
@@ -4164,6 +4372,7 @@ mod tests {
         let stream = super::ToolOutputStream {
             call_id: "call-1".into(),
             trace_sender: sender,
+            graph: std::sync::Arc::new(tokio::sync::Mutex::new(super::GraphRuntime::default())),
         };
         let result = super::execute_tool(
             std::path::Path::new("."),
@@ -4185,6 +4394,107 @@ mod tests {
             receiver.recv().await.expect("a frame was emitted"),
             super::ToolTraceEvent::Ui(RigaEvent::TodoUpdated { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn update_graph_validates_and_emits_readiness_events() {
+        let (sender, mut receiver) = mpsc::channel(16);
+        let stream = super::ToolOutputStream {
+            call_id: "call-graph".into(),
+            trace_sender: sender,
+            graph: std::sync::Arc::new(tokio::sync::Mutex::new(super::GraphRuntime::default())),
+        };
+        let result = super::execute_tool(
+            std::path::Path::new("."),
+            &crate::mcp::McpRuntime::new(),
+            "update_graph",
+            serde_json::json!({
+                "title": "service",
+                "nodes": [
+                    {"id": "runtime", "profile": "explore", "description": "inspect", "prompt": "inspect"},
+                    {"id": "build", "profile": "build", "description": "implement", "prompt": "implement", "depends_on": ["runtime"]}
+                ]
+            }),
+            Some(stream),
+        ).await.expect("graph validates");
+        assert!(result.contains("2 node(s), 1 ready"), "{result}");
+        assert!(matches!(
+            receiver.recv().await.unwrap(),
+            super::ToolTraceEvent::Ui(RigaEvent::GraphUpdated { .. })
+        ));
+        assert!(
+            matches!(receiver.recv().await.unwrap(), super::ToolTraceEvent::Ui(RigaEvent::TaskDependencyAdded { task_id, depends_on }) if task_id == "build" && depends_on == "runtime")
+        );
+        assert!(
+            matches!(receiver.recv().await.unwrap(), super::ToolTraceEvent::Ui(RigaEvent::TaskRunnable { task_id }) if task_id == "runtime")
+        );
+        assert!(
+            matches!(receiver.recv().await.unwrap(), super::ToolTraceEvent::Ui(RigaEvent::TaskBlocked { task_id, blocked_by }) if task_id == "build" && blocked_by == vec!["runtime"])
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_dispatch_rejects_incomplete_dependencies() {
+        let evidence = super::RunEvidence::default();
+        {
+            let graph = evidence.graph();
+            let mut runtime = graph.lock().await;
+            runtime.graph = Some(riga_kernel::task::Graph {
+                title: "service".into(),
+                nodes: vec![
+                    riga_kernel::task::GraphNode {
+                        id: "runtime".into(),
+                        profile: "explore".into(),
+                        description: "inspect".into(),
+                        prompt: "inspect".into(),
+                        depends_on: vec![],
+                    },
+                    riga_kernel::task::GraphNode {
+                        id: "build".into(),
+                        profile: "build".into(),
+                        description: "implement".into(),
+                        prompt: "implement".into(),
+                        depends_on: vec!["runtime".into()],
+                    },
+                ],
+            });
+            runtime
+                .states
+                .insert("runtime".into(), riga_kernel::task::TaskState::Pending);
+            runtime
+                .states
+                .insert("build".into(), riga_kernel::task::TaskState::Pending);
+        }
+        let (sender, mut receiver) = mpsc::channel(4);
+        let config = super::ProviderConfig {
+            endpoint: "http://127.0.0.1:1".into(),
+            api_key: String::new(),
+            model: "test".into(),
+            reasoning_effort: "low".into(),
+            kind: super::ProviderKind::Remote,
+            api: super::ProviderApi::Chat,
+            subagent_model: None,
+        };
+        let error = super::dispatch_subagent(
+            &config,
+            std::path::Path::new("."),
+            &serde_json::json!({"agent": "build", "node_id": "build", "prompt": "implement"}),
+            &crate::mcp::McpRuntime::new(),
+            &sender,
+            0,
+            &super::ApprovalBroker::default(),
+            None,
+            &evidence,
+        )
+        .await
+        .expect_err("blocked node must not start");
+        assert!(
+            error.contains("blocked by incomplete dependencies"),
+            "{error}"
+        );
+        assert!(
+            matches!(receiver.recv().await.unwrap(), super::ToolTraceEvent::Ui(RigaEvent::TaskBlocked { task_id, blocked_by }) if task_id == "build" && blocked_by == vec!["runtime"])
+        );
     }
 
     #[tokio::test]
@@ -4222,6 +4532,22 @@ mod tests {
         assert!(!super::is_subagent_dispatch(
             &serde_json::json!({"action": "dispatch", "prompt": "no agent"})
         ));
+    }
+
+    #[test]
+    fn graph_events_are_durable_but_reasoning_deltas_are_ephemeral() {
+        assert!(!super::is_ephemeral(&RigaEvent::GraphUpdated {
+            graph: Box::new(riga_kernel::task::Graph {
+                title: "x".into(),
+                nodes: vec![]
+            }),
+        }));
+        assert!(!super::is_ephemeral(&RigaEvent::TaskRunnable {
+            task_id: "a".into()
+        }));
+        assert!(super::is_ephemeral(&RigaEvent::ReasoningDelta {
+            delta: "thinking".into()
+        }));
     }
 
     #[test]

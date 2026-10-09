@@ -47,6 +47,140 @@ pub struct TaskRecord {
 pub const MAX_TASK_DEPTH: usize = 2;
 pub const MAX_TASK_FANOUT: usize = 4;
 
+/// A planner-published execution graph. The graph is run state: it is
+/// journaled by the server but is not persisted as a cross-run task record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Graph {
+    pub title: String,
+    pub nodes: Vec<GraphNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub profile: String,
+    pub description: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+impl Graph {
+    /// Validate structural DAG invariants. Profile names are validated by the
+    /// server catalog, which is intentionally not a kernel dependency.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.nodes.is_empty() {
+            return Err("graph must contain at least one node".into());
+        }
+        let mut ids = std::collections::HashSet::new();
+        for node in &self.nodes {
+            if node.id.trim().is_empty() {
+                return Err("graph node id must not be empty".into());
+            }
+            if !ids.insert(node.id.clone()) {
+                return Err(format!("graph contains duplicate node id `{}`", node.id));
+            }
+            if node.depends_on.len() > MAX_TASK_FANOUT {
+                return Err(format!(
+                    "graph node `{}` has more than {MAX_TASK_FANOUT} dependencies",
+                    node.id
+                ));
+            }
+            for dependency in &node.depends_on {
+                if dependency == &node.id {
+                    return Err(format!("graph node `{}` cannot depend on itself", node.id));
+                }
+            }
+        }
+        for node in &self.nodes {
+            for dependency in &node.depends_on {
+                if !ids.contains(dependency) {
+                    return Err(format!(
+                        "graph node `{}` depends on missing node `{dependency}`",
+                        node.id
+                    ));
+                }
+            }
+        }
+        for dependency in &ids {
+            let dependents = self
+                .nodes
+                .iter()
+                .filter(|node| node.depends_on.iter().any(|item| item == dependency))
+                .count();
+            if dependents > MAX_TASK_FANOUT {
+                return Err(format!(
+                    "graph node `{dependency}` has more than {MAX_TASK_FANOUT} dependent tasks"
+                ));
+            }
+        }
+        // Kahn's algorithm gives a deterministic cycle check and also lets us
+        // reject graphs deeper than the existing task nesting budget.
+        let mut indegree: std::collections::HashMap<&str, usize> = self
+            .nodes
+            .iter()
+            .map(|node| (node.id.as_str(), node.depends_on.len()))
+            .collect();
+        let mut ready: Vec<&str> = indegree
+            .iter()
+            .filter_map(|(id, degree)| (*degree == 0).then_some(*id))
+            .collect();
+        let mut depth = std::collections::HashMap::new();
+        for id in &ready {
+            depth.insert(*id, 0usize);
+        }
+        let mut visited = 0;
+        while let Some(id) = ready.pop() {
+            visited += 1;
+            let current_depth = *depth.get(id).unwrap_or(&0);
+            for node in self
+                .nodes
+                .iter()
+                .filter(|node| node.depends_on.iter().any(|dependency| dependency == id))
+            {
+                let next_depth = current_depth + 1;
+                depth
+                    .entry(node.id.as_str())
+                    .and_modify(|value| *value = (*value).max(next_depth))
+                    .or_insert(next_depth);
+                let degree = indegree.get_mut(node.id.as_str()).unwrap();
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push(node.id.as_str());
+                }
+            }
+        }
+        if visited != self.nodes.len() {
+            return Err("graph contains a dependency cycle".into());
+        }
+        if depth.values().any(|value| *value > MAX_TASK_DEPTH) {
+            return Err(format!(
+                "graph depth exceeds the {MAX_TASK_DEPTH}-level task limit"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return nodes whose dependencies have all completed. Failed or cancelled
+    /// dependencies do not make a node runnable.
+    pub fn ready_nodes(
+        &self,
+        states: &std::collections::HashMap<String, TaskState>,
+    ) -> Vec<String> {
+        self.nodes
+            .iter()
+            .filter(|node| {
+                matches!(states.get(&node.id), None | Some(TaskState::Pending))
+                    && node
+                        .depends_on
+                        .iter()
+                        .all(|dependency| states.get(dependency) == Some(&TaskState::Completed))
+            })
+            .map(|node| node.id.clone())
+            .collect()
+    }
+}
+
 /// The task tree for one run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TaskTree {
@@ -263,8 +397,10 @@ impl TodoList {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_TASK_DEPTH, MAX_TASK_FANOUT, TaskState, TaskTree, TodoItem, TodoList, TodoStatus,
+        Graph, GraphNode, MAX_TASK_DEPTH, MAX_TASK_FANOUT, TaskState, TaskTree, TodoItem, TodoList,
+        TodoStatus,
     };
+    use std::collections::HashMap;
 
     #[test]
     fn spawn_builds_a_tree_with_depth_and_parent_links() {
@@ -407,5 +543,87 @@ mod tests {
         };
         // Two settled rows, one done: `1/2`, matching the element's ratio.
         assert_eq!(list.progress(), (1, 2));
+    }
+
+    fn node(id: &str, profile: &str, depends_on: &[&str]) -> GraphNode {
+        GraphNode {
+            id: id.into(),
+            profile: profile.into(),
+            description: format!("{id} task"),
+            prompt: format!("run {id}"),
+            depends_on: depends_on.iter().map(|value| (*value).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn graph_validates_and_reports_ready_nodes() {
+        let graph = Graph {
+            title: "service".into(),
+            nodes: vec![
+                node("runtime", "explore", &[]),
+                node("build", "build", &["runtime"]),
+            ],
+        };
+        graph.validate().unwrap();
+        let states = HashMap::from([
+            (String::from("runtime"), TaskState::Pending),
+            (String::from("build"), TaskState::Pending),
+        ]);
+        assert_eq!(graph.ready_nodes(&states), vec![String::from("runtime")]);
+        let states = HashMap::from([
+            (String::from("runtime"), TaskState::Completed),
+            (String::from("build"), TaskState::Pending),
+        ]);
+        assert_eq!(graph.ready_nodes(&states), vec![String::from("build")]);
+    }
+
+    #[test]
+    fn graph_rejects_duplicate_missing_cycle_depth_and_fanout() {
+        let duplicate = Graph {
+            title: "x".into(),
+            nodes: vec![node("a", "explore", &[]), node("a", "plan", &[])],
+        };
+        assert!(duplicate.validate().unwrap_err().contains("duplicate"));
+        let missing = Graph {
+            title: "x".into(),
+            nodes: vec![node("a", "explore", &["missing"])],
+        };
+        assert!(missing.validate().unwrap_err().contains("missing"));
+        let cycle = Graph {
+            title: "x".into(),
+            nodes: vec![node("a", "explore", &["b"]), node("b", "plan", &["a"])],
+        };
+        assert!(cycle.validate().unwrap_err().contains("cycle"));
+        let too_deep = Graph {
+            title: "x".into(),
+            nodes: vec![
+                node("a", "explore", &[]),
+                node("b", "plan", &["a"]),
+                node("c", "review", &["b"]),
+                node("d", "build", &["c"]),
+            ],
+        };
+        assert!(too_deep.validate().unwrap_err().contains("depth"));
+        let fanout_nodes = std::iter::once(node("root", "explore", &[]))
+            .chain((0..=MAX_TASK_FANOUT).map(|index| {
+                let id = format!("child-{index}");
+                GraphNode {
+                    id,
+                    profile: "review".into(),
+                    description: "child".into(),
+                    prompt: "child".into(),
+                    depends_on: vec!["root".into()],
+                }
+            }))
+            .collect();
+        assert!(
+            Graph {
+                title: "x".into(),
+                nodes: fanout_nodes
+            }
+            .validate()
+            .unwrap_err()
+            .contains("dependent")
+        );
     }
 }
