@@ -279,6 +279,10 @@ function staleReason(profile) {
     const hasBuildSystem = existsSync(join(tree, "Makefile")) || existsSync(join(tree, "build.ninja"));
     if (!hasBuildSystem) return "half-configured CMake tree";
     const cache = readFileSync(join(tree, "CMakeCache.txt"), "utf8");
+    // A plain `tauri dev` shares this CMake tree and reconfigures it with
+    // `GGML_CUDA=OFF`, so a CUDA run that reused it would silently fall back to
+    // CPU. Treat a cache without CUDA as stale and rebuild.
+    if (!/^GGML_CUDA:BOOL=ON$/m.test(cache)) return "CMake cache built without CUDA";
     const cudaFlags = cache.match(/^CMAKE_CUDA_FLAGS:STRING=(.*)$/m)?.[1] ?? "";
     const missing = requiredCudaFlags.filter((flag) => !cudaFlags.includes(flag));
     if (missing.length > 0) return `CMake cache missing ${missing.join(" ")}`;
