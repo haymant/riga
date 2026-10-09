@@ -3889,12 +3889,16 @@ async fn run_local_loop(
                 content: ONE_TOOL_NUDGE.into(),
             });
         }
-        // A turn whose only calls record run state (plan/todos/graph) and that
-        // produced prose is the model's answer: re-prompting it only makes a weak
-        // model regenerate the same plan and loop. Finish here.
-        if tool_calls
-            .iter()
-            .all(|call| is_record_only_tool(&call.name))
+        // A *subagent* turn whose only calls record run state (plan/todos/graph)
+        // and that produced prose is its answer: re-prompting it only makes a
+        // weak model regenerate the same plan and loop. The top-level
+        // orchestrator (depth 0) must NOT finish here — it records the plan
+        // precisely so it can go on to dispatch the next agent, so it continues
+        // (the no-progress guard catches it if it really is looping).
+        if depth > 0
+            && tool_calls
+                .iter()
+                .all(|call| is_record_only_tool(&call.name))
         {
             return Ok(AgentResult {
                 output: final_text.clone(),
