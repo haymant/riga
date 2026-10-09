@@ -3372,43 +3372,41 @@ fn infer_tool_call(object: &serde_json::Map<String, serde_json::Value>) -> Optio
 /// used here instead of inventing a new one.
 fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition]) -> String {
     let mut text = String::from(
-        "\n\nYou can call tools. To call exactly one, reply with this and nothing else:\n\
+        "\n\nYou are a function-calling AI model. The available functions are listed inside \
+         <tools></tools> XML tags. To call one, reply with a JSON object inside \
+         <tool_call></tool_call> tags and nothing else:\n\
          <tool_call>{\"name\": \"TOOL_NAME\", \"arguments\": {}}</tool_call>\n\n\
-         Use the exact tool names and argument names from the schemas below, and one item per call: a \
-         write creates one file with \"path\" and \"content\"; a bash call runs one command \
-         with \"command\". Do not send batches such as a \"files\" or \"commands\" array.\n\n\
-         Examples:\n\
-         <tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"src/app.js\"}}</tool_call>\n\
-         <tool_call>{\"name\": \"write\", \"arguments\": {\"path\": \"src/app.js\", \"content\": \"console.log(1);\"}}</tool_call>\n\
-         <tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"npm install\"}}</tool_call>\n\n\
-         To pick a capability tier or resize this run, call `set_model_budget` \
-         (for example {\"tier\": \"compact\"} or {\"enlarge\": true}); it takes effect next turn. \
-         To let a subagent use a tool it lacks, call `grant_tools` (for example \
-         {\"profile\": \"plan\", \"tools\": [\"bash\"]}); the user is asked to approve. \
-         `reset_tools` clears those grants.\n\n\
-         Emit the call directly, not inside a markdown code fence.\n\n\
-         Important: `task` is the tool name; `dispatch` is only its `action` value. \
-         Never emit a tool named `dispatch`.\n\n\
-         If a tool returns no matches, an empty result, or an error, do not repeat \
-         the same call. Try one genuinely different call, then answer with what you \
-         have. Never call the same tool with the same arguments twice.\n\n\
-         Available tools:\n",
+         <tools>\n",
     );
     for definition in definitions {
-        let name = definition.name.clone();
-        let description = definition.description.clone();
-        let parameters =
-            serde_json::to_string(&definition.parameters).unwrap_or_else(|_| "{}".to_owned());
-        text.push_str(&format!(
-            "- {name}: {description}\n  arguments: {parameters}\n"
-        ));
+        let entry = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": definition.name,
+                "description": definition.description,
+                "parameters": definition.parameters,
+            }
+        });
+        text.push_str(&serde_json::to_string(&entry).unwrap_or_default());
+        text.push('\n');
     }
     text.push_str(
-        "\nCall one tool per reply and wait for its result. If a tool call fails, read \
-         the error and change the arguments before calling again; never repeat the same \
-         failing call. Keep the final answer concise: use the requested format, prefer \
-         20-40 lines or fewer, and omit private chain-of-thought. When you have the final \
-         answer, reply with plain prose and no tool_call block.\n",
+        "</tools>\n\n\
+         Use the exact function and argument names from `parameters`. Call one function per \
+         reply and wait for its result. Emit the call directly, not inside a markdown code \
+         fence. `task` is the tool name; `dispatch` is only its `action` value — never emit a \
+         tool named `dispatch`.\n\n\
+         Examples:\n\
+         <tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"src/app.js\"}}</tool_call>\n\
+         <tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"npm install\"}}</tool_call>\n\
+         <tool_call>{\"name\": \"task\", \"arguments\": {\"action\": \"dispatch\", \"agent\": \"plan\", \"prompt\": \"plan it\"}}</tool_call>\n\n\
+         To pick a capability tier or resize this run, call `set_model_budget` \
+         ({\"tier\": \"compact\"} or {\"enlarge\": true}); it takes effect next turn. To let a \
+         subagent use a tool it lacks, call `grant_tools` ({\"profile\": \"plan\", \"tools\": \
+         [\"bash\"]}); the user is asked to approve. `reset_tools` clears those grants.\n\n\
+         If a function returns no matches, an empty result, or an error, do not repeat the same \
+         call. Try one genuinely different call, then answer with what you have. When you have \
+         the final answer, reply with plain prose and no tool_call block.\n",
     );
     text
 }
@@ -3461,7 +3459,9 @@ async fn run_local_loop(
     task_id: Option<&str>,
     evidence: &RunEvidence,
 ) -> Result<AgentResult, String> {
-    let mut definitions = mcp_runtime.tool_definitions().await;
+    // Built-ins first so the prompt's `<tools>` block lists them, then MCP tools.
+    let mut definitions = builtin_tool_definitions();
+    definitions.extend(mcp_runtime.tool_definitions().await);
     if let Some(allowed) = allowed_tools {
         definitions.retain(|definition| allowed.iter().any(|name| name == &definition.name));
     }
@@ -3684,7 +3684,7 @@ async fn run_local_loop(
                     .map_err(|_| "tool lifecycle stream closed")?;
                 messages.push(crate::local_model::ChatMessage {
                     role: "tool".into(),
-                    content: format!("Result from {}: {message}", call.name),
+                    content: format!("<tool_response>\n{message}\n</tool_response>"),
                 });
                 continue;
             }
@@ -3761,8 +3761,7 @@ async fn run_local_loop(
             messages.push(crate::local_model::ChatMessage {
                 role: "tool".into(),
                 content: format!(
-                    "Result from {}: {}",
-                    call.name,
+                    "<tool_response>\n{}\n</tool_response>",
                     crate::catalog::truncate_tool_result(
                         output.clone(),
                         crate::catalog::MAX_TOOL_RESULT_CHARS
@@ -4321,6 +4320,31 @@ fn tool_schemas() -> Vec<serde_json::Value> {
     ]
 }
 
+/// The built-in tools as `ToolDefinition`s, so the local prompt can render them
+/// in the model's native `<tools>` format. Without this the local prompt only
+/// listed MCP tools and described the built-ins in prose, which is why models
+/// like Hermes 3 improvised their own tool-call shape.
+fn builtin_tool_definitions() -> Vec<rig_core::completion::ToolDefinition> {
+    tool_schemas()
+        .into_iter()
+        .filter_map(|schema| {
+            let function = schema.get("function")?;
+            Some(rig_core::completion::ToolDefinition {
+                name: function.get("name")?.as_str()?.to_owned(),
+                description: function
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                parameters: function
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            })
+        })
+        .collect()
+}
+
 fn function_schema(
     name: &str,
     description: &str,
@@ -4446,7 +4470,8 @@ fn run_journal_path(run_id: &str) -> std::path::PathBuf {
 mod tests {
     use super::{
         ClientMessage, ParsedToolCall, ProviderApi, ProviderConfig, ProviderKind, ServerMessage,
-        parse_local_tool_calls, resolve_run_provider, strip_reasoning,
+        builtin_tool_definitions, local_tool_instructions, parse_local_tool_calls,
+        resolve_run_provider, strip_reasoning,
     };
     use riga_kernel::events::RigaEvent;
     use tokio::sync::mpsc;
@@ -4984,6 +5009,53 @@ mod tests {
         let (prose, calls) = parse_local_tool_calls("The task: find the largest files");
         assert!(calls.is_empty(), "{calls:?}");
         assert!(prose.contains("find the largest files"), "{prose}");
+    }
+
+    #[test]
+    fn builtin_tool_definitions_cover_the_model_facing_tools() {
+        let defs = builtin_tool_definitions();
+        let names: Vec<&str> = defs
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect();
+        for expected in [
+            "read",
+            "write",
+            "bash",
+            "task",
+            "update_plan",
+            "set_model_budget",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+        for definition in &defs {
+            assert!(
+                !definition.description.is_empty(),
+                "{} has no description",
+                definition.name
+            );
+            assert!(
+                definition.parameters.is_object(),
+                "{} has no object schema",
+                definition.name
+            );
+        }
+    }
+
+    #[test]
+    fn local_tool_instructions_render_the_native_tools_block() {
+        let defs = vec![rig_core::completion::ToolDefinition {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}),
+        }];
+        let text = local_tool_instructions(&defs);
+        assert!(text.contains("function-calling"), "{text}");
+        assert!(text.contains("<tools>"), "{text}");
+        assert!(text.contains("</tools>"), "{text}");
+        assert!(text.contains("\"name\":\"read\""), "{text}");
+        assert!(text.contains("\"parameters\""), "{text}");
+        assert!(text.contains("<tool_call>"), "{text}");
     }
 
     #[tokio::test]
