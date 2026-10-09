@@ -371,6 +371,7 @@ pub fn agent_profiles() -> Vec<AgentProfile> {
             &[
                 "Never ask questions and never edit files.",
                 "Produce the plan only: do not run shell commands, write files, or dispatch agents. Read and search to inform the plan if needed.",
+                "Return the plan as your reply and stop. Do not call `update_plan`/`update_todos` repeatedly; the parent records progress.",
                 "You cannot dispatch another agent: the task tool is not available to this read-only profile. Return the plan to the parent orchestrator, which will dispatch build if implementation is needed.",
                 "Keep steps actionable at file and function level.",
                 "State risks and assumptions explicitly.",

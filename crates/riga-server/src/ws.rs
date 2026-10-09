@@ -3462,6 +3462,12 @@ async fn call_local_model(
     .await
 }
 
+/// Tools that only record run state for the UI. A turn whose only calls are
+/// these has nothing left to do, so the loop finishes with the turn's prose.
+fn is_record_only_tool(name: &str) -> bool {
+    matches!(name, "update_plan" | "update_todos" | "update_graph")
+}
+
 /// The local-model tool loop, shaped like `run_chat_loop` so the orchestrator
 /// and a dispatched subagent share it with different prompts and tool sets.
 #[allow(clippy::too_many_arguments)]
@@ -3797,6 +3803,17 @@ async fn run_local_loop(
                     call.name
                 ));
             }
+        }
+        // A turn whose only calls record run state (plan/todos/graph) and that
+        // produced prose is the model's answer: re-prompting it only makes a weak
+        // model regenerate the same plan and loop. Finish here.
+        if tool_calls
+            .iter()
+            .all(|call| is_record_only_tool(&call.name))
+        {
+            return Ok(AgentResult {
+                output: final_text.clone(),
+            });
         }
     }
 }
@@ -4491,8 +4508,8 @@ fn run_journal_path(run_id: &str) -> std::path::PathBuf {
 mod tests {
     use super::{
         ClientMessage, ParsedToolCall, ProviderApi, ProviderConfig, ProviderKind, ServerMessage,
-        builtin_tool_definitions, local_tool_instructions, parse_local_tool_calls,
-        resolve_run_provider, strip_reasoning,
+        builtin_tool_definitions, is_record_only_tool, local_tool_instructions,
+        parse_local_tool_calls, resolve_run_provider, strip_reasoning,
     };
     use riga_kernel::events::RigaEvent;
     use tokio::sync::mpsc;
@@ -5063,6 +5080,18 @@ mod tests {
         let (prose, calls) = parse_local_tool_calls("```json\n{\"key\": \"value\"}\n```");
         assert!(calls.is_empty(), "{calls:?}");
         assert!(prose.contains("\"key\""), "{prose}");
+    }
+
+    #[test]
+    fn record_only_tools_are_recognized() {
+        // A turn that only records run state finishes the loop.
+        for name in ["update_plan", "update_todos", "update_graph"] {
+            assert!(is_record_only_tool(name), "{name}");
+        }
+        // Anything that gathers information or acts keeps the loop going.
+        for name in ["read", "bash", "task", "set_model_budget", "grant_tools"] {
+            assert!(!is_record_only_tool(name), "{name}");
+        }
     }
 
     #[test]
