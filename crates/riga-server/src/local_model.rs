@@ -54,11 +54,211 @@ const MAX_DECODE_BATCH: u32 = 2048;
 /// for a test.
 const _: () = assert!(MAX_DECODE_BATCH > 0 && MAX_DECODE_BATCH < MAX_CONTEXT);
 
-/// Output tokens reserved per turn so the prompt can never consume the whole
-/// window: every turn keeps room to finish a reasoning block and emit a tool
-/// call or an answer. When the prompt leaves less than this, the oldest
-/// non-system messages are dropped until it fits.
-const MIN_OUTPUT_TOKENS: u32 = 1_536;
+/// A capability tier for a local model, used to pick a default run budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// Small models (roughly ≤2B): short turns, small windows.
+    Compact,
+    /// Mid models (roughly 3–8B): the default.
+    Middle,
+    /// Large or reasoning models (roughly ≥13B): long turns, big windows.
+    Large,
+}
+
+impl Capability {
+    /// Parse a tier name, accepting a few common synonyms.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "compact" | "small" | "tiny" => Some(Self::Compact),
+            "middle" | "medium" | "mid" => Some(Self::Middle),
+            "large" | "big" => Some(Self::Large),
+            _ => None,
+        }
+    }
+
+    /// The default run budget for this tier.
+    pub fn budget(self) -> LocalBudget {
+        match self {
+            Self::Compact => LocalBudget {
+                max_tokens: 2_048,
+                min_output: 1_024,
+                run_token_budget: 8_192,
+                max_turns: 6,
+                turn_seconds: 150,
+                no_progress_seconds: 60,
+            },
+            Self::Middle => LocalBudget {
+                max_tokens: 8_192,
+                min_output: 1_536,
+                run_token_budget: 20_480,
+                max_turns: 8,
+                turn_seconds: 240,
+                no_progress_seconds: 90,
+            },
+            Self::Large => LocalBudget {
+                max_tokens: 16_384,
+                min_output: 2_048,
+                run_token_budget: 40_960,
+                max_turns: 10,
+                turn_seconds: 360,
+                no_progress_seconds: 120,
+            },
+        }
+    }
+}
+
+/// Run-scoped local-model budget. The `set_model_budget` tool adjusts it so a
+/// prompt can pick a capability tier, resize a step, or set exact numbers; the
+/// local loop re-reads it every turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalBudget {
+    /// Output tokens requested per turn (clamped to the context room).
+    pub max_tokens: u32,
+    /// Output tokens reserved when trimming the prompt, so a turn always has
+    /// room to finish a reasoning block and emit a tool call or an answer.
+    pub min_output: u32,
+    /// Tokens across every turn of the run.
+    pub run_token_budget: usize,
+    /// Turns in one run.
+    pub max_turns: usize,
+    /// Per-turn wall clock, seconds.
+    pub turn_seconds: u64,
+    /// Idle window before a turn is treated as stalled, seconds.
+    pub no_progress_seconds: u64,
+}
+
+impl Default for LocalBudget {
+    fn default() -> Self {
+        Capability::Middle.budget()
+    }
+}
+
+/// Hard ceilings the budget can never exceed, so "make it bigger" cannot turn
+/// one run into an hour of decoding.
+const MAX_BUDGET_TOKENS: u32 = 32_768;
+const MAX_RUN_TOKENS: usize = 131_072;
+const MAX_TURNS: usize = 24;
+const MAX_TURN_SECONDS: u64 = 900;
+const MAX_IDLE_SECONDS: u64 = 300;
+
+impl LocalBudget {
+    /// Grow the budget for a step that needs more room (roughly 2x), capped.
+    pub fn enlarged(self) -> Self {
+        Self {
+            max_tokens: self.max_tokens.saturating_mul(2).min(MAX_BUDGET_TOKENS),
+            min_output: self.min_output.saturating_mul(2).min(MAX_BUDGET_TOKENS),
+            run_token_budget: self.run_token_budget.saturating_mul(2).min(MAX_RUN_TOKENS),
+            max_turns: (self.max_turns + 4).min(MAX_TURNS),
+            turn_seconds: self.turn_seconds.saturating_mul(2).min(MAX_TURN_SECONDS),
+            no_progress_seconds: self
+                .no_progress_seconds
+                .saturating_mul(2)
+                .min(MAX_IDLE_SECONDS),
+        }
+    }
+
+    /// Shrink the budget for a cheap step (roughly half), floored at compact.
+    pub fn shrunk(self) -> Self {
+        let floor = Capability::Compact.budget();
+        Self {
+            max_tokens: (self.max_tokens / 2).max(floor.max_tokens),
+            min_output: (self.min_output / 2).max(floor.min_output),
+            run_token_budget: (self.run_token_budget / 2).max(floor.run_token_budget),
+            max_turns: self.max_turns.saturating_sub(4).max(floor.max_turns),
+            turn_seconds: (self.turn_seconds / 2).max(floor.turn_seconds),
+            no_progress_seconds: (self.no_progress_seconds / 2).max(floor.no_progress_seconds),
+        }
+    }
+
+    /// Clamp every field to the hard limits.
+    pub fn clamped(self) -> Self {
+        let floor = Capability::Compact.budget();
+        Self {
+            max_tokens: self.max_tokens.clamp(floor.max_tokens, MAX_BUDGET_TOKENS),
+            min_output: self.min_output.clamp(floor.min_output, MAX_BUDGET_TOKENS),
+            run_token_budget: self
+                .run_token_budget
+                .clamp(floor.run_token_budget, MAX_RUN_TOKENS),
+            max_turns: self.max_turns.clamp(floor.max_turns, MAX_TURNS),
+            turn_seconds: self
+                .turn_seconds
+                .clamp(floor.turn_seconds, MAX_TURN_SECONDS),
+            no_progress_seconds: self
+                .no_progress_seconds
+                .clamp(floor.no_progress_seconds, MAX_IDLE_SECONDS),
+        }
+    }
+
+    /// Apply a `set_model_budget` payload: an optional `tier`, optional
+    /// `enlarge`/`shrink`, then explicit field overrides, all clamped.
+    pub fn apply(&mut self, input: &serde_json::Value) -> Result<String, String> {
+        let mut next = *self;
+        if let Some(tier) = input.get("tier").and_then(serde_json::Value::as_str) {
+            next = Capability::parse(tier)
+                .ok_or_else(|| {
+                    format!("unknown capability tier `{tier}`; use compact, middle, or large")
+                })?
+                .budget();
+        }
+        if input
+            .get("enlarge")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            next = next.enlarged();
+        }
+        if input
+            .get("shrink")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            next = next.shrunk();
+        }
+        if let Some(value) = input.get("max_tokens").and_then(serde_json::Value::as_u64) {
+            next.max_tokens = value.min(u32::MAX as u64) as u32;
+        }
+        if let Some(value) = input.get("min_output").and_then(serde_json::Value::as_u64) {
+            next.min_output = value.min(u32::MAX as u64) as u32;
+        }
+        if let Some(value) = input
+            .get("run_token_budget")
+            .and_then(serde_json::Value::as_u64)
+        {
+            next.run_token_budget = value as usize;
+        }
+        if let Some(value) = input.get("max_turns").and_then(serde_json::Value::as_u64) {
+            next.max_turns = value as usize;
+        }
+        if let Some(value) = input
+            .get("turn_seconds")
+            .and_then(serde_json::Value::as_u64)
+        {
+            next.turn_seconds = value;
+        }
+        if let Some(value) = input
+            .get("no_progress_seconds")
+            .and_then(serde_json::Value::as_u64)
+        {
+            next.no_progress_seconds = value;
+        }
+        *self = next.clamped();
+        Ok(self.describe())
+    }
+
+    /// A one-line summary the tool returns to the model.
+    pub fn describe(&self) -> String {
+        format!(
+            "max_tokens={} min_output={} run_token_budget={} max_turns={} turn_seconds={} no_progress_seconds={}",
+            self.max_tokens,
+            self.min_output,
+            self.run_token_budget,
+            self.max_turns,
+            self.turn_seconds,
+            self.no_progress_seconds
+        )
+    }
+}
 
 /// Device memory the auto-fit planner is told to leave unused, per device.
 ///
@@ -747,6 +947,9 @@ impl LocalModelRuntime {
         max_tokens: u32,
         deadline: Option<Instant>,
         no_progress: Option<Duration>,
+        // Output tokens to reserve when trimming the prompt, so the turn can
+        // still finish a reasoning block and emit a tool call or an answer.
+        min_output: u32,
         cancel: &AtomicBool,
         // Set before the first token: whether the chat template opened a
         // reasoning block, so the caller streams it as reasoning rather than
@@ -805,7 +1008,7 @@ impl LocalModelRuntime {
                 return Err("The model tokenizer returned an empty prompt".into());
             }
             let room = context_size.saturating_sub(tokens.len() as u32);
-            if room >= MIN_OUTPUT_TOKENS || working.len() <= 1 {
+            if room >= min_output || working.len() <= 1 {
                 break (prompt, tokens);
             }
             match working
@@ -1075,8 +1278,9 @@ fn _now_epoch() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CATALOG, DEFAULT_CONTEXT, LocalModelRuntime, MAX_CONTEXT, MAX_DECODE_BATCH, MIN_CONTEXT,
-        accelerator_label, requested_context, resolve_context, resolve_max_tokens,
+        CATALOG, Capability, DEFAULT_CONTEXT, LocalBudget, LocalModelRuntime, MAX_BUDGET_TOKENS,
+        MAX_CONTEXT, MAX_DECODE_BATCH, MAX_TURNS, MIN_CONTEXT, accelerator_label,
+        requested_context, resolve_context, resolve_max_tokens,
     };
 
     #[test]
@@ -1249,5 +1453,64 @@ mod tests {
                 model.id
             );
         }
+    }
+
+    #[test]
+    fn capability_tiers_are_ordered_and_parse() {
+        let compact = Capability::Compact.budget();
+        let middle = Capability::Middle.budget();
+        let large = Capability::Large.budget();
+        assert!(compact.max_tokens < middle.max_tokens);
+        assert!(middle.max_tokens < large.max_tokens);
+        assert!(compact.max_turns < middle.max_turns);
+        assert!(middle.max_turns < large.max_turns);
+        assert!(compact.turn_seconds < middle.turn_seconds);
+        assert!(middle.turn_seconds < large.turn_seconds);
+        // Middle is the default, so behaviour is unchanged unless asked.
+        assert_eq!(LocalBudget::default(), middle);
+        assert_eq!(Capability::parse("Compact"), Some(Capability::Compact));
+        assert_eq!(Capability::parse(" medium "), Some(Capability::Middle));
+        assert_eq!(Capability::parse("gigantic"), None);
+    }
+
+    #[test]
+    fn enlarge_and_shrink_stay_within_bounds() {
+        let compact = Capability::Compact.budget();
+        assert!(compact.enlarged().max_tokens > compact.max_tokens);
+        let mut huge = compact;
+        for _ in 0..20 {
+            huge = huge.enlarged();
+        }
+        assert_eq!(huge.max_tokens, MAX_BUDGET_TOKENS);
+        assert_eq!(huge.max_turns, MAX_TURNS);
+        // Shrinking from the floor cannot go lower.
+        assert_eq!(compact.shrunk().max_tokens, compact.max_tokens);
+        assert_eq!(compact.shrunk().max_turns, compact.max_turns);
+    }
+
+    #[test]
+    fn budget_apply_honours_tier_enlarge_and_explicit_overrides() {
+        let mut budget = LocalBudget::default();
+        let summary = budget
+            .apply(&serde_json::json!({"tier": "compact"}))
+            .expect("tier applies");
+        assert_eq!(budget, Capability::Compact.budget());
+        assert!(summary.contains("max_tokens=2048"), "{summary}");
+
+        budget
+            .apply(&serde_json::json!({"enlarge": true}))
+            .expect("enlarge applies");
+        assert!(budget.max_tokens > Capability::Compact.budget().max_tokens);
+
+        // An explicit value below the floor is clamped up, not accepted as-is.
+        budget
+            .apply(&serde_json::json!({"max_tokens": 10}))
+            .expect("override applies");
+        assert_eq!(budget.max_tokens, Capability::Compact.budget().max_tokens);
+
+        let error = budget
+            .apply(&serde_json::json!({"tier": "gigantic"}))
+            .expect_err("unknown tier rejected");
+        assert!(error.contains("unknown capability tier"), "{error}");
     }
 }

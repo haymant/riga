@@ -9,6 +9,10 @@ pub enum ToolRisk {
     ProcessExecution,
     NetworkAccess,
     Destructive,
+    /// A change to the run's own capabilities, such as granting a subagent a
+    /// tool it does not have by default. Requires approval, but is not workspace
+    /// work.
+    CapabilityChange,
 }
 
 impl ToolRisk {
@@ -20,6 +24,7 @@ impl ToolRisk {
             "write" | "edit" | "apply_patch" => Self::WorkspaceWrite,
             "bash" | "shell" => Self::ProcessExecution,
             "web" | "webfetch" | "websearch" => Self::NetworkAccess,
+            "grant_tools" => Self::CapabilityChange,
             _ => Self::ReadOnly,
         }
     }
@@ -69,9 +74,10 @@ impl ToolPolicy {
             ToolRisk::ProcessExecution if self.allow_process_execution => ApprovalDecision::Allow,
             ToolRisk::NetworkAccess if self.allow_network => ApprovalDecision::Allow,
             ToolRisk::Destructive if self.allow_destructive => ApprovalDecision::Allow,
-            ToolRisk::WorkspaceWrite | ToolRisk::ProcessExecution | ToolRisk::NetworkAccess => {
-                ApprovalDecision::RequireApproval
-            }
+            ToolRisk::WorkspaceWrite
+            | ToolRisk::ProcessExecution
+            | ToolRisk::NetworkAccess
+            | ToolRisk::CapabilityChange => ApprovalDecision::RequireApproval,
             ToolRisk::Destructive => ApprovalDecision::Deny,
             ToolRisk::ReadOnly => ApprovalDecision::Deny,
         }

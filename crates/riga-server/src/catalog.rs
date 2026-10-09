@@ -342,7 +342,7 @@ pub fn agent_profiles() -> Vec<AgentProfile> {
             &["scout", "explorer"],
             true,
             "Fast, read-only codebase reconnaissance with compressed hand-off context.",
-            &["read", "glob", "grep", "bash(read-only)"],
+            &["read", "glob", "grep", "skill", "bash"],
             "cheapest/fastest capable model",
             &[
                 "Never ask questions; make reasonable assumptions and document them.",
@@ -363,7 +363,7 @@ pub fn agent_profiles() -> Vec<AgentProfile> {
             &["planner"],
             true,
             "Turn requirements and exploration findings into a concrete implementation plan.",
-            &["read", "glob", "grep", "bash(read-only)"],
+            &["read", "glob", "grep", "skill", "bash"],
             "strong reasoning model",
             &[
                 "Never ask questions and never edit files.",
@@ -402,7 +402,7 @@ pub fn agent_profiles() -> Vec<AgentProfile> {
             &["reviewer"],
             true,
             "Independently review a build result for correctness, security, tests, and maintainability.",
-            &["read", "glob", "grep", "bash(read-only)"],
+            &["read", "glob", "grep", "skill", "bash"],
             "strong reasoning model",
             &[
                 "Never modify files or change system state.",
@@ -484,6 +484,8 @@ fn list_agent_profiles() -> Result<String, String> {
                 "aliases": profile.aliases,
                 "purpose": profile.purpose,
                 "read_only": profile.read_only,
+                "model": profile.model_preference,
+                "tools": profile.tools,
                 "run_with": format!("task action=dispatch agent={} prompt=<the task>", profile.name),
             })
         })

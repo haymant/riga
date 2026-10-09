@@ -85,33 +85,112 @@ A live task is not the same as a durable task record. Durable actions (`create`,
 
 ## Profile boundaries
 
-| Profile | Use for | Can write/dispatch? | Preferred output |
-|---|---|---:|---|
-| `explore` / `scout` | Fast repository reconnaissance | No / No | Summary, evidence, architecture, start here |
-| `plan` / `planner` | Concrete implementation planning | No / No | Goal, plan, files, tests, risks |
-| `build` / `executor` | Implement and validate a scoped change | Yes / Yes | Completed, files changed, notes |
-| `review` / `reviewer` | Correctness/security/test review | No / No | Findings, validation, recommendation |
+| Profile | Model | Default tools | Can write/dispatch? |
+|---|---|---|---|
+| `explore` / `scout` | cheap/fast (subagent model) | read, glob, grep, skill, bash | No / No |
+| `plan` / `planner` | strong reasoning (subagent model) | read, glob, grep, skill, bash | No / No |
+| `build` / `executor` | capable coding (main model) | read, write, glob, grep, bash, task, skill | Yes / Yes |
+| `review` / `reviewer` | strong reasoning (subagent model) | read, glob, grep, skill, bash | No / No |
 
-Never broaden a read-only profile because it attempted a write or nested dispatch. Return the result to the parent.
+Every profile also gets the run-state tools: `update_plan`, `update_todos`,
+`update_graph`, `set_model_budget`, `grant_tools`, `reset_tools`.
 
-## Output budgets for small models
+`bash` is available to **every** profile but each call is **approval-gated**, so
+a read-only agent can run `find`/`ls`/`git` once you approve it. `write` and
+`task` are only on `build`. The model is chosen by `subagent_model_for`: the
+configured `subagent_model` for read-only profiles, else the main model.
 
-Prompt limits are useful, but enforce output budgets in provider configuration when possible. The output budget includes reasoning, tool-call JSON, and the final answer.
+### Granting tools to a subagent (HITL)
 
-For Qwen 4B or similar local models:
+When a subagent genuinely needs a tool it does not have (for example `webfetch`
+for `explore`), the parent grants it for this run — with your approval:
 
-- `explore`: 8–12 bullets, roughly 1,500–2,048 output tokens;
-- `plan`: 5–8 numbered steps and up to 5 risks, roughly 1,024–1,536 tokens;
-- `review`: findings with severity and file/line evidence, roughly 1,500–2,048 tokens;
-- `build`: allow more room for file bodies and commands; keep the final report under 20 lines.
+```json
+{"name": "grant_tools", "arguments": {"profile": "explore", "tools": ["webfetch"], "reason": "fetch upstream docs"}}
+```
 
-Use explicit stopping instructions:
+The runtime asks you to confirm; on approval the tool joins that profile's set
+for the rest of the run. Reset with:
+
+```json
+{"name": "reset_tools", "arguments": {"profile": "explore"}}
+{"name": "reset_tools", "arguments": {}}
+```
+
+`reset_tools` with no profile clears every grant. Grants are run-scoped and do
+not persist. Never broaden a read-only profile by editing its definition; use
+`grant_tools` so the user sees and approves the change.
+
+## Model budget (compact / middle / large)
+
+The local run has a **run-scoped budget** you can change with `set_model_budget`.
+It takes effect on the next turn, so a prompt can use different parameters per
+step. The budget includes reasoning, tool-call JSON, and the final answer.
+
+Pick a capability tier, or resize the current one:
+
+```json
+{"tier": "compact"}
+{"tier": "middle"}
+{"tier": "large"}
+{"enlarge": true}
+{"shrink": true}
+{"max_tokens": 16384, "run_token_budget": 40960, "turn_seconds": 360}
+```
+
+Exact tier parameters:
+
+| Tier | max_tokens | min_output | run_token_budget | max_turns | turn_seconds | no_progress_seconds |
+|---|---:|---:|---:|---:|---:|---:|
+| `compact` | 2,048 | 1,024 | 8,192 | 6 | 150 | 60 |
+| `middle` (default) | 8,192 | 1,536 | 20,480 | 8 | 240 | 90 |
+| `large` | 16,384 | 2,048 | 40,960 | 10 | 360 | 120 |
+
+- `max_tokens` — per-turn output cap (clamped to the context room).
+- `min_output` — output reserve; the prompt is trimmed until it fits.
+- `run_token_budget` — summed across every turn.
+- `max_turns`, `turn_seconds`, `no_progress_seconds` — loop bounds.
+- `enlarge` doubles the numeric limits (+4 turns); `shrink` halves them. Both
+  clamp to hard ceilings, so they are safe to call repeatedly.
+- `context` is a **load-time** setting (`RIGA_LOCAL_CONTEXT`); changing it needs
+  a model reload, so it is not part of this tool.
+
+Guidance: `compact` for cheap recon on a ~2B model, `middle` for 3–8B, `large`
+for ≥13B or a reasoning model. Raise `max_tokens` before blaming the model when
+a `write` body or a tool call is truncated; do not shrink the build budget to
+fix verbose planning.
+
+Pair it with a prompt-level limit:
 
 ```text
 Use tools only until the requested evidence is collected. Return only the requested sections. Limit the final answer to 500 words and 30 lines. Do not repeat tool output, speculate beyond evidence, or reveal private chain-of-thought.
 ```
 
-Do not globally reduce the build budget to solve verbose planning; that can truncate tool calls or file contents.
+## Recovering a failed run
+
+A run can fail with a clear message. Read it, adjust, then retry — do not
+re-dispatch the same way:
+
+- **`the local model kept emitting a tool call that is not valid JSON; it may
+  need a larger output limit or a smaller request`** — the tool call was cut off
+  or malformed. Enlarge the budget, then retry:
+  ```json
+  {"name": "set_model_budget", "arguments": {"enlarge": true}}
+  ```
+  and re-dispatch with an instruction to emit **one smaller call** (prefer
+  several small `write` calls over one large one).
+- **`hit the per-turn time limit while still generating`** — slow, not stuck.
+  Enlarge `turn_seconds` (or use `large`), then retry.
+- **`produced no token within the idle window`** — a real stall; retry once, and
+  if it repeats use a smaller prompt or a smaller model.
+- **`reached the N-turn budget` / `exceeded the N-token budget`** — enlarge the
+  budget (`{"enlarge": true}`) or split the task into more graph nodes.
+- **`` `bash` is not available to this agent ``** — the profile lacks the tool;
+  `grant_tools` it (with approval) instead of re-dispatching the same way.
+- **`task node is blocked by incomplete dependencies`** — dispatch the
+  dependencies first; do not force the node.
+
+After a failure, `update_todos` the retry so the RunDeck shows the recovery.
 
 ## Validation checklist
 

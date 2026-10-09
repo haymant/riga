@@ -85,6 +85,11 @@ struct RunEvidence {
     /// parameter keeps the dozens of loop call sites unchanged.
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     graph: std::sync::Arc<tokio::sync::Mutex<GraphRuntime>>,
+    /// Run-scoped local-model budget, adjusted by `set_model_budget`.
+    budget: std::sync::Arc<tokio::sync::Mutex<crate::local_model::LocalBudget>>,
+    /// Tools granted to a profile for this run, on top of its defaults, by
+    /// `grant_tools` after the user approves.
+    tool_grants: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
 }
 
 #[derive(Default)]
@@ -140,6 +145,16 @@ impl RunEvidence {
 
     fn graph(&self) -> std::sync::Arc<tokio::sync::Mutex<GraphRuntime>> {
         self.graph.clone()
+    }
+
+    fn budget(&self) -> std::sync::Arc<tokio::sync::Mutex<crate::local_model::LocalBudget>> {
+        self.budget.clone()
+    }
+
+    fn tool_grants(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>> {
+        self.tool_grants.clone()
     }
 }
 
@@ -1347,6 +1362,8 @@ struct ToolOutputStream {
     call_id: String,
     trace_sender: mpsc::Sender<ToolTraceEvent>,
     graph: std::sync::Arc<tokio::sync::Mutex<GraphRuntime>>,
+    budget: std::sync::Arc<tokio::sync::Mutex<crate::local_model::LocalBudget>>,
+    tool_grants: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
 }
 
 impl ToolOutputStream {
@@ -1695,6 +1712,77 @@ async fn execute_tool(
                 graph.nodes.len(),
                 ready_count
             ))
+        }
+        "set_model_budget" => {
+            let stream = output_stream
+                .as_ref()
+                .ok_or("set_model_budget requires a live run")?;
+            let mut budget = stream.budget.lock().await;
+            let summary = budget.apply(&input)?;
+            Ok(format!("Model budget updated: {summary}"))
+        }
+        "grant_tools" => {
+            let stream = output_stream
+                .as_ref()
+                .ok_or("grant_tools requires a live run")?;
+            let profile_name = input
+                .get("profile")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or("grant_tools requires a profile")?;
+            let profile = crate::catalog::find_agent_profile(profile_name)
+                .ok_or_else(|| format!("unknown agent `{profile_name}`"))?;
+            let tools: Vec<String> = input
+                .get("tools")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if tools.is_empty() {
+                return Err("grant_tools requires at least one tool name".into());
+            }
+            let mut grants = stream.tool_grants.lock().await;
+            let granted = grants.entry(profile.name.clone()).or_default();
+            for tool in &tools {
+                if !granted.contains(tool) {
+                    granted.push(tool.clone());
+                }
+            }
+            Ok(format!(
+                "Granted to `{}` for this run: {}. Effective tools: {}",
+                profile.name,
+                tools.join(", "),
+                allowed_tools_for(&profile, Some(granted.as_slice())).join(", ")
+            ))
+        }
+        "reset_tools" => {
+            let stream = output_stream
+                .as_ref()
+                .ok_or("reset_tools requires a live run")?;
+            let mut grants = stream.tool_grants.lock().await;
+            match input
+                .get("profile")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                Some(profile) => {
+                    grants.remove(profile);
+                    Ok(format!("Cleared tool grants for `{profile}`"))
+                }
+                None => {
+                    grants.clear();
+                    Ok("Cleared all tool grants for this run".into())
+                }
+            }
         }
         "skill" => {
             if let Some(name) = input
@@ -2474,6 +2562,8 @@ async fn run_chat_loop(
                                 call_id: call.call_id.clone(),
                                 trace_sender: trace_sender.clone(),
                                 graph: evidence.graph(),
+                                budget: evidence.budget(),
+                                tool_grants: evidence.tool_grants(),
                             }),
                         )
                         .await
@@ -2715,7 +2805,11 @@ async fn dispatch_subagent(
         ))
         .await;
 
-    let allowed = allowed_tools_for(&profile);
+    let allowed = {
+        let grants = evidence.tool_grants();
+        let guard = grants.lock().await;
+        allowed_tools_for(&profile, guard.get(&profile.name).map(Vec::as_slice))
+    };
     let system_prompt = subagent_system_prompt(&profile, workspace_root);
     // A local run dispatches local children; a remote run dispatches remote
     // children, so a subagent never crosses the provider boundary. The child's
@@ -2846,20 +2940,35 @@ fn subagent_system_prompt(
 
 /// The tools a subagent may call. A read-only profile never gets write, shell,
 /// or nested dispatch, so it cannot exceed its remit by accident.
-fn allowed_tools_for(profile: &crate::catalog::AgentProfile) -> Vec<String> {
+/// The tools a subagent may call: the run-state tools every profile has, the
+/// profile's declared tools, and any tools granted for this run.
+///
+/// The declared `tools` are the source of truth, so a read-only profile that
+/// declares `bash` may run shell commands — each one still goes through the
+/// approval gate. Read-only profiles simply do not declare `write` or `task`.
+fn allowed_tools_for(
+    profile: &crate::catalog::AgentProfile,
+    grants: Option<&[String]>,
+) -> Vec<String> {
     let mut allowed = vec![
         "update_plan".to_owned(),
         "update_todos".to_owned(),
         "update_graph".to_owned(),
+        "set_model_budget".to_owned(),
+        "grant_tools".to_owned(),
+        "reset_tools".to_owned(),
     ];
-    if profile.read_only {
-        allowed.extend(["read", "glob", "grep", "skill"].map(str::to_owned));
-        return allowed;
-    }
     for tool in &profile.tools {
         let base = tool.split('(').next().unwrap_or(tool).trim();
-        if !base.is_empty() {
+        if !base.is_empty() && !allowed.iter().any(|name| name == base) {
             allowed.push(base.to_owned());
+        }
+    }
+    if let Some(grants) = grants {
+        for tool in grants {
+            if !allowed.iter().any(|name| name == tool) {
+                allowed.push(tool.clone());
+            }
         }
     }
     allowed
@@ -2874,8 +2983,6 @@ fn subagent_model_for(config: &ProviderConfig, profile: &crate::catalog::AgentPr
         _ => config.model.clone(),
     }
 }
-const LOCAL_MAX_TURNS: usize = 8;
-
 /// How many times a local turn is asked to re-emit an unparseable tool call.
 const MAX_TOOL_CALL_RETRIES: usize = 2;
 
@@ -2898,32 +3005,10 @@ const MAX_REPEATED_TOOL_CALLS: usize = 2;
 const LOCAL_TOOL_CALL_RETRY: &str = "Your reply contained a <tool_call> block that was not valid JSON; it was probably cut off. \
 Reply with exactly ONE smaller tool call whose <tool_call> block is valid JSON. Prefer several small `write` calls over one large one.";
 
-/// Tokens requested per local turn before `resolve_max_tokens` shrinks it to the
-/// room the prompt leaves. Deliberately modest: a 1.5B model at 4k tokens on CPU
-/// is minutes of work, and the tool loop re-decodes the history every turn.
-/// Output budget for one local turn.
-///
-/// This is a cap, not a target: generation still stops at the model's end token,
-/// so a larger value costs nothing on a short reply and only buys room for a long
-/// one. It is clamped by `resolve_max_tokens` to whatever the context has left
-/// after the prompt, so it can never overflow. A `write` that carries a file's
-/// body needs real room — 1024 truncated the JSON mid-string, which parses as
-/// neither a tool call nor an answer.
-const LOCAL_MAX_TOKENS: u32 = 8192;
-
-/// Whole-run output budget for a local model, summed across every tool turn.
-///
-/// Without this a small model can generate `LOCAL_MAX_TURNS * LOCAL_MAX_TOKENS`
-/// tokens — tens of minutes on CPU — while the UI sits at "thinking". When the
-/// budget is spent the run stops with a clear message instead of hanging.
-const LOCAL_RUN_TOKEN_BUDGET: usize = 20_480;
-
-/// Wall-clock budget for one turn and for the whole run.
-const LOCAL_TURN_WALL_CLOCK: std::time::Duration = std::time::Duration::from_secs(240);
+/// Wall-clock budget for the whole run. The per-turn output cap, turn wall clock,
+/// idle window, turn count, and run token budget now come from the run's
+/// `LocalBudget` (set by `set_model_budget`), so they are not constants here.
 const LOCAL_RUN_WALL_CLOCK: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// How long a turn may produce no token before it is treated as stalled.
-const LOCAL_NO_PROGRESS: std::time::Duration = std::time::Duration::from_secs(90);
 
 #[derive(Debug, PartialEq)]
 struct ParsedToolCall {
@@ -3088,6 +3173,11 @@ fn local_tool_instructions(definitions: &[rig_core::completion::ToolDefinition])
          <tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"src/app.js\"}}</tool_call>\n\
          <tool_call>{\"name\": \"write\", \"arguments\": {\"path\": \"src/app.js\", \"content\": \"console.log(1);\"}}</tool_call>\n\
          <tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"npm install\"}}</tool_call>\n\n\
+         To pick a capability tier or resize this run, call `set_model_budget` \
+         (for example {\"tier\": \"compact\"} or {\"enlarge\": true}); it takes effect next turn. \
+         To let a subagent use a tool it lacks, call `grant_tools` (for example \
+         {\"profile\": \"plan\", \"tools\": [\"bash\"]}); the user is asked to approve. \
+         `reset_tools` clears those grants.\n\n\
          Important: `task` is the tool name; `dispatch` is only its `action` value. \
          Never emit a tool named `dispatch`.\n\n\
          If a tool returns no matches, an empty result, or an error, do not repeat \
@@ -3193,7 +3283,18 @@ async fn run_local_loop(
     // Across turns: a call the model already made must not be re-run.
     let mut tool_calls_total = 0usize;
     let mut seen_calls: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for turn in 0..LOCAL_MAX_TURNS {
+    let mut turn = 0usize;
+    loop {
+        // Re-read the budget each turn so a `set_model_budget` call mid-run takes
+        // effect on the next turn.
+        let budget = *evidence.budget().lock().await;
+        if turn >= budget.max_turns {
+            return Err(format!(
+                "the local model reached the {}-turn budget without finishing; ask a narrower question or raise the budget with set_model_budget.",
+                budget.max_turns
+            ));
+        }
+        turn += 1;
         // Generation is blocking C, so it runs on the blocking pool. The future
         // is awaited directly: nothing else in this task needs the executor, and
         // a dropped run would otherwise leave a context mid-decode.
@@ -3215,7 +3316,7 @@ async fn run_local_loop(
         let worker_cancel = cancel.clone();
         let turn_deadline = std::cmp::min(
             run_deadline,
-            std::time::Instant::now() + LOCAL_TURN_WALL_CLOCK,
+            std::time::Instant::now() + std::time::Duration::from_secs(budget.turn_seconds),
         );
         // Set by `generate` once the prompt is formatted: whether the template
         // opened a reasoning block. The streamer reads it on its first token.
@@ -3225,9 +3326,10 @@ async fn run_local_loop(
             let mut stream = LocalDeltaStream::new(stream_sender, streamed_flag, reasoning_flag);
             let result = runtime.generate(
                 &request,
-                LOCAL_MAX_TOKENS,
+                budget.max_tokens,
                 Some(turn_deadline),
-                Some(LOCAL_NO_PROGRESS),
+                Some(std::time::Duration::from_secs(budget.no_progress_seconds)),
+                budget.min_output,
                 worker_cancel.as_ref(),
                 &reasoning_expected,
                 |delta| stream.push(delta),
@@ -3254,9 +3356,10 @@ async fn run_local_loop(
                 "The local model {reason} after {generated_total} tokens. A slow local model can over-run a turn on a long reasoning block; try a smaller prompt, a shorter request, or a faster build (CUDA/Metal)."
             ));
         }
-        if generated_total >= LOCAL_RUN_TOKEN_BUDGET {
+        if generated_total >= budget.run_token_budget {
             return Err(format!(
-                "The local model exceeded the {LOCAL_RUN_TOKEN_BUDGET}-token budget for one run. Try a smaller prompt or a smaller request."
+                "The local model exceeded the {}-token budget for one run. Raise it with set_model_budget, or try a smaller prompt.",
+                budget.run_token_budget
             ));
         }
         let (prose, tool_calls) = parse_local_tool_calls(&text);
@@ -3304,7 +3407,8 @@ async fn run_local_loop(
             }
             if truncated {
                 answer.push_str(&format!(
-                    "\n\n[truncated] The local model reached its {LOCAL_MAX_TOKENS}-token output limit, so this reply is cut off."
+                    "\n\n[truncated] The local model reached its {}-token output limit, so this reply is cut off.",
+                    budget.max_tokens
                 ));
             }
             return Ok(AgentResult { output: answer });
@@ -3418,6 +3522,8 @@ async fn run_local_loop(
                                 call_id: call_id.clone(),
                                 trace_sender: trace_sender.clone(),
                                 graph: evidence.graph(),
+                                budget: evidence.budget(),
+                                tool_grants: evidence.tool_grants(),
                             }),
                         )
                         .await
@@ -3464,7 +3570,6 @@ async fn run_local_loop(
             }
         }
     }
-    Err("local model exceeded the maximum tool-call turns".into())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3613,6 +3718,8 @@ async fn call_responses_api(
                     call_id: call_id.to_owned(),
                     trace_sender: trace_sender.clone(),
                     graph: evidence.graph(),
+                    budget: evidence.budget(),
+                    tool_grants: evidence.tool_grants(),
                 }),
             )
             .await;
@@ -3986,6 +4093,21 @@ fn tool_schemas() -> Vec<serde_json::Value> {
             "update_graph",
             "Publish the current execution DAG. Each node needs a unique id, a known profile, a prompt, and optional dependency ids.",
             serde_json::json!({"type":"object","properties":{"title":{"type":"string"},"nodes":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"profile":{"type":"string","enum":["explore","plan","build","review"]},"description":{"type":"string"},"prompt":{"type":"string"},"depends_on":{"type":"array","items":{"type":"string"}}},"required":["id","profile","description","prompt"]}}},"required":["title","nodes"]}),
+        ),
+        function_schema(
+            "set_model_budget",
+            "Adjust the run's local-model budget: pick a capability tier (compact/middle/large), enlarge or shrink the current budget, or set exact limits. Takes effect on the next turn.",
+            serde_json::json!({"type":"object","properties":{"tier":{"type":"string","enum":["compact","middle","large"]},"enlarge":{"type":"boolean"},"shrink":{"type":"boolean"},"max_tokens":{"type":"integer"},"min_output":{"type":"integer"},"run_token_budget":{"type":"integer"},"max_turns":{"type":"integer"},"turn_seconds":{"type":"integer"},"no_progress_seconds":{"type":"integer"}},"required":[]}),
+        ),
+        function_schema(
+            "grant_tools",
+            "Ask the user to grant a subagent extra tools for this run (for example `bash` for `plan`). Requires approval.",
+            serde_json::json!({"type":"object","properties":{"profile":{"type":"string"},"tools":{"type":"array","items":{"type":"string"}},"reason":{"type":"string"}},"required":["profile","tools"]}),
+        ),
+        function_schema(
+            "reset_tools",
+            "Remove tools granted to a profile (or every profile when `profile` is omitted) for this run.",
+            serde_json::json!({"type":"object","properties":{"profile":{"type":"string"}},"required":[]}),
         ),
     ]
 }
@@ -4579,6 +4701,12 @@ mod tests {
             call_id: "call-1".into(),
             trace_sender: sender,
             graph: std::sync::Arc::new(tokio::sync::Mutex::new(super::GraphRuntime::default())),
+            budget: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::local_model::LocalBudget::default(),
+            )),
+            tool_grants: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         };
         let result = super::execute_tool(
             std::path::Path::new("."),
@@ -4610,6 +4738,12 @@ mod tests {
             call_id: "call-1".into(),
             trace_sender: sender,
             graph: std::sync::Arc::new(tokio::sync::Mutex::new(super::GraphRuntime::default())),
+            budget: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::local_model::LocalBudget::default(),
+            )),
+            tool_grants: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         };
         let result = super::execute_tool(
             std::path::Path::new("."),
@@ -4640,6 +4774,12 @@ mod tests {
             call_id: "call-graph".into(),
             trace_sender: sender,
             graph: std::sync::Arc::new(tokio::sync::Mutex::new(super::GraphRuntime::default())),
+            budget: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::local_model::LocalBudget::default(),
+            )),
+            tool_grants: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         };
         let result = super::execute_tool(
             std::path::Path::new("."),
@@ -4668,6 +4808,91 @@ mod tests {
         assert!(
             matches!(receiver.recv().await.unwrap(), super::ToolTraceEvent::Ui(RigaEvent::TaskBlocked { task_id, blocked_by }) if task_id == "build" && blocked_by == vec!["runtime"])
         );
+    }
+
+    /// A `ToolOutputStream` for tool tests, sharing the given budget and grants.
+    fn tool_test_stream(
+        budget: std::sync::Arc<tokio::sync::Mutex<crate::local_model::LocalBudget>>,
+        tool_grants: std::sync::Arc<
+            tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+        >,
+    ) -> super::ToolOutputStream {
+        let (sender, _receiver) = mpsc::channel(4);
+        super::ToolOutputStream {
+            call_id: "call-test".into(),
+            trace_sender: sender,
+            graph: std::sync::Arc::new(tokio::sync::Mutex::new(super::GraphRuntime::default())),
+            budget,
+            tool_grants,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_model_budget_updates_the_run_budget() {
+        let budget = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::local_model::LocalBudget::default(),
+        ));
+        let grants = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let stream = tool_test_stream(budget.clone(), grants);
+        let result = super::execute_tool(
+            std::path::Path::new("."),
+            &crate::mcp::McpRuntime::new(),
+            "set_model_budget",
+            serde_json::json!({"tier": "compact"}),
+            Some(stream),
+        )
+        .await
+        .expect("budget tool executes");
+        assert!(result.contains("Model budget updated"), "{result}");
+        assert_eq!(
+            *budget.lock().await,
+            crate::local_model::Capability::Compact.budget()
+        );
+    }
+
+    #[tokio::test]
+    async fn grant_tools_extends_and_reset_tools_clears_grants() {
+        let budget = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::local_model::LocalBudget::default(),
+        ));
+        let grants = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let stream = tool_test_stream(budget.clone(), grants.clone());
+        let result = super::execute_tool(
+            std::path::Path::new("."),
+            &crate::mcp::McpRuntime::new(),
+            "grant_tools",
+            serde_json::json!({"profile": "plan", "tools": ["webfetch"]}),
+            Some(stream),
+        )
+        .await
+        .expect("grant tool executes");
+        assert!(result.contains("Granted to `plan`"), "{result}");
+        assert_eq!(
+            grants.lock().await.get("plan").cloned(),
+            Some(vec!["webfetch".to_owned()])
+        );
+
+        let stream = tool_test_stream(budget, grants.clone());
+        let result = super::execute_tool(
+            std::path::Path::new("."),
+            &crate::mcp::McpRuntime::new(),
+            "reset_tools",
+            serde_json::json!({}),
+            Some(stream),
+        )
+        .await
+        .expect("reset tool executes");
+        assert!(result.contains("Cleared all tool grants"), "{result}");
+        assert!(grants.lock().await.is_empty());
+    }
+
+    #[test]
+    fn run_grants_extend_a_profiles_allowed_tools() {
+        let plan = crate::catalog::find_agent_profile("plan").expect("plan profile");
+        let base = super::allowed_tools_for(&plan, None);
+        assert!(!base.iter().any(|tool| tool == "webfetch"));
+        let granted = super::allowed_tools_for(&plan, Some(&["webfetch".to_owned()]));
+        assert!(granted.iter().any(|tool| tool == "webfetch"));
     }
 
     #[tokio::test]
@@ -4824,22 +5049,28 @@ mod tests {
     fn read_only_profiles_cannot_write_or_dispatch() {
         for agent in ["explore", "plan", "review"] {
             let profile = crate::catalog::find_agent_profile(agent).expect("read-only profile");
-            let allowed = super::allowed_tools_for(&profile);
-            for forbidden in ["write", "bash", "task", "shell"] {
+            let allowed = super::allowed_tools_for(&profile, None);
+            // Read-only profiles cannot mutate or dispatch; `bash` is allowed
+            // but every call is approval-gated.
+            for forbidden in ["write", "task", "shell"] {
                 assert!(
                     !allowed.iter().any(|tool| tool == forbidden),
                     "{agent} must not be allowed `{forbidden}`: {allowed:?}"
                 );
             }
-            assert!(allowed.iter().any(|tool| tool == "read"));
-            assert!(allowed.iter().any(|tool| tool == "glob"));
+            for expected in ["read", "glob", "grep", "bash", "skill"] {
+                assert!(
+                    allowed.iter().any(|tool| tool == expected),
+                    "{agent} should be allowed `{expected}`: {allowed:?}"
+                );
+            }
         }
     }
 
     #[test]
     fn build_profile_may_write_and_dispatch() {
         let build = crate::catalog::find_agent_profile("build").expect("build profile");
-        let allowed = super::allowed_tools_for(&build);
+        let allowed = super::allowed_tools_for(&build, None);
         for expected in ["read", "write", "bash", "task"] {
             assert!(
                 allowed.iter().any(|tool| tool == expected),
