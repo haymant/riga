@@ -1380,6 +1380,32 @@ async fn execute_tool(
                 .and_then(serde_json::Value::as_str)
                 .ok_or("glob requires pattern")?,
         ),
+        "find_symbol" | "find_callers" | "find_references" | "find_tests" => {
+            let query = input.get("symbol").or_else(|| input.get("query")).and_then(serde_json::Value::as_str).ok_or_else(|| argument_error(name, "{\"symbol\": \"<name>\"}", &input))?;
+            crate::catalog::execute_repository_query(workspace_root, name, query).await
+        }
+        "add_evidence" => {
+            let evidence = riga_kernel::events::EvidenceNode { id: input.get("id").and_then(serde_json::Value::as_str).unwrap_or("evidence-1").into(), claim: input.get("claim").and_then(serde_json::Value::as_str).ok_or("add_evidence requires claim")?.into(), source_ref: input.get("source_ref").and_then(serde_json::Value::as_str).ok_or("add_evidence requires source_ref")?.into(), confidence: input.get("confidence").and_then(serde_json::Value::as_u64).unwrap_or(50).min(100) as u8, task_id: input.get("task_id").and_then(serde_json::Value::as_str).map(str::to_owned) };
+            if let Some(stream) = &output_stream { stream.trace_sender.send(ToolTraceEvent::Ui(riga_kernel::events::RigaEvent::EvidenceAdded { evidence: Box::new(evidence.clone()) })).await.map_err(|_| "tool lifecycle stream closed")?; }
+            serde_json::to_string(&evidence).map_err(|e| e.to_string())
+        }
+        "link_evidence" => {
+            let claim_id = input.get("claim_id").and_then(serde_json::Value::as_str).ok_or("link_evidence requires claim_id")?;
+            let evidence_id = input.get("evidence_id").and_then(serde_json::Value::as_str).ok_or("link_evidence requires evidence_id")?;
+            if let Some(stream) = &output_stream { stream.trace_sender.send(ToolTraceEvent::Ui(riga_kernel::events::RigaEvent::EvidenceLinked { claim_id: claim_id.into(), evidence_id: evidence_id.into() })).await.map_err(|_| "tool lifecycle stream closed")?; }
+            Ok(format!("linked evidence {evidence_id} to claim {claim_id}"))
+        }
+        "remember" => {
+            let knowledge = riga_kernel::events::KnowledgeNode { id: input.get("id").and_then(serde_json::Value::as_str).unwrap_or("knowledge-1").into(), fact: input.get("fact").and_then(serde_json::Value::as_str).ok_or("remember requires fact")?.into(), source_run_id: String::new(), confidence: input.get("confidence").and_then(serde_json::Value::as_u64).unwrap_or(50).min(100) as u8 };
+            if let Some(stream) = &output_stream { stream.trace_sender.send(ToolTraceEvent::Ui(riga_kernel::events::RigaEvent::KnowledgeCreated { knowledge: Box::new(knowledge.clone()) })).await.map_err(|_| "tool lifecycle stream closed")?; }
+            serde_json::to_string(&knowledge).map_err(|e| e.to_string())
+        }
+        "link_knowledge" => {
+            let knowledge_id = input.get("knowledge_id").and_then(serde_json::Value::as_str).ok_or("link_knowledge requires knowledge_id")?;
+            let evidence_id = input.get("evidence_id").and_then(serde_json::Value::as_str).ok_or("link_knowledge requires evidence_id")?;
+            if let Some(stream) = &output_stream { stream.trace_sender.send(ToolTraceEvent::Ui(riga_kernel::events::RigaEvent::KnowledgeLinked { knowledge_id: knowledge_id.into(), evidence_id: evidence_id.into() })).await.map_err(|_| "tool lifecycle stream closed")?; }
+            Ok(format!("linked knowledge {knowledge_id} to evidence {evidence_id}"))
+        }
         "grep" => {
             crate::catalog::execute_grep(
                 workspace_root,

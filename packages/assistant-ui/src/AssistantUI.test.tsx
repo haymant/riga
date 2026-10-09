@@ -197,8 +197,8 @@ describe("AssistantUI subagent task card", () => {
     expect(screen.getByText("Execution graph")).toBeInTheDocument();
     expect(screen.getByText("0/2")).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "Execution" })).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("tab", { name: "Evidence" })).toBeDisabled();
-    expect(screen.getByRole("tab", { name: "Knowledge" })).toBeDisabled();
+    expect(screen.getByRole("tab", { name: "Evidence" })).not.toBeDisabled();
+    expect(screen.getByRole("tab", { name: "Knowledge" })).not.toBeDisabled();
 
     fireEvent.click(screen.getByRole("button", { name: /explore.*Inspect runtime.*ready/ }));
     expect(screen.getByText("runtime")).toBeInTheDocument();

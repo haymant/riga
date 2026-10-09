@@ -142,6 +142,14 @@ pub fn builtins() -> Vec<CatalogItem> {
             false,
         ),
         ("skill", "Load a repository skill document", false),
+        ("find_symbol", "Find symbol definitions with file:line evidence", false),
+        ("find_callers", "Find likely callers of a symbol with file:line evidence", false),
+        ("find_references", "Find references to a symbol with file:line evidence", false),
+        ("find_tests", "Find tests related to a symbol with file:line evidence", false),
+        ("add_evidence", "Attach a claim to a source reference", false),
+        ("link_evidence", "Link evidence to a claim", false),
+        ("remember", "Create reusable knowledge from a run", false),
+        ("link_knowledge", "Link reusable knowledge to evidence", false),
     ]
     .into_iter()
     .map(|(id, description, requires_approval)| CatalogItem {
@@ -785,6 +793,30 @@ pub async fn execute_grep(root: &Path, query: &str) -> Result<String, String> {
         ));
     }
     Ok(matches.join("\n"))
+}
+
+pub async fn execute_repository_query(root: &Path, tool: &str, query: &str) -> Result<String, String> {
+    let query = query.trim();
+    if query.is_empty() { return Err(format!("{tool} requires a non-empty symbol")); }
+    let needle = match tool {
+        "find_symbol" => format!("{query}"),
+        "find_tests" => format!("test"),
+        _ => query.to_owned(),
+    };
+    let mut matches = Vec::new();
+    for entry in walkdir::WalkDir::new(root).into_iter().filter_entry(|entry| !is_ignored_entry(entry)).filter_map(Result::ok).filter(|entry| entry.file_type().is_file()) {
+        if entry.metadata().map(|m| m.len() > MAX_GREP_FILE_BYTES).unwrap_or(true) { continue; }
+        let Ok(text) = tokio::fs::read_to_string(entry.path()).await else { continue; };
+        for (line, content) in text.lines().enumerate() {
+            let relevant = if tool == "find_symbol" { content.contains(&format!("fn {query}")) || content.contains(&format!("struct {query}")) || content.contains(&format!("class {query}")) || content.contains(&format!("function {query}")) } else if tool == "find_tests" { content.contains(&needle) && content.contains(query) } else { content.contains(&needle) };
+            if relevant {
+                let relative = entry.path().strip_prefix(root).unwrap_or(entry.path()).display();
+                matches.push(format!("{relative}:{}:{content}", line + 1));
+                if matches.len() >= MAX_GREP_MATCHES { return Ok(format!("{}\n… truncated at {MAX_GREP_MATCHES} matches", matches.join("\n"))); }
+            }
+        }
+    }
+    Ok(if matches.is_empty() { format!("no {tool} matches for `{query}`") } else { matches.join("\n") })
 }
 
 pub async fn execute_web(url: &str) -> Result<String, String> {

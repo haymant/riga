@@ -1,6 +1,23 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceNode {
+    pub id: String,
+    pub claim: String,
+    pub source_ref: String,
+    pub confidence: u8,
+    pub task_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KnowledgeNode {
+    pub id: String,
+    pub fact: String,
+    pub source_run_id: String,
+    pub confidence: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RigaEvent {
     RunStarted,
     TextDelta {
@@ -43,6 +60,10 @@ pub enum RigaEvent {
     TaskRunnable {
         task_id: String,
     },
+    EvidenceAdded { evidence: Box<EvidenceNode> },
+    EvidenceLinked { claim_id: String, evidence_id: String },
+    KnowledgeCreated { knowledge: Box<KnowledgeNode> },
+    KnowledgeLinked { knowledge_id: String, evidence_id: String },
     /// A subagent task was dispatched.
     TaskStarted {
         task: Box<crate::task::TaskRecord>,
@@ -93,7 +114,7 @@ pub struct RigaEventEnvelope {
 
 #[cfg(test)]
 mod tests {
-    use super::{RigaEvent, RigaEventEnvelope};
+    use super::{EvidenceNode, KnowledgeNode, RigaEvent, RigaEventEnvelope};
     use crate::task::{
         Graph, GraphNode, Plan, PlanStep, TaskRecord, TaskState, TodoItem, TodoList, TodoStatus,
     };
@@ -188,6 +209,20 @@ mod tests {
             let json = serde_json::to_string(&event).unwrap();
             let decoded: RigaEvent = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, event, "event failed to round-trip: {json}");
+        }
+    }
+
+    #[test]
+    fn evidence_and_knowledge_events_round_trip_over_the_wire() {
+        let events = [
+            RigaEvent::EvidenceAdded { evidence: Box::new(EvidenceNode { id: "ev-1".into(), claim: "symbol exists".into(), source_ref: "src/lib.rs:12".into(), confidence: 90, task_id: Some("task-1".into()) }) },
+            RigaEvent::EvidenceLinked { claim_id: "claim-1".into(), evidence_id: "ev-1".into() },
+            RigaEvent::KnowledgeCreated { knowledge: Box::new(KnowledgeNode { id: "k-1".into(), fact: "the kernel is transport-neutral".into(), source_run_id: "run-1".into(), confidence: 85 }) },
+            RigaEvent::KnowledgeLinked { knowledge_id: "k-1".into(), evidence_id: "ev-1".into() },
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<RigaEvent>(&json).unwrap(), event);
         }
     }
 

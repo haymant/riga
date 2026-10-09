@@ -96,6 +96,8 @@ type TodoItemState = { id: string; text: string; description?: string; status: T
 type TodoListState = { title?: string; revision?: number; items: TodoItemState[] };
 type AgentTaskView = { id: string; agent: string; description: string; state: "pending" | "running" | "waiting" | "blocked" | "done" | "failed"; result?: string; progress?: number; blockedBy?: string[]; elapsedMs?: number };
 type GraphLens = "execution" | "evidence" | "knowledge";
+type EvidenceView = { id: string; claim: string; source_ref: string; confidence: number; task_id?: string };
+type KnowledgeView = { id: string; fact: string; source_run_id: string; confidence: number };
 type GraphNodeView = { id: string; profile: string; description: string; prompt: string; depends_on: string[]; state: AgentTaskView["state"]; progress?: number; blockedBy?: string[] };
 type PendingApproval = { approvalId: string; tool: string; summary: string };
 
@@ -201,6 +203,8 @@ function AssistantUIInner({
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [graphLens, setGraphLens] = useState<GraphLens>("execution");
   const [focusNode, setFocusNode] = useState<string | null>(null);
+  const [evidence, setEvidence] = useState<EvidenceView[]>([]);
+  const [knowledge, setKnowledge] = useState<KnowledgeView[]>([]);
   const [runDeckCollapsed, setRunDeckCollapsed] = useState(() => loadLocal(`riga.run-deck.${initialSessions.find((session) => session.active)?.id ?? "riga"}.collapsed`, isNarrowViewport()));
   const [theme, setTheme] = useState<"dark" | "light">(() => loadLocal("riga.theme.v1", "dark"));
   const [fullWidthEnabled, setFullWidthEnabled] = useState(initialFullWidth);
@@ -441,6 +445,8 @@ function AssistantUIInner({
           setAgentPlan(null);
           setAgentTodos(null);
           setAgentTasks([]);
+          setEvidence([]);
+          setKnowledge([]);
           setIsRunning(true);
         } else if (typeof event === "object" && event !== null && "GraphUpdated" in event) {
           const graph = (event as { GraphUpdated: { graph: { nodes: Array<{ id: string; profile: string; description: string; prompt: string; depends_on: string[] }> } } }).GraphUpdated.graph;
@@ -458,6 +464,12 @@ function AssistantUIInner({
           const blocked = (event as { TaskBlocked: { task_id: string; blocked_by: string[] } }).TaskBlocked;
           setGraphNodes((current) => current.map((node) => node.id === blocked.task_id ? { ...node, state: "blocked", blockedBy: blocked.blocked_by } : node));
           setAgentTasks((current) => current.map((task) => task.id === blocked.task_id ? { ...task, state: "blocked", blockedBy: blocked.blocked_by } : task));
+        } else if (typeof event === "object" && event !== null && "EvidenceAdded" in event) {
+          const item = (event as { EvidenceAdded: { evidence: EvidenceView } }).EvidenceAdded.evidence;
+          setEvidence((current) => [...current.filter((value) => value.id !== item.id), item]);
+        } else if (typeof event === "object" && event !== null && "KnowledgeCreated" in event) {
+          const item = (event as { KnowledgeCreated: { knowledge: KnowledgeView } }).KnowledgeCreated.knowledge;
+          setKnowledge((current) => [...current.filter((value) => value.id !== item.id), item]);
         } else if (typeof event === "object" && event !== null && "PlanUpdated" in event) {
           setAgentPlan((event as { PlanUpdated: { plan: AgentPlanState } }).PlanUpdated.plan);
         } else if (typeof event === "object" && event !== null && "TodoUpdated" in event) {
@@ -758,7 +770,7 @@ function AssistantUIInner({
 
           {pendingApproval && <div className="approval-card"><div className="approval-icon"><ShieldCheck size={19} /></div><div className="approval-copy"><div className="approval-title"><strong>Approval required</strong><span>{pendingApproval.tool}</span></div><p>The agent wants to run <code>{pendingApproval.summary}</code>.</p></div><div className="approval-actions"><button className="deny-button" onClick={() => answerApproval(false, "once")}>Decline</button><button className="outline-button" onClick={() => answerApproval(true, "always")}>Always allow</button><button className="approve-button" onClick={() => answerApproval(true, "once")}><Check size={15} /> Allow once</button></div></div>}
 
-          {(agentPlan || agentTodos || agentTasks.length > 0 || graphNodes.length > 0) && <RunDeck collapsed={runDeckCollapsed} onToggle={() => setRunDeckCollapsed((value) => !value)} lens={graphLens} onLensChange={setGraphLens} runIds={runIds} selectedRunId={selectedRunId} onRunChange={setSelectedRunId} focusNode={focusNode} onFocusNode={setFocusNode} graphNodes={graphNodes} plan={agentPlan} todos={agentTodos} tasks={agentTasks} toolRuns={taskTools} />}
+          {(agentPlan || agentTodos || agentTasks.length > 0 || graphNodes.length > 0 || evidence.length > 0 || knowledge.length > 0) && <RunDeck collapsed={runDeckCollapsed} onToggle={() => setRunDeckCollapsed((value) => !value)} lens={graphLens} onLensChange={setGraphLens} runIds={runIds} selectedRunId={selectedRunId} onRunChange={setSelectedRunId} focusNode={focusNode} onFocusNode={setFocusNode} graphNodes={graphNodes} plan={agentPlan} todos={agentTodos} tasks={agentTasks} toolRuns={taskTools} evidence={evidence} knowledge={knowledge} />}
           <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" className="composer-model-name" value={providerKind === "local" ? LOCAL_MODEL_VALUE : providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{localModels?.loaded && <option value={LOCAL_MODEL_VALUE}>Local · {localModels.loaded}</option>}{Array.from(new Set([providerModel, "gpt-5-nano", "gpt-5-mini", "gpt-5-codex"])).filter(Boolean).map((model) => <option key={model} value={model}>{model}</option>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setCatalogOpen((value) => !value); setManualCatalog(true); setCatalogLayer("root"); setCatalogQuery(""); }}><Plus size={17} /></button><textarea value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${isRunning ? "stop-ready" : draft.trim() ? "send-ready" : ""}`} aria-label={isRunning ? "Stop run" : "Send message"} onClick={isRunning ? stopRun : sendMessage}>{isRunning ? <Square size={14} fill="currentColor" /> : <Send size={16} />}</button></div>{catalogOpen && <div className="catalog-menu" ref={catalogRef} role="listbox">
               <div className="catalog-menu-header">{catalogLayer === "connectors" && <button className="catalog-back" aria-label="Back to insert menu" onClick={() => setCatalogLayer("root")}><ChevronLeft size={14} /></button>}<strong>{activeTrigger ? `${activeTrigger.char === "@" ? "Mention" : "Command"} suggestions` : catalogLayer === "root" ? "Insert into composer" : "Connectors"}</strong><button className="catalog-close" aria-label="Close insert menu" onClick={() => setCatalogOpen(false)}><X size={14} /></button></div>
               <input className="catalog-search" autoFocus={catalogOpen} value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder={activeTrigger ? `Filter ${activeTrigger.char === "@" ? "files or agents" : "tools and skills"}…` : "Search tools, skills, connectors…"} aria-label="Search composer insert menu" />
@@ -995,6 +1007,8 @@ function RunDeck({
   todos,
   tasks,
   toolRuns,
+  evidence,
+  knowledge,
 }: {
   collapsed: boolean;
   onToggle: () => void;
@@ -1010,8 +1024,10 @@ function RunDeck({
   todos: TodoListState | null;
   tasks: AgentTaskView[];
   toolRuns: Record<string, Extract<TranscriptItem, { role: "tool" }>[] >;
+  evidence: EvidenceView[];
+  knowledge: KnowledgeView[];
 }) {
-  if (!plan && !todos && tasks.length === 0 && graphNodes.length === 0) return null;
+  if (!plan && !todos && tasks.length === 0 && graphNodes.length === 0 && evidence.length === 0 && knowledge.length === 0) return null;
   const total = graphNodes.length || tasks.length;
   const done = tasks.filter((task) => task.state === "done" || task.state === "failed").length;
   const running = tasks.find((task) => task.state === "running" || task.state === "waiting");
@@ -1026,18 +1042,25 @@ function RunDeck({
       {!collapsed && <div className="run-deck-body">
         <div className="run-deck-controls" aria-label="Run Deck selectors">
           <div className="run-deck-lenses" role="tablist" aria-label="Graph lens">
-            {(["execution", "evidence", "knowledge"] as GraphLens[]).map((value) => <button key={value} type="button" role="tab" aria-selected={lens === value} disabled={value !== "execution"} className={lens === value ? "selected" : ""} onClick={() => onLensChange(value)}>{value[0].toUpperCase() + value.slice(1)}</button>)}
+            {(["execution", "evidence", "knowledge"] as GraphLens[]).map((value) => <button key={value} type="button" role="tab" aria-selected={lens === value} className={lens === value ? "selected" : ""} onClick={() => onLensChange(value)}>{value[0].toUpperCase() + value.slice(1)}</button>)}
           </div>
           <label className="run-deck-run-picker">Run scope<select aria-label="Run scope" value={selectedRunId ?? ""} onChange={(event) => onRunChange(event.target.value)}>{runIds.length === 0 && <option value="">Active run</option>}{runIds.map((runId) => <option key={runId} value={runId}>{runId === selectedRunId && runId === runIds[runIds.length - 1] ? `${runId} · active` : runId}</option>)}</select></label>
         </div>
         {focusNode && <div className="run-deck-breadcrumb"><button type="button" className="outline-button" onClick={() => onFocusNode(null)}>Session › Run ›</button><strong>{focusNode}</strong></div>}
         {lens === "execution" && graphNodes.length > 0 && <RunGraphPanel nodes={graphNodes} focusNode={focusNode} onFocusNode={onFocusNode} />}
-        {lens === "evidence" && <div className="run-deck-empty">Evidence will appear when the run emits evidence.</div>}
-        {lens === "knowledge" && <div className="run-deck-empty">Knowledge will appear when the run emits reusable facts.</div>}
+        {lens === "evidence" && <EvidenceCards evidence={evidence} />}
+        {lens === "knowledge" && <KnowledgeCards knowledge={knowledge} />}
         <div className="run-deck-cards"><AgentPlanCard plan={plan} /><AgentTodoList list={todos} /><AgentTaskList tasks={tasks} toolRuns={toolRuns} /></div>
       </div>}
     </section>
   );
+}
+
+function EvidenceCards({ evidence }: { evidence: EvidenceView[] }) {
+  return <section className="run-evidence-cards" aria-label="Evidence cards"><div className="agent-card-head"><strong>Evidence</strong><span>{evidence.length} source{evidence.length === 1 ? "" : "s"}</span></div>{evidence.length === 0 ? <div className="run-deck-empty">No evidence attached yet.</div> : evidence.map((item) => <article className="evidence-card" key={item.id}><strong>{item.claim}</strong><code>{item.source_ref}</code><span>{item.confidence}% confidence{item.task_id ? ` · ${item.task_id}` : ""}</span></article>)}</section>;
+}
+function KnowledgeCards({ knowledge }: { knowledge: KnowledgeView[] }) {
+  return <section className="run-knowledge-cards" aria-label="Knowledge cards"><div className="agent-card-head"><strong>Reusable knowledge</strong><span>{knowledge.length} fact{knowledge.length === 1 ? "" : "s"}</span></div>{knowledge.length === 0 ? <div className="run-deck-empty">No reusable facts yet.</div> : knowledge.map((item) => <article className="knowledge-card" key={item.id}><strong>{item.fact}</strong><span>{item.confidence}% confidence{item.source_run_id ? ` · ${item.source_run_id}` : ""}</span></article>)}</section>;
 }
 
 /** The subagents dispatched during this run. Mirrors the assistant-ui
