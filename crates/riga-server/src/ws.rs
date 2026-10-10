@@ -90,6 +90,23 @@ struct RunEvidence {
     /// Tools granted to a profile for this run, on top of its defaults, by
     /// `grant_tools` after the user approves.
     tool_grants: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
+    /// Ordered outcome log for the run: every tool and subagent result. Emitted
+    /// to the Evidence lens as it happens and summarised into knowledge at run
+    /// end, so the lenses reflect what actually ran instead of only what the
+    /// model chose to record with `add_evidence`.
+    outcomes: std::sync::Arc<tokio::sync::Mutex<Vec<Outcome>>>,
+    /// Monotonic id source, so evidence nodes have stable unique ids.
+    evidence_seq: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One tool or subagent result, kept for the run-end knowledge summary.
+#[derive(Clone)]
+struct Outcome {
+    actor: String,
+    ok: bool,
+    summary: String,
+    /// True for a dispatched subagent, false for a direct tool call.
+    agent: bool,
 }
 
 #[derive(Default)]
@@ -155,6 +172,117 @@ impl RunEvidence {
         &self,
     ) -> std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>> {
         self.tool_grants.clone()
+    }
+
+    /// Log one tool/subagent outcome and surface it in the Evidence lens.
+    ///
+    /// Every outcome is logged so the run can be summarised at the end. Only
+    /// failures, successful *mutating* calls, and subagent tasks are emitted:
+    /// recording every read and glob would bury the signal the user wants.
+    async fn record_outcome(
+        &self,
+        sender: &mpsc::Sender<ToolTraceEvent>,
+        actor: &str,
+        ok: bool,
+        output: &str,
+        task_id: Option<&str>,
+        agent: bool,
+    ) {
+        // A subagent dispatch is recorded by `dispatch_subagent` under the
+        // agent's name; skip the wrapper `task` tool so it is not double-counted.
+        if actor == "task" && !agent {
+            return;
+        }
+        let summary = summarize_outcome(output);
+        self.outcomes.lock().await.push(Outcome {
+            actor: actor.to_owned(),
+            ok,
+            summary: summary.clone(),
+            agent,
+        });
+        if ok && !agent && !is_mutating_tool(actor) {
+            return;
+        }
+        let id = format!(
+            "ev-{}",
+            self.evidence_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1
+        );
+        let node = riga_kernel::events::EvidenceNode {
+            id,
+            claim: format!(
+                "{} {}: {summary}",
+                if agent {
+                    format!("agent `{actor}`")
+                } else {
+                    format!("`{actor}`")
+                },
+                if ok { "succeeded" } else { "failed" }
+            ),
+            source_ref: format!("{actor}:{}", task_id.unwrap_or("run")),
+            confidence: if ok { 85 } else { 60 },
+            task_id: task_id.map(str::to_owned),
+        };
+        let _ = sender
+            .send(ToolTraceEvent::Ui(
+                riga_kernel::events::RigaEvent::EvidenceAdded {
+                    evidence: Box::new(node),
+                },
+            ))
+            .await;
+    }
+
+    /// Reusable lessons derived from the run's outcomes: repeated failures,
+    /// individual failures, and what a subagent achieved. Fed to the Knowledge
+    /// lens and, on the next run in the session, back into the prompt.
+    async fn lessons(&self) -> Vec<(String, u8)> {
+        let outcomes = self.outcomes.lock().await;
+        let mut lessons: Vec<(String, u8)> = Vec::new();
+        let mut push = |fact: String, confidence: u8| {
+            if !lessons.iter().any(|(existing, _)| existing == &fact) {
+                lessons.push((fact, confidence));
+            }
+        };
+        // Consecutive failures of one actor are the loop pattern worth naming.
+        let mut streak: Option<(String, usize)> = None;
+        for outcome in outcomes.iter() {
+            if outcome.ok {
+                streak = None;
+                continue;
+            }
+            streak = match streak {
+                Some((actor, count)) if actor == outcome.actor => Some((actor, count + 1)),
+                _ => Some((outcome.actor.clone(), 1)),
+            };
+            if let Some((actor, count)) = &streak
+                && *count >= 2
+            {
+                push(
+                    format!(
+                        "`{actor}` failed {count}× in a row (latest: {}). Do not repeat an identical call — vary the approach or report what you have.",
+                        outcome.summary
+                    ),
+                    75,
+                );
+            }
+        }
+        for outcome in outcomes.iter().filter(|outcome| !outcome.ok) {
+            push(
+                format!("`{}` failed: {}", outcome.actor, outcome.summary),
+                65,
+            );
+        }
+        for outcome in outcomes
+            .iter()
+            .filter(|outcome| outcome.ok && outcome.agent)
+        {
+            push(
+                format!("`{}` completed: {}", outcome.actor, outcome.summary),
+                80,
+            );
+        }
+        lessons
     }
 }
 
@@ -391,6 +519,93 @@ fn is_mutating_tool(tool: &str) -> bool {
         riga_kernel::policy::ToolRisk::WorkspaceWrite
             | riga_kernel::policy::ToolRisk::ProcessExecution
     )
+}
+
+/// One-line summary of a tool or subagent result for the evidence/knowledge
+/// lenses. The first non-empty line, capped, so a long result does not bloat an
+/// evidence card.
+fn summarize_outcome(output: &str) -> String {
+    let line = output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut text: String = line.chars().take(140).collect();
+    if line.chars().count() > 140 {
+        text.push('…');
+    }
+    text
+}
+
+/// Where per-session knowledge lives: `<data dir>/knowledge/<session>.json`.
+fn knowledge_path(session_id: &str) -> std::path::PathBuf {
+    let safe: String = session_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    crate::secure_store::data_root()
+        .join("knowledge")
+        .join(format!("{safe}.json"))
+}
+
+/// Reusable facts recorded for a session across earlier runs.
+async fn load_session_knowledge(session_id: &str) -> Vec<riga_kernel::events::KnowledgeNode> {
+    let path = knowledge_path(session_id);
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return Vec::new();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_default()
+}
+
+/// Merge new facts into the session's knowledge file, keeping it bounded.
+async fn save_session_knowledge(session_id: &str, run_id: &str, facts: Vec<(String, u8)>) {
+    if facts.is_empty() {
+        return;
+    }
+    let path = knowledge_path(session_id);
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let mut existing = load_session_knowledge(session_id).await;
+    for (fact, confidence) in facts {
+        if existing.iter().any(|node| node.fact == fact) {
+            continue;
+        }
+        existing.push(riga_kernel::events::KnowledgeNode {
+            id: format!("k-{}", existing.len() + 1),
+            fact,
+            source_run_id: run_id.to_owned(),
+            confidence,
+        });
+    }
+    if existing.len() > 64 {
+        existing.drain(0..existing.len() - 64);
+    }
+    if let Ok(json) = serde_json::to_vec_pretty(&existing) {
+        let _ = tokio::fs::write(&path, json).await;
+    }
+}
+
+/// Render prior knowledge as a prompt preamble, or empty when there is none.
+/// Kept short and newest-first: this is a nudge, not a transcript.
+fn knowledge_preamble(knowledge: &[riga_kernel::events::KnowledgeNode]) -> String {
+    if knowledge.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from(
+        "[Prior knowledge for this session — lessons from earlier runs. Apply them; do not relearn them.]\n",
+    );
+    for node in knowledge.iter().rev().take(12) {
+        text.push_str(&format!("- {}\n", node.fact));
+    }
+    text.push_str("[End prior knowledge]\n\n");
+    text
 }
 
 /// Completion claims that a run must be able to back with a tool result.
@@ -890,9 +1105,14 @@ pub(crate) async fn start_ipc_run(
         (events, cancel)
     };
     let receiver = events.subscribe();
+    // Bring prior lessons from this session back into context, so a retry does
+    // not rediscover what an earlier failure already taught.
+    let prior_knowledge = load_session_knowledge(&session_id).await;
+    let run_prompt = format!("{}{}", knowledge_preamble(&prior_knowledge), prompt);
     let run_id_task = run_id.clone();
     let session_id_task = session_id.clone();
     let prompt_task = prompt.clone();
+    let run_prompt_task = run_prompt;
     let config_task = config.clone();
     let mcp_task = mcp_runtime.clone();
     let local_task = local_models.clone();
@@ -910,13 +1130,15 @@ pub(crate) async fn start_ipc_run(
             &broker_task,
             &config_task,
             &run_root,
-            &prompt_task,
+            &run_prompt_task,
             &mcp_task,
             &local_task,
             &history_task,
             &evidence,
         )
         .await;
+        // Persist the lessons for the next run in this session.
+        save_session_knowledge(&session_id_task, &run_id_task, evidence.lessons().await).await;
         let mut turns = vec![ConversationTurn {
             role: "user".into(),
             content: prompt_task,
@@ -1267,10 +1489,15 @@ pub(crate) async fn upgrade(
                         // Subscribe before spawning so the run's opening frames are
                         // buffered for this socket rather than lost.
                         let upstream = events.subscribe();
+                        // Bring prior lessons back into context for a retry.
+                        let prior_knowledge = load_session_knowledge(&session_id).await;
+                        let run_prompt =
+                            format!("{}{}", knowledge_preamble(&prior_knowledge), prompt);
                         {
                             let run_id_task = run_id.clone();
                             let session_id_task = session_id.clone();
                             let prompt_task = prompt.clone();
+                            let run_prompt_task = run_prompt;
                             let config_task = config.clone();
                             let run_root_task = run_root.clone();
                             let mcp_task = mcp_runtime.clone();
@@ -1290,11 +1517,17 @@ pub(crate) async fn upgrade(
                                     &broker_task,
                                     &config_task,
                                     &run_root_task,
-                                    &prompt_task,
+                                    &run_prompt_task,
                                     &mcp_task,
                                     &local_task,
                                     &history_task,
                                     &evidence,
+                                )
+                                .await;
+                                save_session_knowledge(
+                                    &session_id_task,
+                                    &run_id_task,
+                                    evidence.lessons().await,
                                 )
                                 .await;
                                 let mut turns = vec![ConversationTurn {
@@ -2119,6 +2352,18 @@ async fn run_provider(
     while let Ok(trace) = trace_receiver.try_recv() {
         channel.emit_trace(trace);
     }
+    // Summarise the run into reusable knowledge before it terminates, so a
+    // failed run leaves the next attempt better informed.
+    for (index, (fact, confidence)) in evidence.lessons().await.into_iter().enumerate() {
+        channel.emit(RigaEvent::KnowledgeCreated {
+            knowledge: Box::new(riga_kernel::events::KnowledgeNode {
+                id: format!("k-{}", index + 1),
+                fact,
+                source_run_id: channel.run_id.clone(),
+                confidence,
+            }),
+        });
+    }
     match result {
         Ok(result) => {
             // The guard: a final answer must not claim files were written or
@@ -2600,6 +2845,9 @@ async fn run_chat_loop(
                 consecutive_failures += 1;
             }
             evidence.record(&call.name, ok);
+            evidence
+                .record_outcome(&trace_sender, &call.name, ok, &output, task_id, false)
+                .await;
             let trace = ToolTrace {
                 call: call.call.clone(),
                 name: call.name.clone(),
@@ -2914,6 +3162,18 @@ async fn dispatch_subagent(
                 elapsed_ms: 0,
             },
         ))
+        .await;
+    // A subagent is a first-class outcome: its result is evidence, and its
+    // failure is a lesson the next run should not have to rediscover.
+    evidence
+        .record_outcome(
+            trace_sender,
+            &profile.name,
+            ok,
+            &result,
+            Some(&task_id),
+            true,
+        )
         .await;
     let _ = trace_sender
         .send(ToolTraceEvent::Ui(
@@ -3854,6 +4114,9 @@ async fn run_local_loop(
                 consecutive_failures += 1;
             }
             evidence.record(&call.name, ok);
+            evidence
+                .record_outcome(&trace_sender, &call.name, ok, &output, task_id, false)
+                .await;
             trace_sender
                 .send(ToolTraceEvent::Completed(ToolTrace {
                     call: payload,
@@ -6169,5 +6432,91 @@ mod tests {
         }
         assert_eq!(reasoning, "I should list files.");
         assert_eq!(text, "The answer is 42.");
+    }
+
+    #[test]
+    fn summarize_outcome_takes_the_first_line_and_caps() {
+        assert_eq!(super::summarize_outcome("\n\nhello\nworld"), "hello");
+        let long = "x".repeat(200);
+        let summary = super::summarize_outcome(&long);
+        assert_eq!(summary.chars().count(), 141);
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn knowledge_preamble_is_empty_without_knowledge() {
+        assert_eq!(super::knowledge_preamble(&[]), "");
+        let node = riga_kernel::events::KnowledgeNode {
+            id: "k-1".into(),
+            fact: "avoid repeated bash".into(),
+            source_run_id: "run-1".into(),
+            confidence: 70,
+        };
+        let preamble = super::knowledge_preamble(&[node]);
+        assert!(preamble.contains("avoid repeated bash"));
+        assert!(preamble.contains("Prior knowledge"));
+    }
+
+    #[tokio::test]
+    async fn outcomes_become_evidence_and_lessons() {
+        let (sender, mut receiver) = mpsc::channel(16);
+        let evidence = super::RunEvidence::default();
+        // A read success is logged for the summary but not emitted: it carries
+        // no signal the user wants in the Evidence lens.
+        evidence
+            .record_outcome(&sender, "read", true, "file contents", None, false)
+            .await;
+        // A failing tool is emitted and, once repeated, becomes a lesson.
+        evidence
+            .record_outcome(
+                &sender,
+                "bash",
+                false,
+                "command not found",
+                Some("task-1"),
+                false,
+            )
+            .await;
+        evidence
+            .record_outcome(
+                &sender,
+                "bash",
+                false,
+                "command not found",
+                Some("task-1"),
+                false,
+            )
+            .await;
+        // A subagent is a first-class outcome.
+        evidence
+            .record_outcome(
+                &sender,
+                "build",
+                false,
+                "repeated the same bash call 3 times",
+                None,
+                true,
+            )
+            .await;
+
+        let mut emitted = 0;
+        while let Ok(event) = receiver.try_recv() {
+            if let super::ToolTraceEvent::Ui(RigaEvent::EvidenceAdded { .. }) = event {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 3, "the read success is not emitted as evidence");
+
+        let lessons = evidence.lessons().await;
+        assert!(
+            lessons
+                .iter()
+                .any(|(fact, _)| fact.contains("bash") && fact.contains("2×")),
+            "{lessons:?}"
+        );
+        assert!(
+            lessons.iter().any(|(fact, _)| fact.contains("build")),
+            "{lessons:?}"
+        );
     }
 }
