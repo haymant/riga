@@ -42,7 +42,16 @@ pub enum UiPanel {
     History,
     Settings,
     Catalog,
+    RunDeck,
     Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeckLens {
+    #[default]
+    Execution,
+    Evidence,
+    Knowledge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

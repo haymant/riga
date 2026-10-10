@@ -311,9 +311,9 @@ pub(crate) type RunRegistry =
 
 #[derive(Debug, Serialize)]
 pub struct ActiveRun {
-    pub(crate) run_id: String,
-    pub(crate) session_id: String,
-    pub(crate) local: bool,
+    pub run_id: String,
+    pub session_id: String,
+    pub local: bool,
 }
 
 /// A frame that is streamed but not worth persisting.

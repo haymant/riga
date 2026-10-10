@@ -133,10 +133,11 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
             }
             ("Command palette (server catalog)", lines)
         }
+        crate::model::UiPanel::RunDeck => ("RunDeck", render_rundeck(app)),
         crate::model::UiPanel::Help => (
             "Help",
             vec![Line::from(
-                "Ctrl+H history · Ctrl+, settings · Ctrl+K catalog · r reasoning · t tools · y/a/n approvals · Esc close/cancel · q quit",
+                "Ctrl+H history · Ctrl+, settings · Ctrl+K catalog · Ctrl+D RunDeck · ? help · r reasoning · t tools · y/a/n approvals · Esc close/cancel · q quit",
             )],
         ),
         crate::model::UiPanel::Transcript => unreachable!(),
@@ -147,6 +148,139 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_rundeck(app: &UiState) -> Vec<Line<'static>> {
+    let lens = match app.deck_lens {
+        crate::model::DeckLens::Execution => "Execution",
+        crate::model::DeckLens::Evidence => "Evidence",
+        crate::model::DeckLens::Knowledge => "Knowledge",
+    };
+    let mut lines = vec![Line::from(format!(
+        "{lens} · Tab/←/→ lens · ↑/↓ runs · Enter resume · x stop · Esc close"
+    ))];
+    if app.state.active_runs.is_empty() {
+        lines.push(Line::from(
+            "No active runs. Finished runs remain inspectable in the selected session.",
+        ));
+    } else {
+        for (index, active) in app.state.active_runs.iter().enumerate() {
+            lines.push(Line::from(format!(
+                "{} {} · session {} · {} {}",
+                if index == app.panel_cursor {
+                    "▶"
+                } else {
+                    " "
+                },
+                active.run_id,
+                active.session_id,
+                if active.local { "local" } else { "remote" },
+                if app.state.active_run.as_deref() == Some(active.run_id.as_str()) {
+                    "· selected"
+                } else {
+                    ""
+                }
+            )));
+        }
+    }
+    let Some(run_id) = &app.state.active_run else {
+        return lines;
+    };
+    let Some(run) = app.state.run(run_id) else {
+        return lines;
+    };
+    let done = run
+        .tasks
+        .values()
+        .filter(|task| task.state.is_terminal())
+        .count();
+    let total = run
+        .graph
+        .as_ref()
+        .map(|graph| graph.nodes.len())
+        .unwrap_or(run.tasks.len());
+    lines.push(Line::from(format!(
+        "Run {run_id} · {:?} · progress {done}/{total} · sequence {}",
+        run.status, run.last_sequence
+    )));
+    match app.deck_lens {
+        crate::model::DeckLens::Execution => {
+            if let Some(plan) = &run.plan {
+                lines.push(Line::from(format!("Plan: {}", plan.title)));
+                for (index, step) in plan.steps.iter().enumerate() {
+                    lines.push(Line::from(format!(
+                        "  {} {} {}",
+                        if index == plan.active_index {
+                            "▶"
+                        } else {
+                            "·"
+                        },
+                        step.id,
+                        step.label
+                    )));
+                }
+            }
+            if let Some(todos) = &run.todos {
+                let (done, total) = todos.progress();
+                lines.push(Line::from(format!("Todos: {done}/{total}")));
+                for item in &todos.items {
+                    lines.push(Line::from(format!("  [{:?}] {}", item.status, item.text)));
+                }
+            }
+            for task in run.tasks.values() {
+                lines.push(Line::from(format!(
+                    "Task {} · {} · {:?} · {}",
+                    task.record
+                        .as_ref()
+                        .map(|record| record.agent.as_str())
+                        .unwrap_or("task"),
+                    task.record
+                        .as_ref()
+                        .map(|record| record.description.as_str())
+                        .unwrap_or(""),
+                    task.state,
+                    task.result.as_deref().unwrap_or("")
+                )));
+            }
+            if let Some(graph) = &run.graph {
+                lines.push(Line::from(format!("Graph: {}", graph.title)));
+                for node in &graph.nodes {
+                    lines.push(Line::from(format!(
+                        "  {} ← {}",
+                        node.id,
+                        if node.depends_on.is_empty() {
+                            "ready".into()
+                        } else {
+                            node.depends_on.join(", ")
+                        }
+                    )));
+                }
+            }
+        }
+        crate::model::DeckLens::Evidence => {
+            for evidence in &run.evidence {
+                lines.push(Line::from(format!(
+                    "{} · {} · confidence {} · {}",
+                    evidence.id, evidence.claim, evidence.confidence, evidence.source_ref
+                )));
+            }
+            if run.evidence.is_empty() {
+                lines.push(Line::from("No evidence recorded for this run."));
+            }
+        }
+        crate::model::DeckLens::Knowledge => {
+            for knowledge in &run.knowledge {
+                lines.push(Line::from(format!(
+                    "{} · {} · confidence {} · source {}",
+                    knowledge.id, knowledge.fact, knowledge.confidence, knowledge.source_run_id
+                )));
+            }
+            if run.knowledge.is_empty() {
+                lines.push(Line::from("No reusable knowledge recorded for this run."));
+            }
+        }
+    }
+    lines
 }
 
 fn composer_height(app: &UiState, area: Rect) -> u16 {

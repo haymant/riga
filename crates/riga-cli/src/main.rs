@@ -44,11 +44,13 @@ async fn main() -> Result<(), String> {
 
     if args.tui {
         let sessions = transport.list_sessions().await;
+        let active_runs = transport.list_active_runs().await;
         let mut app = app::UiState {
             state: model::AppState {
                 connection: ConnectionState::Connected,
                 selected_session: sessions.first().map(|session| session.id.clone()),
                 sessions,
+                active_runs,
                 ..model::AppState::default()
             },
             follow_output: true,

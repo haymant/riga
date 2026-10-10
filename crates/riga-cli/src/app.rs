@@ -1,6 +1,6 @@
 use crate::{
     input::{InputAction, TextBuffer},
-    model::{AppState, CatalogEntry, ProviderForm, UiPanel},
+    model::{AppState, CatalogEntry, DeckLens, ProviderForm, UiPanel},
     transport::RigaTransport,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -36,6 +36,10 @@ pub enum UiCommand {
     InsertCatalog {
         text: String,
     },
+    ResumeRun {
+        run_id: String,
+        session_id: String,
+    },
     Quit,
 }
 
@@ -61,6 +65,7 @@ pub struct UiState {
     pub provider_field: usize,
     pub catalog: Vec<CatalogEntry>,
     pub catalog_query: TextBuffer,
+    pub deck_lens: DeckLens,
 }
 
 impl UiState {
@@ -114,6 +119,11 @@ impl UiState {
                 self.panel = UiPanel::Catalog;
                 self.panel_cursor = 0;
                 self.catalog_query.clear();
+                return None;
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.panel = UiPanel::RunDeck;
+                self.panel_cursor = 0;
                 return None;
             }
             KeyCode::Char('?') => {
@@ -309,6 +319,41 @@ impl UiState {
                     self.panel_cursor = 0;
                 }
             },
+            UiPanel::RunDeck => match key.code {
+                KeyCode::Left | KeyCode::Char('l') => {
+                    self.deck_lens = match self.deck_lens {
+                        DeckLens::Execution => DeckLens::Knowledge,
+                        DeckLens::Evidence => DeckLens::Execution,
+                        DeckLens::Knowledge => DeckLens::Evidence,
+                    }
+                }
+                KeyCode::Right | KeyCode::Char('r') | KeyCode::Tab => {
+                    self.deck_lens = match self.deck_lens {
+                        DeckLens::Execution => DeckLens::Evidence,
+                        DeckLens::Evidence => DeckLens::Knowledge,
+                        DeckLens::Knowledge => DeckLens::Execution,
+                    }
+                }
+                KeyCode::Up => self.panel_cursor = self.panel_cursor.saturating_sub(1),
+                KeyCode::Down => self.panel_cursor = self.panel_cursor.saturating_add(1),
+                KeyCode::Char('x') => {
+                    if let Some(active) = self.state.active_runs.get(self.panel_cursor) {
+                        return Some(UiCommand::CancelRun {
+                            run_id: active.run_id.clone(),
+                        });
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(active) = self.state.active_runs.get(self.panel_cursor) {
+                        self.panel = UiPanel::Transcript;
+                        return Some(UiCommand::ResumeRun {
+                            run_id: active.run_id.clone(),
+                            session_id: active.session_id.clone(),
+                        });
+                    }
+                }
+                _ => {}
+            },
             UiPanel::Help | UiPanel::Transcript => {}
         }
         None
@@ -431,6 +476,11 @@ pub async fn run_with_transport<T: RigaTransport>(
                     let receiver = transport
                         .start_run(run_id.clone(), session_id, prompt)
                         .await?;
+                    app.state.active_runs.push(riga_server::ws::ActiveRun {
+                        run_id: run_id.clone(),
+                        session_id: app.state.selected_session.clone().unwrap_or_default(),
+                        local: false,
+                    });
                     app.state.select_run(Some(run_id));
                     events = Some(receiver);
                 }
@@ -450,7 +500,10 @@ pub async fn run_with_transport<T: RigaTransport>(
                     app.approval_command_finished(&approval_id);
                 }
                 UiCommand::CancelRun { run_id } => {
-                    let _ = transport.cancel_run(run_id).await;
+                    let _ = transport.cancel_run(run_id.clone()).await;
+                    app.state
+                        .active_runs
+                        .retain(|active| active.run_id != run_id);
                 }
                 UiCommand::SelectSession { session_id } => {
                     app.state.selected_session = Some(session_id);
@@ -476,6 +529,12 @@ pub async fn run_with_transport<T: RigaTransport>(
                     for character in text.chars() {
                         app.draft.insert(character);
                     }
+                }
+                UiCommand::ResumeRun { run_id, session_id } => {
+                    let receiver = transport.subscribe_run(run_id.clone(), 0).await?;
+                    app.state.selected_session = Some(session_id);
+                    app.state.select_run(Some(run_id));
+                    events = Some(receiver);
                 }
                 UiCommand::Quit => break,
             }
@@ -613,6 +672,27 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Some(UiCommand::InsertCatalog {
                 text: "Use the read tool: ".into()
+            })
+        );
+    }
+
+    #[test]
+    fn rundeck_lists_active_runs_and_resume_preserves_scope() {
+        let mut app = UiState::default();
+        app.state.active_runs.push(riga_server::ws::ActiveRun {
+            run_id: "run-live".into(),
+            session_id: "session-1".into(),
+            local: true,
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.panel, UiPanel::RunDeck);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.deck_lens, DeckLens::Evidence);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(UiCommand::ResumeRun {
+                run_id: "run-live".into(),
+                session_id: "session-1".into(),
             })
         );
     }

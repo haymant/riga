@@ -51,6 +51,42 @@ Writes and shell commands are **approval-gated by the kernel's tool policy**, no
 
 The local GGUF context window is capped at `32768` tokens (the KV cache is sized from it). On a machine with limited memory headroom, set `RIGA_LOCAL_CONTEXT` to a smaller value — for example `8192` — to shrink the KV cache; the GGUF's own trained window still clamps the result.
 
+### Start the CLI
+
+The CLI uses the CPU backend by default. From the repository root, start the
+interactive terminal UI with:
+
+```bash
+cargo run -p riga-cli -- --tui
+```
+
+The non-interactive health, session, and catalog commands use the same CPU
+default. For example:
+
+```bash
+cargo run -p riga-cli -- --health
+cargo run -p riga-cli -- --list-sessions
+cargo run -p riga-cli -- --catalog
+```
+
+To build and start the CLI with NVIDIA CUDA offload, enable the server's
+dependency feature through the CLI package and provide a compatible CUDA
+toolkit and NVIDIA driver on the build and runtime machines:
+
+```bash
+export PATH="/usr/local/cuda-12.6/bin:$PATH"
+export CUDA_PATH=/usr/local/cuda-12.6
+export CUDA_LIBRARY_PATH=/usr/local/cuda-12.6
+export CMAKE_CUDA_ARCHITECTURES=86  # change to the GPU's compute capability
+cargo run -p riga-cli --features riga-server/cuda -- --tui
+```
+
+Use `cargo clean -p llama-cpp-sys-2` after changing CUDA toolkit paths or the
+CUDA feature. CUDA is a compile-time backend choice; merely running the CPU
+binary on a CUDA-capable machine does not enable GPU offload. The server still
+auto-fits local-model layers to currently available GPU memory. If no CUDA
+toolkit is installed, omit the feature and use the CPU command above.
+
 Never commit `.env.local`, provider keys, `RIGA_TOKEN`, or uploaded files. The API key is encrypted at rest by the server store and is write-only from the browser.
 
 ### Reference demo and desktop shell
