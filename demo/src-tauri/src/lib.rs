@@ -63,6 +63,13 @@ async fn riga_list_sessions(
 }
 
 #[tauri::command]
+async fn riga_list_active_runs(
+    service: State<'_, IpcService>,
+) -> Result<Vec<riga_server::ws::ActiveRun>, String> {
+    Ok(service.list_active_runs().await)
+}
+
+#[tauri::command]
 async fn riga_create_session(
     service: State<'_, IpcService>,
     request: CreateSessionRequest,
@@ -246,6 +253,7 @@ pub fn run() {
             riga_catalog,
             riga_list_sessions,
             riga_create_session,
+            riga_list_active_runs,
             riga_list_mcp_registry,
             riga_save_mcp_registry,
             riga_configure_provider,

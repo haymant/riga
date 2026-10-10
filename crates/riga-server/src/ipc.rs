@@ -85,6 +85,22 @@ impl IpcService {
         self.state.sessions.read().await.clone()
     }
 
+    /// The runs currently executing. Mirrors the WebSocket `ListActiveRuns`
+    /// response so the desktop can show and cancel active runs like the browser.
+    pub async fn list_active_runs(&self) -> Vec<ws::ActiveRun> {
+        self.state
+            .runs
+            .lock()
+            .await
+            .iter()
+            .map(|(run_id, handle)| ws::ActiveRun {
+                run_id: run_id.clone(),
+                session_id: handle.session_id.clone(),
+                local: handle.local,
+            })
+            .collect()
+    }
+
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<Session, String> {
         if request.title.trim().is_empty() || request.workspace.trim().is_empty() {
             return Err("title and workspace are required".into());

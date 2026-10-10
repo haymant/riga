@@ -23,6 +23,7 @@ export const RIGA_IPC_COMMANDS = {
   catalog: "riga_catalog",
   listSessions: "riga_list_sessions",
   createSession: "riga_create_session",
+  listActiveRuns: "riga_list_active_runs",
   configureProvider: "riga_configure_provider",
   startRun: "riga_start_run",
   resumeRun: "riga_resume_run",
@@ -109,9 +110,7 @@ export class RigaTauriTransport implements RigaTransport {
     return this.call(RIGA_IPC_COMMANDS.resumeRun, { runId, afterSequence });
   }
   cancelRun(runId: string): Promise<void> { return this.call(RIGA_IPC_COMMANDS.cancelRun, { runId }); }
-  // The current desktop IPC command set predates active-run discovery. Keep the
-  // transport compatible; the WebSocket transport provides the live registry.
-  listActiveRuns(): Promise<ActiveRun[]> { return Promise.resolve([]); }
+  listActiveRuns(): Promise<ActiveRun[]> { return this.call(RIGA_IPC_COMMANDS.listActiveRuns); }
   respondToApproval(runId: string, approvalId: string, approved: boolean, option?: "once" | "always"): Promise<void> {
     return this.call(RIGA_IPC_COMMANDS.approval, { request: { run_id: runId, approval_id: approvalId, approved, option } });
   }

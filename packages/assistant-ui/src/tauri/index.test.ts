@@ -19,6 +19,7 @@ describe("RigaTauriTransport", () => {
     await transport.startRun("run-1", "session-1", "hello");
     await transport.resumeRun("run-1", 4);
     await transport.cancelRun("run-1");
+    await transport.listActiveRuns();
     await transport.respondToApproval("run-1", "approval-1", true, "once");
 
     expect(calls.map(({ command }) => command)).toEqual([
@@ -27,6 +28,7 @@ describe("RigaTauriTransport", () => {
       RIGA_IPC_COMMANDS.startRun,
       RIGA_IPC_COMMANDS.resumeRun,
       RIGA_IPC_COMMANDS.cancelRun,
+      RIGA_IPC_COMMANDS.listActiveRuns,
       RIGA_IPC_COMMANDS.approval,
     ]);
     expect(calls[1]?.args).toMatchObject({ endpoint: "https://model.test/v1", apiKey: "secret", reasoningEffort: "medium", api: "responses" });
