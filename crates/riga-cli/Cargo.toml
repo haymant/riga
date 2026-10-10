@@ -10,6 +10,7 @@ description = "RIGA command-line adapter"
 [dependencies]
 riga-kernel = { version = "0.1.0", path = "../riga-kernel" }
 riga-server = { version = "0.1.0", path = "../riga-server" }
+base64 = "0.22.1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 ratatui = "0.29"

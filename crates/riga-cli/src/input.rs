@@ -47,6 +47,11 @@ impl TextBuffer {
         self.cursor += value.len_utf8();
     }
 
+    pub fn insert_str(&mut self, value: &str) {
+        self.text.insert_str(self.cursor, value);
+        self.cursor += value.len();
+    }
+
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
@@ -263,6 +268,16 @@ mod tests {
         buffer.move_left();
         buffer.insert('界');
         assert_eq!(buffer.text(), "界你");
+    }
+
+    #[test]
+    fn pasted_unicode_and_newlines_keep_the_cursor_after_the_inserted_text() {
+        let mut buffer = TextBuffer::default();
+        buffer.replace("ab");
+        buffer.move_left();
+        buffer.insert_str("你\ncd");
+        assert_eq!(buffer.text(), "a你\ncdb");
+        assert_eq!(buffer.cursor_byte_position(), "a你\ncd".len());
     }
 
     #[test]

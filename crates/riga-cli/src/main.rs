@@ -67,6 +67,7 @@ async fn main() -> Result<(), String> {
             },
             follow_output: true,
             reasoning_collapsed: true,
+            tools_collapsed: true,
             local_models: Some(local_models),
             ..app::UiState::default()
         };

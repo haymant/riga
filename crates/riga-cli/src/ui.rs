@@ -35,9 +35,10 @@ fn push_transcript_note(lines: &mut Vec<Line<'static>>, text: &str, color: Color
     }
 }
 
-fn push_reasoning(lines: &mut Vec<Line<'static>>, text: &str, collapsed: bool) {
+fn push_reasoning(lines: &mut Vec<Line<'static>>, text: &str, collapsed: bool, width: usize) {
     let surface = Color::Rgb(34, 34, 36);
-    if collapsed {
+    let visual_rows = text_visual_rows(text, width, 2).saturating_add(1);
+    if collapsed && visual_rows > 3 {
         let preview: String = text
             .lines()
             .find(|line| !line.trim().is_empty())
@@ -49,7 +50,7 @@ fn push_reasoning(lines: &mut Vec<Line<'static>>, text: &str, collapsed: bool) {
             Span::styled("╎ ", Style::default().fg(Color::DarkGray).bg(surface)),
             Span::styled(
                 format!(
-                    "Thinking · {} chars · {preview} · Ctrl+R to expand",
+                    "Thinking · {} chars · {preview} · Ctrl+R expand",
                     text.chars().count()
                 ),
                 Style::default()
@@ -81,15 +82,83 @@ fn push_reasoning(lines: &mut Vec<Line<'static>>, text: &str, collapsed: bool) {
     }
 }
 
+fn text_visual_rows(text: &str, width: usize, prefix_width: usize) -> usize {
+    let available = width.saturating_sub(prefix_width).max(1);
+    text.lines()
+        .map(|line| Line::from(line).width().max(1).div_ceil(available))
+        .sum()
+}
+
+fn push_tool_call(
+    lines: &mut Vec<Line<'static>>,
+    tool: &str,
+    call_id: &str,
+    call: &serde_json::Value,
+    collapsed: bool,
+    width: usize,
+) {
+    let pretty = serde_json::to_string_pretty(call).unwrap_or_else(|_| call.to_string());
+    let rows = text_visual_rows(&pretty, width, 2).saturating_add(1);
+    if collapsed && rows > 3 {
+        let arguments = call.get("arguments").unwrap_or(call);
+        let summary = serde_json::to_string(arguments).unwrap_or_default();
+        let preview: String = summary.chars().take(68).collect();
+        push_transcript_note(
+            lines,
+            &format!("↳ {tool} · {call_id} · {rows} rows · {preview} · Ctrl+T expand"),
+            Color::DarkGray,
+        );
+        return;
+    }
+    push_transcript_note(lines, &format!("↳ {tool} · {call_id}"), Color::DarkGray);
+    for line in pretty.lines() {
+        push_transcript_note(lines, &format!("  {line}"), Color::Gray);
+    }
+}
+
+fn push_tool_detail(
+    lines: &mut Vec<Line<'static>>,
+    label: &str,
+    text: &str,
+    color: Color,
+    collapsed: bool,
+    width: usize,
+) {
+    let rows = text_visual_rows(text, width, 2).saturating_add(1);
+    if collapsed && rows > 3 {
+        let preview: String = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("(empty)")
+            .chars()
+            .take(68)
+            .collect();
+        push_transcript_note(
+            lines,
+            &format!("{label} · {rows} rows · {preview} · Ctrl+T expand"),
+            Color::DarkGray,
+        );
+        return;
+    }
+    push_transcript_note(lines, &format!("{label} ·"), color);
+    for line in text.lines() {
+        push_transcript_note(lines, line, color);
+    }
+}
+
 pub fn render(frame: &mut Frame<'_>, app: &UiState) {
     let area = frame.area();
     if has_wide_sidebar(area) {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Min(72),
+                Constraint::Min(40),
                 Constraint::Length(1),
-                Constraint::Length(34),
+                Constraint::Length(if app.sidebar_width == 0 {
+                    34
+                } else {
+                    app.sidebar_width.clamp(24, 56)
+                }),
             ])
             .split(area);
         render_transcript_column(frame, columns[0], app);
@@ -122,10 +191,8 @@ fn has_wide_sidebar(area: Rect) -> bool {
 fn active_sidebar_panel(app: &UiState) -> UiPanel {
     if app.panel != UiPanel::Transcript {
         app.panel
-    } else if app.rundeck_open {
-        UiPanel::RunDeck
     } else {
-        UiPanel::History
+        app.last_sidebar_panel.unwrap_or(UiPanel::History)
     }
 }
 
@@ -158,6 +225,7 @@ fn sidebar_panel_lines(app: &UiState, panel: UiPanel, max_lines: usize) -> Vec<L
                 lines.push(Line::from(app.panel_input.text().to_owned()));
                 lines.push(Line::from("Enter save · Esc cancel"));
             } else {
+                lines.push(Line::from("Tab chat · +/- resize"));
                 lines.push(Line::from("Ctrl+H · n new · r rename"));
                 if app.state.sessions.is_empty() {
                     lines.push(Line::from("No sessions yet"));
@@ -204,7 +272,7 @@ fn sidebar_panel_lines(app: &UiState, panel: UiPanel, max_lines: usize) -> Vec<L
         }
         UiPanel::RunDeck => {
             lines.extend(render_rundeck(app));
-            lines.push(Line::from("Tab / ← → change view · Esc close"));
+            lines.push(Line::from("Tab chat · ←/→ change view · Esc close"));
         }
         UiPanel::Catalog => {
             lines.push(Line::from(format!("Filter: {}", app.catalog_query.text())));
@@ -230,7 +298,9 @@ fn sidebar_panel_lines(app: &UiState, panel: UiPanel, max_lines: usize) -> Vec<L
                 Line::from("/ · tools, skills, MCP"),
                 Line::from("@ · files, subagents"),
                 Line::from("Ctrl+R / Ctrl+T · collapse output"),
-                Line::from("Esc · close · q · quit"),
+                Line::from("Tab / mouse · focus composer, chat, sidebar"),
+                Line::from("Shift+drag select · Ctrl+C copy · Ctrl+Shift+V paste"),
+                Line::from("+/- · resize sidebar · Esc close · q quit"),
             ]);
         }
     }
@@ -333,7 +403,9 @@ fn render_panel_surface_body(
             .saturating_add(prefix_width as u16)
             .saturating_add(cursor.saturating_sub(start).min(available) as u16)
             .min(editor_area.x + editor_area.width.saturating_sub(1));
-        frame.set_cursor_position((cursor_x, editor_area.y));
+        if app.panel == panel {
+            frame.set_cursor_position((cursor_x, editor_area.y));
+        }
     }
 }
 
@@ -377,8 +449,16 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                 if active {
                     Style::default()
                         .fg(Color::White)
-                        .bg(Color::Rgb(53, 53, 57))
-                        .add_modifier(Modifier::BOLD)
+                        .bg(if app.panel == panel {
+                            Color::Rgb(53, 53, 57)
+                        } else {
+                            Color::Rgb(39, 39, 42)
+                        })
+                        .add_modifier(if app.panel == panel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        })
                 } else {
                     Style::default().fg(Color::Gray)
                 },
@@ -620,7 +700,7 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
         crate::model::UiPanel::Help => (
             "Help",
             vec![Line::from(
-                "Ctrl+H history · Ctrl+,/F2 settings/model · Ctrl+K catalog · Ctrl+J newline · Ctrl+D RunDeck side panel · Ctrl+L local models · ? help · Ctrl+R reasoning · Ctrl+T tools · y/a/n approvals · Esc close/cancel · q quit",
+                "Ctrl+I info · Ctrl+H history · Ctrl+,/F2 settings · Ctrl+K catalog · Ctrl+J newline · Ctrl+D RunDeck · Ctrl+L models · Ctrl+O shell stdin · Ctrl+R reasoning · Ctrl+T tools · Tab focus · drag select · Ctrl+C copy · Ctrl+Shift+V paste · +/- sidebar · y/a/n approvals · Esc close/cancel · q quit",
             )],
         ),
         crate::model::UiPanel::Transcript => unreachable!(),
@@ -895,21 +975,11 @@ fn render_topbar(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     frame.render_widget(Paragraph::new(line), area);
 }
 
-fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
+fn transcript_lines(app: &UiState, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let user_rail = Color::LightBlue;
     let assistant_rail = Color::LightYellow;
     for item in &app.state.session_history {
-        if app.tools_collapsed
-            && matches!(
-                item,
-                TranscriptItem::ToolCall { .. }
-                    | TranscriptItem::ToolOutput { .. }
-                    | TranscriptItem::ToolResult { .. }
-            )
-        {
-            continue;
-        }
         match item {
             crate::model::TranscriptItem::UserText(text) => {
                 push_rich_message(&mut lines, user_rail, text);
@@ -920,19 +990,39 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                 lines.push(Line::default());
             }
             TranscriptItem::AssistantReasoning(text) => {
-                push_reasoning(&mut lines, text, app.reasoning_collapsed);
+                push_reasoning(&mut lines, text, app.reasoning_collapsed, width);
             }
             crate::model::TranscriptItem::System(text) => {
                 push_transcript_note(&mut lines, text, Color::Magenta);
             }
-            TranscriptItem::ToolCall { tool, call, .. } => {
-                push_transcript_note(&mut lines, &format!("↳ {tool} · {call}"), Color::DarkGray);
+            TranscriptItem::ToolCall {
+                call_id,
+                tool,
+                call,
+            } => {
+                push_tool_call(&mut lines, tool, call_id, call, app.tools_collapsed, width);
             }
             TranscriptItem::ToolOutput { output, .. } => {
-                push_transcript_note(&mut lines, &format!("  {output}"), Color::Gray);
+                push_tool_detail(
+                    &mut lines,
+                    "Tool output",
+                    output,
+                    Color::Gray,
+                    app.tools_collapsed,
+                    width,
+                );
             }
             TranscriptItem::ToolResult { result, .. } => {
-                push_transcript_note(&mut lines, &format!("  Result · {result}"), Color::DarkGray);
+                let result =
+                    serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string());
+                push_tool_detail(
+                    &mut lines,
+                    "Tool result",
+                    &result,
+                    Color::DarkGray,
+                    app.tools_collapsed,
+                    width,
+                );
             }
             crate::model::TranscriptItem::TaskResult {
                 task_id,
@@ -964,16 +1054,6 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     if let Some(run_id) = &app.state.active_run {
         if let Some(run) = app.state.run(run_id) {
             for item in &run.transcript {
-                if app.tools_collapsed
-                    && matches!(
-                        item,
-                        crate::model::TranscriptItem::ToolCall { .. }
-                            | crate::model::TranscriptItem::ToolOutput { .. }
-                            | crate::model::TranscriptItem::ToolResult { .. }
-                    )
-                {
-                    continue;
-                }
                 match item {
                     crate::model::TranscriptItem::UserText(text) => {
                         push_rich_message(&mut lines, user_rail, text);
@@ -984,22 +1064,35 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                         lines.push(Line::default());
                     }
                     TranscriptItem::AssistantReasoning(text) => {
-                        push_reasoning(&mut lines, text, app.reasoning_collapsed);
+                        push_reasoning(&mut lines, text, app.reasoning_collapsed, width);
                     }
-                    TranscriptItem::ToolCall { tool, call, .. } => {
-                        lines.push(Line::from(Span::styled(
-                            format!("┃ ↳ {tool} · {call}"),
-                            Style::default().fg(Color::DarkGray),
-                        )))
+                    TranscriptItem::ToolCall {
+                        call_id,
+                        tool,
+                        call,
+                    } => {
+                        push_tool_call(&mut lines, tool, call_id, call, app.tools_collapsed, width);
                     }
                     TranscriptItem::ToolOutput { output, .. } => {
-                        push_transcript_note(&mut lines, &format!("  {output}"), Color::Gray);
+                        push_tool_detail(
+                            &mut lines,
+                            "Tool output",
+                            output,
+                            Color::Gray,
+                            app.tools_collapsed,
+                            width,
+                        );
                     }
                     TranscriptItem::ToolResult { result, .. } => {
-                        push_transcript_note(
+                        let result = serde_json::to_string_pretty(result)
+                            .unwrap_or_else(|_| result.to_string());
+                        push_tool_detail(
                             &mut lines,
-                            &format!("Result · {result}"),
+                            "Tool result",
+                            &result,
                             Color::DarkGray,
+                            app.tools_collapsed,
+                            width,
                         );
                     }
                     crate::model::TranscriptItem::TaskResult {
@@ -1041,14 +1134,127 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
             Style::default().fg(Color::DarkGray),
         )));
     }
-    let total_lines = wrapped_line_count(&lines, area.width as usize);
-    let viewport_lines = area.height as usize;
-    let bottom_offset = total_lines.saturating_sub(viewport_lines);
-    let offset = if app.follow_output {
+    lines
+}
+
+fn transcript_area_width(terminal_width: u16, terminal_height: u16, app: &UiState) -> usize {
+    if terminal_width >= 112 && terminal_height >= 12 {
+        let sidebar = if app.sidebar_width == 0 {
+            34
+        } else {
+            app.sidebar_width.clamp(24, 56)
+        };
+        terminal_width.saturating_sub(sidebar.saturating_add(1)) as usize
+    } else {
+        terminal_width as usize
+    }
+}
+
+fn transcript_viewport_height(terminal_height: u16, app: &UiState) -> u16 {
+    let composer = app
+        .draft
+        .text()
+        .lines()
+        .count()
+        .max(1)
+        .saturating_add(2)
+        .min(terminal_height.saturating_sub(5).max(3) as usize) as u16;
+    terminal_height.saturating_sub(composer.saturating_add(2))
+}
+
+fn transcript_offset(
+    lines: &[Line<'_>],
+    width: usize,
+    viewport_height: usize,
+    app: &UiState,
+) -> usize {
+    let total_lines = wrapped_line_count(lines, width);
+    let bottom_offset = total_lines.saturating_sub(viewport_height);
+    if app.follow_output {
         bottom_offset
     } else {
         bottom_offset.saturating_sub(app.transcript_scroll)
+    }
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    text.trim_start_matches("┃ ")
+        .trim_start_matches("╎ ")
+        .to_owned()
+}
+
+fn selected_line_indices(
+    lines: &[Line<'_>],
+    width: usize,
+    start_visual_row: usize,
+    end_visual_row: usize,
+) -> Vec<usize> {
+    let mut selected = Vec::new();
+    let mut visual_row = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        let row_count = line.width().max(1).div_ceil(width.max(1));
+        let end = visual_row.saturating_add(row_count);
+        if visual_row <= end_visual_row && end > start_visual_row {
+            selected.push(index);
+        }
+        visual_row = end;
+    }
+    selected
+}
+
+pub fn selected_transcript_text(
+    app: &UiState,
+    terminal_width: u16,
+    terminal_height: u16,
+) -> String {
+    let (Some(anchor), Some(cursor)) = (app.selection_anchor, app.selection_cursor) else {
+        return String::new();
     };
+    let width = transcript_area_width(terminal_width, terminal_height, app).max(1);
+    let viewport_height = transcript_viewport_height(terminal_height, app) as usize;
+    let lines = transcript_lines(app, width);
+    let offset = transcript_offset(&lines, width, viewport_height, app);
+    let first_screen_row = anchor.min(cursor).max(1) as usize;
+    let last_screen_row = anchor.max(cursor).min(viewport_height as u16) as usize;
+    if first_screen_row > last_screen_row {
+        return String::new();
+    }
+    let start = offset.saturating_add(first_screen_row.saturating_sub(1));
+    let end = offset.saturating_add(last_screen_row.saturating_sub(1));
+    selected_line_indices(&lines, width, start, end)
+        .into_iter()
+        .map(|index| line_plain_text(&lines[index]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
+    let width = area.width.max(1) as usize;
+    let mut lines = transcript_lines(app, width);
+    let viewport_lines = area.height as usize;
+    let offset = transcript_offset(&lines, width, viewport_lines, app);
+    if let (Some(anchor), Some(cursor)) = (app.selection_anchor, app.selection_cursor) {
+        let first = anchor.min(cursor).max(area.y) as usize;
+        let last = cursor
+            .max(anchor)
+            .min(area.y.saturating_add(area.height.saturating_sub(1))) as usize;
+        if first <= last {
+            let selected = selected_line_indices(
+                &lines,
+                width,
+                offset.saturating_add(first.saturating_sub(area.y as usize)),
+                offset.saturating_add(last.saturating_sub(area.y as usize)),
+            );
+            for index in selected {
+                lines[index].style = lines[index].style.bg(Color::Rgb(54, 67, 82));
+            }
+        }
+    }
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
     frame.render_widget(
         paragraph.scroll((offset.min(u16::MAX as usize) as u16, 0)),
@@ -1065,7 +1271,11 @@ fn wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
-    let title = if let Some(approval) = app.state.pending_approval() {
+    let composer_focused =
+        app.shell_input_mode || (app.panel == UiPanel::Transcript && !app.transcript_focused);
+    let title = if app.shell_input_mode {
+        "Shell stdin · Enter send · Esc return to chat".to_owned()
+    } else if let Some(approval) = app.state.pending_approval() {
         format!(
             "Approval{} · {} / {} · Tab focus · y allow · a always · n deny",
             if app.approval_focused {
@@ -1077,31 +1287,51 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
             approval.approval_id
         )
     } else if app.state.active_run.is_some() {
-        "Composer · Esc stop · Enter send".to_owned()
+        format!(
+            "Composer{} · Tab sidebar · Esc stop · Enter send",
+            if composer_focused { " [focused]" } else { "" }
+        )
     } else {
-        "Composer · Ctrl+J newline · Enter send".to_owned()
+        format!(
+            "Composer{} · Tab sidebar · Ctrl+J newline · Enter send",
+            if composer_focused { " [focused]" } else { "" }
+        )
     };
     let surface = Color::Rgb(34, 34, 36);
     frame.render_widget(
-        Paragraph::new(format!("> {}", app.draft.text()))
-            .style(Style::default().fg(Color::White).bg(surface))
-            .block(
-                Block::default()
-                    .borders(Borders::TOP)
-                    .border_style(Style::default().fg(Color::DarkGray))
-                    .style(Style::default().bg(surface))
-                    .title(title),
-            )
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(if app.shell_input_mode {
+            format!("$ {}", app.shell_input.text())
+        } else {
+            format!("> {}", app.draft.text())
+        })
+        .style(Style::default().fg(Color::White).bg(surface))
+        .block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(if composer_focused {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                }))
+                .style(Style::default().bg(surface))
+                .title(title),
+        )
+        .wrap(Wrap { trim: false }),
         area,
     );
-    let (column, line) = app.draft.cursor_position();
-    frame.set_cursor_position((
-        area.x.saturating_add(2).saturating_add(column),
-        area.y
-            .saturating_add(1)
-            .saturating_add(line.min(area.height.saturating_sub(2))),
-    ));
+    if composer_focused {
+        let (column, line) = if app.shell_input_mode {
+            app.shell_input.cursor_position()
+        } else {
+            app.draft.cursor_position()
+        };
+        frame.set_cursor_position((
+            area.x.saturating_add(2).saturating_add(column),
+            area.y
+                .saturating_add(1)
+                .saturating_add(line.min(area.height.saturating_sub(2))),
+        ));
+    }
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
@@ -1143,9 +1373,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
         return;
     }
     let navigation = if area.width < 90 {
-        "Ctrl+I info · Ctrl+H history · / tools · @ files"
+        "Tab focus · Ctrl+I info · Ctrl+H history · / tools · @ files"
     } else {
-        "Ctrl+I info · Ctrl+H history · Ctrl+, settings · Ctrl+L models · / tools · @ files"
+        "Tab focus · Ctrl+I info · Ctrl+H history · Ctrl+, settings · Ctrl+L models · / tools · @ files"
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -1164,7 +1394,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
             Span::raw(" · "),
             Span::styled(status, Style::default().fg(Color::Cyan)),
             Span::raw(format!(
-                " · {navigation} · Ctrl+R reasoning · Ctrl+T tools · q quit"
+                " · {navigation} · Ctrl+O shell stdin · Ctrl+R reasoning · Ctrl+T tools · drag select · Ctrl+C copy · Ctrl+Shift+V paste · +/- sidebar · q quit"
             )),
         ])),
         area,
@@ -1185,7 +1415,7 @@ mod tests {
     use crate::{
         app::UiState,
         input::TextBuffer,
-        model::{AppState, ConnectionState, ProviderForm, UiPanel},
+        model::{AppState, ConnectionState, ProviderForm, TranscriptItem, UiPanel},
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{
@@ -1260,6 +1490,31 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("ERR"));
+        assert_eq!(
+            terminal.backend_mut().get_cursor_position().unwrap(),
+            (3, 21).into()
+        );
+    }
+
+    #[test]
+    fn shell_input_mode_renders_its_prompt_and_visible_caret() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = UiState {
+            shell_input_mode: true,
+            ..UiState::default()
+        };
+        app.shell_input.replace("y");
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Shell stdin"));
+        assert!(text.contains("$ y"));
         assert_eq!(
             terminal.backend_mut().get_cursor_position().unwrap(),
             (3, 21).into()
@@ -1399,6 +1654,56 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_auto_collapses_only_when_it_exceeds_three_rows() {
+        let mut short = Vec::new();
+        push_reasoning(&mut short, "one\ntwo", true, 80);
+        assert!(!line_plain_text(&short[0]).contains("chars"));
+
+        let mut long = Vec::new();
+        push_reasoning(&mut long, "one\ntwo\nthree", true, 80);
+        assert!(line_plain_text(&long[0]).contains("Ctrl+R expand"));
+
+        let mut expanded = Vec::new();
+        push_reasoning(&mut expanded, "one\ntwo\nthree", false, 80);
+        assert!(line_plain_text(&expanded[0]).contains("Thinking"));
+        assert!(line_plain_text(&expanded[1]).contains("one"));
+    }
+
+    #[test]
+    fn long_tool_details_collapse_and_selected_rows_copy_as_plain_text() {
+        let mut app = UiState {
+            tools_collapsed: true,
+            ..UiState::default()
+        };
+        app.state.session_history = vec![
+            TranscriptItem::ToolOutput {
+                call_id: "call-1".into(),
+                output: "first\nsecond\nthird".into(),
+            },
+            TranscriptItem::UserText("copy this line".into()),
+        ];
+        let lines = transcript_lines(&app, 80);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line_plain_text(line).contains("Ctrl+T expand"))
+        );
+
+        app.tools_collapsed = false;
+        let expanded = transcript_lines(&app, 80);
+        assert!(
+            expanded
+                .iter()
+                .any(|line| line_plain_text(line).contains("second"))
+        );
+
+        app.state.session_history = vec![TranscriptItem::UserText("copy this line".into())];
+        app.selection_anchor = Some(1);
+        app.selection_cursor = Some(1);
+        assert_eq!(selected_transcript_text(&app, 80, 24), "copy this line");
+    }
+
+    #[test]
     fn provider_settings_mask_api_keys() {
         let backend = TestBackend::new(100, 20);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1491,7 +1796,8 @@ mod tests {
             cell.symbol() == "╎" && cell.fg == Color::DarkGray && cell.bg == Color::Rgb(34, 34, 36)
         }));
         let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
-        assert!(text.contains("Ctrl+R to expand"));
+        assert!(text.contains("private chain preview"));
+        assert!(!text.contains("Ctrl+R expand"));
     }
 
     #[test]

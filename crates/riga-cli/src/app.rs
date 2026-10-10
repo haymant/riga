@@ -5,7 +5,9 @@ use crate::{
     },
     transport::RigaTransport,
 };
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 
@@ -54,6 +56,10 @@ pub enum UiCommand {
     UploadAttachment {
         path: String,
     },
+    SendShellInput {
+        call_id: String,
+        text: String,
+    },
     Quit,
 }
 
@@ -74,6 +80,10 @@ pub struct UiState {
     pub(crate) approval_submission: Option<String>,
     pub approval_focused: bool,
     pub panel: UiPanel,
+    pub last_sidebar_panel: Option<UiPanel>,
+    pub sidebar_width: u16,
+    pub selection_anchor: Option<u16>,
+    pub selection_cursor: Option<u16>,
     pub panel_cursor: usize,
     pub panel_input: TextBuffer,
     pub workspace_input: TextBuffer,
@@ -101,6 +111,8 @@ pub struct UiState {
     pub completion_cursor: usize,
     pub completion_range: Option<(usize, usize)>,
     pub completion_candidates: Vec<CompletionItem>,
+    pub shell_input_mode: bool,
+    pub shell_input: TextBuffer,
 }
 
 enum BackgroundResult {
@@ -117,6 +129,27 @@ enum BackgroundResult {
 }
 
 impl UiState {
+    fn active_shell_call_id(&self) -> Option<String> {
+        let run_id = self.state.active_run.as_deref()?;
+        let run = self.state.run(run_id)?;
+        let mut active_calls = Vec::<String>::new();
+        for item in &run.transcript {
+            match item {
+                TranscriptItem::ToolCall { call_id, tool, .. }
+                    if matches!(tool.to_ascii_lowercase().as_str(), "bash" | "shell") =>
+                {
+                    active_calls.push(call_id.clone());
+                }
+                TranscriptItem::ToolResult {
+                    call_id: Some(call_id),
+                    ..
+                } => active_calls.retain(|active| active != call_id),
+                _ => {}
+            }
+        }
+        active_calls.pop()
+    }
+
     pub fn set_session_history(&mut self, turns: Vec<riga_server::ws::ConversationTurn>) {
         self.state.session_history = turns
             .into_iter()
@@ -257,21 +290,139 @@ impl UiState {
         }
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent, terminal_height: u16) {
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, terminal_width: u16, terminal_height: u16) {
         match mouse.kind {
-            MouseEventKind::Down(_) => {
-                self.transcript_focused = mouse.row < terminal_height.saturating_sub(4);
+            MouseEventKind::Down(MouseButton::Left) => {
+                let wide_sidebar = terminal_width >= 112 && terminal_height >= 12;
+                let sidebar_width = if self.sidebar_width == 0 {
+                    34
+                } else {
+                    self.sidebar_width.clamp(24, 56)
+                };
+                if wide_sidebar && mouse.column >= terminal_width.saturating_sub(sidebar_width) {
+                    if (1..=5).contains(&mouse.row) {
+                        let panel = match mouse.row {
+                            1 => UiPanel::History,
+                            2 => UiPanel::Settings,
+                            3 => UiPanel::LocalModels,
+                            4 => UiPanel::Help,
+                            5 => UiPanel::RunDeck,
+                            _ => unreachable!(),
+                        };
+                        self.show_sidebar_panel(panel);
+                    } else {
+                        self.panel = self.last_sidebar_panel.unwrap_or(UiPanel::History);
+                        self.transcript_focused = false;
+                        self.clear_selection();
+                    }
+                } else {
+                    let composer_height = self
+                        .draft
+                        .text()
+                        .lines()
+                        .count()
+                        .max(1)
+                        .saturating_add(2)
+                        .min(terminal_height.saturating_sub(5).max(3) as usize)
+                        as u16;
+                    let composer_top = terminal_height.saturating_sub(composer_height + 1);
+                    if mouse.row >= composer_top && mouse.row < terminal_height.saturating_sub(1) {
+                        self.focus_composer();
+                        self.clear_selection();
+                    } else if !wide_sidebar
+                        && (self.panel != UiPanel::Transcript || self.rundeck_open)
+                        && mouse.row < composer_top.saturating_sub(2)
+                    {
+                        self.transcript_focused = false;
+                        self.clear_selection();
+                    } else if mouse.row > 0 && mouse.row < composer_top {
+                        if self.panel != UiPanel::Transcript {
+                            self.last_sidebar_panel = Some(self.panel);
+                        }
+                        self.panel = UiPanel::Transcript;
+                        self.rundeck_open = false;
+                        self.transcript_focused = true;
+                        self.selection_anchor = Some(mouse.row);
+                        self.selection_cursor = Some(mouse.row);
+                    }
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.selection_anchor.is_some() {
+                    self.selection_cursor = Some(mouse.row);
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.selection_anchor.is_some() {
+                    self.selection_cursor = Some(mouse.row);
+                }
             }
             MouseEventKind::ScrollUp => {
-                self.transcript_focused = true;
-                self.follow_output = false;
-                self.transcript_scroll = self.transcript_scroll.saturating_add(3);
+                if self.panel == UiPanel::Transcript {
+                    self.transcript_focused = true;
+                    self.follow_output = false;
+                    self.transcript_scroll = self.transcript_scroll.saturating_add(3);
+                }
             }
             MouseEventKind::ScrollDown => {
-                self.transcript_focused = true;
-                self.transcript_scroll = self.transcript_scroll.saturating_sub(3);
+                if self.panel == UiPanel::Transcript {
+                    self.transcript_focused = true;
+                    self.transcript_scroll = self.transcript_scroll.saturating_sub(3);
+                }
             }
             _ => {}
+        }
+    }
+
+    fn show_sidebar_panel(&mut self, panel: UiPanel) {
+        self.panel = panel;
+        self.last_sidebar_panel = Some(panel);
+        self.rundeck_open = panel == UiPanel::RunDeck;
+        self.transcript_focused = false;
+        self.clear_selection();
+    }
+
+    fn focus_composer(&mut self) {
+        if self.panel != UiPanel::Transcript {
+            self.last_sidebar_panel = Some(self.panel);
+        }
+        self.panel = UiPanel::Transcript;
+        self.transcript_focused = false;
+        self.rundeck_open = false;
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.selection_cursor = None;
+    }
+
+    pub fn handle_paste(&mut self, text: &str) {
+        if self.shell_input_mode {
+            self.shell_input.insert_str(text);
+            return;
+        }
+        if self.panel == UiPanel::Transcript {
+            self.draft.insert_str(text);
+            self.prompt_history_cursor = None;
+            self.refresh_completion();
+            return;
+        }
+        match self.panel {
+            UiPanel::History if self.creating_session && self.session_field == 1 => {
+                self.workspace_input.insert_str(text)
+            }
+            UiPanel::History if self.creating_session || self.renaming_session.is_some() => {
+                self.panel_input.insert_str(text)
+            }
+            UiPanel::Settings => {
+                self.panel_input.insert_str(text);
+                self.commit_provider_input();
+            }
+            UiPanel::Catalog => self.catalog_query.insert_str(text),
+            UiPanel::LocalModels if self.local_attachment_input => {
+                self.panel_input.insert_str(text)
+            }
+            _ => self.draft.insert_str(text),
         }
     }
 
@@ -290,6 +441,27 @@ impl UiState {
                 }
                 _ => return None,
             }
+        }
+        if self.shell_input_mode {
+            if key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                self.shell_input_mode = false;
+                self.notice = Some("Shell input mode closed; the run is still active.".into());
+                return None;
+            }
+            let Some(call_id) = self.active_shell_call_id() else {
+                self.shell_input_mode = false;
+                self.notice = Some("The shell command has already finished.".into());
+                return None;
+            };
+            return match self.shell_input.handle_key(key) {
+                InputAction::Submit(text) => Some(UiCommand::SendShellInput {
+                    call_id,
+                    text: format!("{text}\n"),
+                }),
+                InputAction::Changed | InputAction::Ignored => None,
+            };
         }
         if key.code == KeyCode::Esc && self.panel != UiPanel::Transcript {
             return self.handle_panel_key(key);
@@ -333,7 +505,122 @@ impl UiState {
                 return Some(command);
             }
         }
+        if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.panel != UiPanel::Transcript {
+                self.focus_composer();
+            }
+            if self.active_shell_call_id().is_some() {
+                self.shell_input_mode = true;
+                self.shell_input.clear();
+                self.transcript_focused = false;
+                self.notice = Some(
+                    "Shell input · type a response and press Enter; Esc returns to chat.".into(),
+                );
+            } else {
+                self.notice = Some("No active Bash/shell command is waiting for input.".into());
+            }
+            return None;
+        }
+        if key.code == KeyCode::Tab
+            && self.panel == UiPanel::Transcript
+            && self.completion_trigger.is_none()
+        {
+            if self.transcript_focused {
+                self.transcript_focused = false;
+            } else {
+                let panel = self.last_sidebar_panel.unwrap_or(UiPanel::History);
+                self.show_sidebar_panel(panel);
+            }
+            return None;
+        }
+        if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.panel != UiPanel::Transcript {
+                self.focus_composer();
+                return None;
+            }
+        }
+        if key.code == KeyCode::Tab && self.panel != UiPanel::Transcript {
+            let panel_tab_navigates = match self.panel {
+                UiPanel::Settings => false,
+                UiPanel::History if self.creating_session => false,
+                UiPanel::History if self.renaming_session.is_some() => true,
+                UiPanel::LocalModels if self.local_attachment_input => true,
+                _ => true,
+            };
+            if panel_tab_navigates {
+                self.focus_composer();
+                return None;
+            }
+        }
+        if self.panel == UiPanel::Transcript && self.transcript_focused {
+            match key.code {
+                KeyCode::Up => {
+                    self.follow_output = false;
+                    self.transcript_scroll = self.transcript_scroll.saturating_add(1);
+                    return None;
+                }
+                KeyCode::Down => {
+                    self.transcript_scroll = self.transcript_scroll.saturating_sub(1);
+                    return None;
+                }
+                KeyCode::PageUp => {
+                    self.follow_output = false;
+                    self.transcript_scroll = self.transcript_scroll.saturating_add(3);
+                    self.new_events = 0;
+                    return None;
+                }
+                KeyCode::PageDown => {
+                    self.transcript_scroll = self.transcript_scroll.saturating_sub(3);
+                    return None;
+                }
+                KeyCode::Home => {
+                    self.follow_output = false;
+                    self.transcript_scroll = usize::MAX;
+                    return None;
+                }
+                KeyCode::End => {
+                    self.jump_to_bottom();
+                    return None;
+                }
+                KeyCode::Esc => {
+                    self.transcript_focused = false;
+                    self.clear_selection();
+                    return None;
+                }
+                _ if key.modifiers.contains(KeyModifiers::CONTROL) || key.code == KeyCode::F(1) => {
+                    self.transcript_focused = false;
+                }
+                _ => return None,
+            }
+        }
         if self.panel != UiPanel::Transcript {
+            let panel_is_editor = matches!(self.panel, UiPanel::Settings | UiPanel::Catalog)
+                || (self.panel == UiPanel::History
+                    && (self.creating_session || self.renaming_session.is_some()))
+                || (self.panel == UiPanel::LocalModels && self.local_attachment_input);
+            if !panel_is_editor {
+                match key.code {
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        let current = if self.sidebar_width == 0 {
+                            34
+                        } else {
+                            self.sidebar_width
+                        };
+                        self.sidebar_width = current.saturating_add(4).clamp(24, 56);
+                        return None;
+                    }
+                    KeyCode::Char('-') => {
+                        let current = if self.sidebar_width == 0 {
+                            34
+                        } else {
+                            self.sidebar_width
+                        };
+                        self.sidebar_width = current.saturating_sub(4).clamp(24, 56);
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
             match key.code {
                 KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.panel = UiPanel::Help;
@@ -388,25 +675,18 @@ impl UiState {
                 }
                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if self.panel == UiPanel::RunDeck {
+                        self.last_sidebar_panel = Some(UiPanel::RunDeck);
+                        self.panel = UiPanel::Transcript;
                         self.rundeck_open = false;
-                        UiPanel::Transcript
+                        self.transcript_focused = false;
                     } else {
-                        self.rundeck_open = true;
-                        UiPanel::RunDeck
-                    };
-                    self.panel = if self.panel == UiPanel::RunDeck {
-                        UiPanel::Transcript
-                    } else {
-                        UiPanel::RunDeck
-                    };
+                        self.show_sidebar_panel(UiPanel::RunDeck);
+                    }
                     return None;
                 }
                 _ => {}
             }
             return self.handle_panel_key(key);
-        }
-        if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
-            self.transcript_focused = false;
         }
         if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
             let _ = self.draft.handle_key(key);
@@ -466,21 +746,23 @@ impl UiState {
                 return None;
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.rundeck_open = !self.rundeck_open;
-                self.panel = if self.rundeck_open {
-                    UiPanel::RunDeck
+                if self.panel == UiPanel::RunDeck || self.rundeck_open {
+                    self.last_sidebar_panel = Some(UiPanel::RunDeck);
+                    self.panel = UiPanel::Transcript;
+                    self.rundeck_open = false;
                 } else {
-                    UiPanel::Transcript
-                };
+                    self.show_sidebar_panel(UiPanel::RunDeck);
+                }
                 return None;
             }
             KeyCode::Char('\u{4}') => {
-                self.rundeck_open = !self.rundeck_open;
-                self.panel = if self.rundeck_open {
-                    UiPanel::RunDeck
+                if self.panel == UiPanel::RunDeck || self.rundeck_open {
+                    self.last_sidebar_panel = Some(UiPanel::RunDeck);
+                    self.panel = UiPanel::Transcript;
+                    self.rundeck_open = false;
                 } else {
-                    UiPanel::Transcript
-                };
+                    self.show_sidebar_panel(UiPanel::RunDeck);
+                }
                 return None;
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -625,10 +907,10 @@ impl UiState {
 
     fn handle_panel_key(&mut self, key: KeyEvent) -> Option<UiCommand> {
         if key.code == KeyCode::Esc {
-            if self.panel == UiPanel::RunDeck {
-                self.rundeck_open = false;
-            }
+            self.last_sidebar_panel = Some(self.panel);
             self.panel = UiPanel::Transcript;
+            self.rundeck_open = false;
+            self.transcript_focused = false;
             self.creating_session = false;
             self.renaming_session = None;
             return None;
@@ -1167,10 +1449,33 @@ pub async fn run_with_transport<T: RigaTransport>(
         if event::poll(Duration::from_millis(60)).map_err(|error| error.to_string())? {
             match event::read().map_err(|error| error.to_string())? {
                 Event::Mouse(mouse) => {
-                    let height = terminal.size().map_err(|error| error.to_string())?.height;
-                    app.handle_mouse(mouse, height);
+                    let size = terminal.size().map_err(|error| error.to_string())?;
+                    app.handle_mouse(mouse, size.width, size.height);
+                }
+                Event::Paste(text) => {
+                    app.handle_paste(&text);
                 }
                 Event::Key(key) => {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && app.selection_anchor.is_some()
+                    {
+                        let size = terminal.size().map_err(|error| error.to_string())?;
+                        let text =
+                            crate::ui::selected_transcript_text(&app, size.width, size.height);
+                        if text.is_empty() {
+                            app.notice = Some("No transcript rows selected.".into());
+                        } else if let Err(error) = terminal.copy_to_clipboard(&text) {
+                            app.notice = Some(format!("Clipboard copy failed: {error}"));
+                        } else {
+                            app.notice = Some(format!(
+                                "Copied {} characters to the terminal clipboard.",
+                                text.chars().count()
+                            ));
+                        }
+                        app.clear_selection();
+                        continue;
+                    }
                     let Some(command) = app.handle_key(key) else {
                         continue;
                     };
@@ -1320,6 +1625,16 @@ pub async fn run_with_transport<T: RigaTransport>(
                                     result,
                                 });
                             });
+                        }
+                        UiCommand::SendShellInput { call_id, text } => {
+                            app.shell_input.clear();
+                            if riga_server::catalog::send_interactive_shell_input(&call_id, text) {
+                                app.notice = Some("Input sent to the active shell command.".into());
+                            } else {
+                                app.notice =
+                                    Some("The shell command is no longer accepting input.".into());
+                                app.shell_input_mode = false;
+                            }
                         }
                         UiCommand::UploadAttachment { path } => {
                             let file_name = std::path::Path::new(&path)
@@ -1582,6 +1897,39 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_o_sends_newline_terminated_input_to_active_shell_call() {
+        let mut app = UiState::default();
+        app.draft.replace("keep this chat draft");
+        app.state.select_run(Some("run-1".into()));
+        app.apply_event(RigaEventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            event_id: "tool-call".into(),
+            session_id: "session-1".into(),
+            run_id: "run-1".into(),
+            sequence: 1,
+            timestamp: "now".into(),
+            event: RigaEvent::ToolCallStarted {
+                call: serde_json::json!({"call_id": "shell-1", "tool": "bash"}),
+            },
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(app.shell_input_mode);
+        for character in "npm install".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(UiCommand::SendShellInput {
+                call_id: "shell-1".into(),
+                text: "npm install\n".into(),
+            })
+        );
+        assert_eq!(app.draft.text(), "keep this chat draft");
+    }
+
+    #[test]
     fn focused_transcript_up_down_controls_follow_offset() {
         let mut app = UiState {
             transcript_focused: true,
@@ -1593,6 +1941,75 @@ mod tests {
         assert_eq!(app.transcript_scroll, 1);
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.transcript_scroll, 0);
+    }
+
+    #[test]
+    fn tab_focus_preserves_the_selected_sidebar_panel_and_rundeck_toggle() {
+        let mut app = UiState::default();
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.panel, UiPanel::RunDeck);
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::Transcript);
+        assert_eq!(app.last_sidebar_panel, Some(UiPanel::RunDeck));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::RunDeck);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::Transcript);
+        assert_eq!(app.last_sidebar_panel, Some(UiPanel::RunDeck));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(app.panel, UiPanel::RunDeck);
+    }
+
+    #[test]
+    fn focused_sidebar_can_be_resized_with_plus_and_minus() {
+        let mut app = UiState {
+            panel: UiPanel::History,
+            ..UiState::default()
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(app.sidebar_width, 38);
+        app.handle_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        assert_eq!(app.sidebar_width, 34);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(app.draft.text(), "+");
+    }
+
+    #[test]
+    fn mouse_selects_sidebar_tabs_and_returns_focus_to_the_composer() {
+        let mut app = UiState::default();
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 90,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            120,
+            40,
+        );
+        assert_eq!(app.panel, UiPanel::Help);
+        app.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 38,
+                modifiers: KeyModifiers::NONE,
+            },
+            120,
+            40,
+        );
+        assert_eq!(app.panel, UiPanel::Transcript);
+        assert_eq!(app.last_sidebar_panel, Some(UiPanel::Help));
+    }
+
+    #[test]
+    fn bracketed_paste_inserts_text_at_the_current_composer_cursor() {
+        let mut app = UiState::default();
+        app.draft.replace("ab");
+        app.draft.move_left();
+        app.handle_paste("你\ncd");
+        assert_eq!(app.draft.text(), "a你\ncdb");
     }
 
     #[test]
@@ -1643,8 +2060,13 @@ mod tests {
         assert!(app.rundeck_open);
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(!app.rundeck_open);
-        app.panel = UiPanel::RunDeck;
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::Transcript);
+        assert_eq!(app.last_sidebar_panel, Some(UiPanel::RunDeck));
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::RunDeck);
+        app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.deck_lens, DeckLens::Evidence);
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),

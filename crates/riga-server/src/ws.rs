@@ -2166,6 +2166,7 @@ async fn execute_streaming_bash(
     let mut execution = Box::pin(crate::catalog::execute_bash_streaming(
         workspace_root,
         command,
+        output_stream.call_id.clone(),
         output_sender,
     ));
     let mut output_open = true;

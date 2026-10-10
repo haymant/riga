@@ -1,12 +1,31 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Mutex, OnceLock},
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncReadExt, process::Command, sync::mpsc};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    sync::mpsc,
+};
+
+static INTERACTIVE_SHELL_INPUTS: OnceLock<Mutex<HashMap<String, mpsc::UnboundedSender<String>>>> =
+    OnceLock::new();
+
+/// Send one line of terminal input to the currently running streamed shell tool.
+/// The CLI exposes this only after the user explicitly enters shell-input mode.
+pub fn send_interactive_shell_input(call_id: &str, text: String) -> bool {
+    INTERACTIVE_SHELL_INPUTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|inputs| inputs.get(call_id).cloned())
+        .is_some_and(|sender| sender.send(text).is_ok())
+}
 
 /// Directories that never hold agent-relevant source and would otherwise swamp
 /// a result: dependency trees, build output, VCS internals, and the per-session
@@ -652,31 +671,36 @@ pub async fn execute_write(root: &Path, path: &str, content: &str) -> Result<Str
 
 pub async fn execute_bash(root: &Path, command: &str) -> Result<String, String> {
     // Authorization is the caller's job; see `execute_write`.
-    execute_bash_inner(root, command, None).await
+    execute_bash_inner(root, command, None, None).await
 }
 
 pub async fn execute_bash_streaming(
     root: &Path,
     command: &str,
+    call_id: String,
     output_sender: mpsc::Sender<String>,
 ) -> Result<String, String> {
-    execute_bash_inner(root, command, Some(output_sender)).await
+    execute_bash_inner(root, command, Some(output_sender), Some(call_id)).await
 }
 
 async fn execute_bash_inner(
     root: &Path,
     command: &str,
     output_sender: Option<mpsc::Sender<String>>,
+    interactive_call_id: Option<String>,
 ) -> Result<String, String> {
-    let mut child = Command::new("bash")
+    let mut command_builder = Command::new("bash");
+    command_builder
         .arg("-lc")
         .arg(command)
         .current_dir(root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| e.to_string())?;
+        .kill_on_drop(true);
+    if interactive_call_id.is_some() {
+        command_builder.stdin(Stdio::piped());
+    }
+    let mut child = command_builder.spawn().map_err(|e| e.to_string())?;
     let mut stdout = child
         .stdout
         .take()
@@ -685,6 +709,16 @@ async fn execute_bash_inner(
         .stderr
         .take()
         .ok_or("failed to capture shell stderr")?;
+    let mut child_stdin = child.stdin.take();
+    let (input_sender, mut input_receiver) = mpsc::unbounded_channel();
+    let mut input_open = interactive_call_id.is_some();
+    if let Some(call_id) = &interactive_call_id {
+        INTERACTIVE_SHELL_INPUTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .map_err(|error| error.to_string())?
+            .insert(call_id.clone(), input_sender);
+    }
     let mut stdout_open = true;
     let mut stderr_open = true;
     let mut stdout_buffer = [0_u8; 1_024];
@@ -709,7 +743,26 @@ async fn execute_bash_inner(
                     append_shell_output(&mut output, &stderr_buffer[..bytes_read], output_sender.as_ref()).await?;
                 }
             }
+            input = input_receiver.recv(), if input_open => {
+                match input {
+                    Some(text) => {
+                        if let Some(stdin) = child_stdin.as_mut()
+                            && stdin.write_all(text.as_bytes()).await.is_err()
+                        {
+                            child_stdin = None;
+                            input_open = false;
+                        }
+                    }
+                    None => input_open = false,
+                }
+            }
         }
+    }
+    if let Some(call_id) = &interactive_call_id
+        && let Some(inputs) = INTERACTIVE_SHELL_INPUTS.get()
+        && let Ok(mut inputs) = inputs.lock()
+    {
+        inputs.remove(call_id);
     }
     let status = child.wait().await.map_err(|e| e.to_string())?;
     if status.success() {
@@ -942,6 +995,7 @@ mod tests {
             Path::new("."),
             "printf stdout; printf stderr >&2",
             Some(sender),
+            None,
         )
         .await
         .expect("command should succeed");

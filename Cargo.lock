@@ -2540,6 +2540,7 @@ dependencies = [
 name = "riga-cli"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "clap",
  "crossterm 0.29.0",
  "pulldown-cmark",
