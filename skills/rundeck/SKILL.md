@@ -1,6 +1,6 @@
 ---
 name: rundeck
-description: Orchestrate RIGA subagents with RunDeck graphs, dependencies, live-status interpretation, active-run recovery, cancellation controls, and concise profile-specific prompts. Use when coordinating explore, plan, build, or review agents; checking running/ready/blocked work; recovering a stale local run; or designing a multi-stage repository task.
+description: Orchestrate RIGA subagents with RunDeck graphs, dependencies, live-status interpretation, active-run recovery, cancellation controls, evidence and knowledge lenses, and concise profile-specific prompts. Use when coordinating explore, plan, build, or review agents; checking running/ready/blocked work; reading the Evidence or Knowledge lens; recovering a stale or looping local run; or designing a multi-stage repository task.
 ---
 
 # RunDeck orchestration
@@ -15,6 +15,8 @@ Use this skill for live subagent coordination. Keep durable task bookkeeping sep
 - `build` may write files, run commands, and dispatch children when its profile permits it.
 - RunDeck is the in-product live execution view; durable `task` records are cross-run bookkeeping.
 - A second top-level run cannot start while a local run is active. Stop or wait for the current run first.
+- The harness records every tool and subagent outcome as **evidence**, and summarises each run into **knowledge** — you do not need to call `add_evidence`/`remember` for those lenses to fill.
+- Prior lessons from the session are injected into your prompt as a `[Prior knowledge …]` block; treat them as facts and apply them instead of relearning them.
 
 ## Parent-coordinated workflow
 
@@ -82,6 +84,36 @@ The RunDeck UI exposes **Active runs** after connecting or reconnecting. Expand 
 For `local_run_in_progress`, do not start another run. Open RunDeck, inspect the active run, then stop it or wait for completion. If the deck is collapsed, click its RunDeck summary in the composer footer.
 
 A live task is not the same as a durable task record. Durable actions (`create`, `inspect`, `update`, `list`) do not start a worker and require configured secure persistence. If unavailable, use `update_plan` and `update_todos` for run-local progress.
+
+## Evidence and knowledge (automatic)
+
+You do not record anything for the **Evidence** and **Knowledge** lenses to work —
+the harness derives them from what actually ran.
+
+- **Evidence** (`EvidenceAdded`): every tool and subagent outcome is logged. The
+  lens surfaces failures, successful mutating calls (`write`/`bash`/`edit`), and
+  subagent tasks. Each card reads `actor succeeded|failed: first-line summary`,
+  with a `source_ref` (`actor:task-…`) and a confidence (85 success / 60 failure).
+  Reads and globs are logged for the run summary but not surfaced, so the lens
+  keeps its signal.
+- **Knowledge** (`KnowledgeCreated`): at run end the outcomes are summarised into
+  lessons — repeated failures, individual failures, and what each subagent
+  achieved. The lens shows them with their source run.
+- **Retry context**: lessons persist per session and are prepended to the next
+  run's prompt:
+
+  ```text
+  [Prior knowledge for this session — lessons from earlier runs. Apply them; do not relearn them.]
+  - `bash` failed 2× in a row (latest: …). Do not repeat an identical call — vary the approach or report what you have.
+  [End prior knowledge]
+  ```
+
+  When you see this block, **act on it**: avoid the approach a lesson says failed,
+  prefer the one it says worked, and do not spend tools re-deriving it.
+
+`add_evidence` and `remember` still exist for facts the harness cannot infer — a
+claim with a `source_ref` you chose, or a durable fact. Use them *in addition to*
+the automatic evidence, not instead of doing the work.
 
 ## Profile boundaries
 
@@ -188,10 +220,36 @@ re-dispatch the same way:
   if it repeats use a smaller prompt or a smaller model.
 - **`reached the N-turn budget` / `exceeded the N-token budget`** — enlarge the
   budget (`{"enlarge": true}`) or split the task into more graph nodes.
+- **`the local model repeated the same tool set … N turns in a row`** — you are
+  re-dispatching the same shape of work. Change the **plan**, not just the
+  arguments: dispatch a different profile, narrow the prompt, or answer.
+- **`the local model called … N times in this run without finishing`** — one tool
+  is looping with *varying* arguments (a fresh `find`, `bash`, `read`, …). Stop
+  retrying it; use a different tool or a narrower request.
+- **`the local model repeated the same … call N times without finishing`** — that
+  exact call already ran and its result is in the history. Use that result.
+- **`the local model called … N times in a row and each attempt failed`** — the
+  call cannot succeed as written. Fix the input or switch tools.
+- **`the local model made more than 16 tool calls without finishing`** — the run
+  is too broad; split it into graph nodes.
 - **`` `bash` is not available to this agent ``** — the profile lacks the tool;
   `grant_tools` it (with approval) instead of re-dispatching the same way.
 - **`task node is blocked by incomplete dependencies`** — dispatch the
   dependencies first; do not force the node.
+
+### Loop guards (the harness stops these)
+
+| Guard | Limit | What it means |
+|---|---|---|
+| Identical call | 2 repeats | that exact call already ran; use its result |
+| Same tool, varying args | 6 calls | one tool is looping; switch approach |
+| Same tool set per turn | 3 turns | you keep re-dispatching the same shape |
+| Consecutive failures | 3 | the call cannot succeed as written |
+| Whole run | 16 calls | the run is too broad; split it |
+| Turn budget | tier | enlarge or split the task |
+
+Each guard ends the run with a message naming the pattern, and the outcome is
+recorded as evidence, so the next attempt starts with the lesson.
 
 After a failure, `update_todos` the retry so the RunDeck shows the recovery.
 
@@ -201,6 +259,10 @@ After a failure, `update_todos` the retry so the RunDeck shows the recovery.
 - Dispatch only ready nodes.
 - Pass completed findings into dependent prompts.
 - Check RunDeck for task ID, state, nested tool events, and result summary.
+- Read the **Evidence** lens for what actually ran, and the **Knowledge** lens for
+  the lessons before re-dispatching.
+- On a retry, apply the `[Prior knowledge …]` block instead of repeating the
+  approach a lesson says failed.
 - Use Active runs to recover a run after reconnect or stale UI state.
 - Use Stop on the specific run rather than starting a competing local run.
 - Never place API keys, provider secrets, uploaded attachments, or generated model files in prompts or documentation.
