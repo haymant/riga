@@ -1010,6 +1010,44 @@ mod tests {
         assert!(chunks.iter().any(|chunk| chunk.contains("stderr")));
     }
 
+    #[tokio::test]
+    async fn interactive_shell_input_reaches_process_and_registry_is_cleaned() {
+        let call_id = "catalog-test-interactive-shell".to_owned();
+        let task_call_id = call_id.clone();
+        let (sender, mut receiver) = mpsc::channel(8);
+        let execution = tokio::spawn(async move {
+            super::execute_bash_streaming(
+                Path::new("."),
+                r#"read -r answer; printf 'answer=%s\n' "$answer""#,
+                task_call_id,
+                sender,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if super::send_interactive_shell_input(&call_id, "yes\n".into()) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("interactive shell listener should register");
+
+        let output = execution
+            .await
+            .expect("shell task should not panic")
+            .expect("shell process should succeed");
+        assert!(output.contains("answer=yes"));
+        while receiver.try_recv().is_ok() {}
+        assert!(!super::send_interactive_shell_input(
+            &call_id,
+            "late\n".into()
+        ));
+    }
+
     #[test]
     fn shell_output_is_capped_at_the_protocol_limit() {
         let mut output = "x".repeat(19_999);
