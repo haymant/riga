@@ -25,7 +25,7 @@ capabilities, kept separate from the evolving build plans above.
 - `EVIDENCE.md` — the automatic record of what ran, and the Evidence lens.
 - `KNOWLEDGE.md` — the reusable lessons a run leaves, and their injection into
   the next run.
-- `RUNSHELL.md` — the workspace, the run lifecycle, the local tool loop and its
-  guards, reasoning, budget/context, and the native shell helpers.
+- `RUNDECK.md` — the command center: the panel above the composer, its lenses
+  (execution, evidence, knowledge), the subagent queue, and the task graph.
 
 Each doc ends with **potential future work ordered by least ROI**.
