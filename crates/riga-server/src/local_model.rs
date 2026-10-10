@@ -297,6 +297,10 @@ const CATALOG: &[CuratedModel] = &[
         sha256: "fbe1d5edd4ce802ae3ae7c7e4ab7d09789d697fdac1fc7929f8df4ca3c41bae3",
         max_context: 32_768,
         license_url: "https://huggingface.co/Qwen/Qwen3-4B",
+        reasoning: Some(ReasoningTags {
+            open: "\u{3c}think\u{3e}",
+            close: "\u{3c}/think\u{3e}",
+        }),
     },
     CuratedModel {
         id: "qwen2.5-coder-7b-instruct",
@@ -307,6 +311,7 @@ const CATALOG: &[CuratedModel] = &[
         sha256: "1664fccab734674a50763490a8c6931b70e3f2f8ec10031b54806d30e5f956b6",
         max_context: 32_768,
         license_url: "https://huggingface.co/Qwen/Qwen2.5-Coder-7B-Instruct",
+        reasoning: None,
     },
     CuratedModel {
         id: "phi-4-mini-instruct",
@@ -317,6 +322,7 @@ const CATALOG: &[CuratedModel] = &[
         sha256: "01999f17c39cc3074afae5e9c539bc82d45f2dd7faa3917c66cbef76fce8c0c2",
         max_context: 131_072,
         license_url: "https://huggingface.co/microsoft/Phi-4-mini-instruct",
+        reasoning: None,
     },
     CuratedModel {
         id: "hermes-3-llama-3.1-8b",
@@ -327,6 +333,7 @@ const CATALOG: &[CuratedModel] = &[
         sha256: "44b5c529dffaf34657a4c44a7919e5958b4270fbd365eed3b87d3444b45a378a",
         max_context: 131_072,
         license_url: "https://huggingface.co/NousResearch/Hermes-3-Llama-3.1-8B",
+        reasoning: None,
     },
 ];
 
@@ -344,6 +351,134 @@ struct CuratedModel {
     /// and the GGUF is what llama.cpp reads.
     max_context: u32,
     license_url: &'static str,
+    /// Explicit reasoning dialect, when the template alone is not enough. `None`
+    /// means "read it from the chat template" (see `ReasoningFormat`).
+    reasoning: Option<ReasoningTags>,
+}
+
+/// How a model surfaces its reasoning.
+///
+/// Resolved once per loaded model so neither the streamer nor the final-answer
+/// stripper hard-codes one model's tags. `open`/`close` empty means the model has
+/// no reasoning channel and no block is shown. A curated entry can declare the
+/// tags explicitly (its `reasoning` field); otherwise they are read from the chat
+/// template, so a manually copied GGUF whose template reveals its dialect works
+/// with no code change.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReasoningFormat {
+    /// Tag the model emits to open a reasoning block, e.g. ` thinking`.
+    pub open: String,
+    /// Tag that closes it, e.g. ``.
+    pub close: String,
+}
+
+/// Tag pairs the loader recognises in a chat template, most specific first.
+const REASONING_DIALECTS: &[(&str, &str)] = &[
+    ("\u{3c}think\u{3e}", "\u{3c}/think\u{3e}"),
+    ("\u{3c}thinking\u{3e}", "\u{3c}/thinking\u{3e}"),
+    ("\u{3c}reasoning\u{3e}", "\u{3c}/reasoning\u{3e}"),
+    ("[THINK]", "[/THINK]"),
+];
+
+impl ReasoningFormat {
+    /// A model with no reasoning channel: nothing is shown and nothing stripped.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// The Qwen3/DeepSeek-style ` thinking…` dialect.
+    pub fn think() -> Self {
+        Self {
+            open: "\u{3c}think\u{3e}".to_string(),
+            close: "\u{3c}/think\u{3e}".to_string(),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.open.is_empty() && !self.close.is_empty()
+    }
+
+    /// Read the dialect from a chat template. The template is the source of truth
+    /// for a model we have not curated: if it names a known tag pair, the model
+    /// speaks that dialect.
+    pub fn detect_from_template(template: &str) -> Self {
+        for (open, close) in REASONING_DIALECTS {
+            if template.contains(open) && template.contains(close) {
+                return Self {
+                    open: (*open).to_string(),
+                    close: (*close).to_string(),
+                };
+            }
+        }
+        Self::none()
+    }
+
+    /// Whether the formatted prompt already opened the block, so the model's
+    /// first tokens are reasoning with no opening tag of its own.
+    pub fn opens_in_prompt(&self, prompt: &str) -> bool {
+        self.enabled() && prompt.trim_end().ends_with(self.open.as_str())
+    }
+
+    /// Remove every reasoning block from a reply. An unterminated block (a turn
+    /// cut off mid-thought) drops the tail rather than leaking half of it.
+    pub fn strip(&self, text: &str) -> String {
+        if !self.enabled() {
+            return text.trim().to_owned();
+        }
+        let (open, close) = (self.open.as_str(), self.close.as_str());
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        // A template-opened block carries no opening tag in the generated text:
+        // the reply starts inside the block, so the first marker is the close tag.
+        if let Some(end) = rest.find(close)
+            && rest.find(open).is_none_or(|open_at| end < open_at)
+        {
+            rest = &rest[end + close.len()..];
+        }
+        while let Some(start) = rest.find(open) {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + open.len()..];
+            match after.find(close) {
+                Some(end) => rest = &after[end + close.len()..],
+                None => return out.trim().to_owned(),
+            }
+        }
+        out.push_str(rest);
+        out.trim().to_owned()
+    }
+}
+
+/// A curated model's explicit reasoning dialect, when the template alone is not
+/// enough to describe it.
+#[derive(Clone, Copy)]
+struct ReasoningTags {
+    open: &'static str,
+    close: &'static str,
+}
+
+impl ReasoningTags {
+    fn to_format(self) -> ReasoningFormat {
+        ReasoningFormat {
+            open: self.open.to_string(),
+            close: self.close.to_string(),
+        }
+    }
+}
+
+/// Apply a `RIGA_LOCAL_REASONING` override (`auto`, `on`, `off`) to the detected
+/// dialect, so the display can be forced on or off without a rebuild.
+fn parse_reasoning_override(value: Option<&str>, detected: ReasoningFormat) -> ReasoningFormat {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("off" | "none" | "0" | "false") => ReasoningFormat::none(),
+        Some("on" | "think" | "1" | "true") => {
+            if detected.enabled() {
+                detected
+            } else {
+                ReasoningFormat::think()
+            }
+        }
+        _ => detected,
+    }
 }
 
 /// Resolve the context window to actually use.
@@ -431,6 +566,8 @@ struct LoadedModel {
     /// The resolved window: the model's own maximum, capped by MAX_CONTEXT.
     /// Resolved once at load time so inference does not repeat the clamping.
     context_size: u32,
+    /// How this model tags reasoning, resolved once at load time.
+    reasoning: ReasoningFormat,
 }
 
 #[derive(Default)]
@@ -444,6 +581,9 @@ pub struct LocalModelRuntime {
     /// decode, and status checks run on async workers; locking there could park
     /// one worker per check behind a running model.
     loaded_name: Arc<Mutex<Option<String>>>,
+    /// The loaded model's reasoning dialect, mirrored like `loaded_name` so the
+    /// UI can read it without locking `engine` behind a running generation.
+    loaded_reasoning: Arc<Mutex<ReasoningFormat>>,
     downloads: Arc<Mutex<HashMap<String, CancellationToken>>>,
     generations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// Broadcast sink for download progress and terminal download state.
@@ -548,6 +688,15 @@ impl LocalModelRuntime {
 
     pub fn loaded_file_name(&self) -> Option<String> {
         self.loaded_name.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    /// How the loaded model tags reasoning. Mirrored at load time so callers can
+    /// read it without locking `engine`, which a running generation holds.
+    pub fn reasoning_format(&self) -> ReasoningFormat {
+        self.loaded_reasoning
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|_| ReasoningFormat::none())
     }
 
     /// Whether `model_id` names a curated entry, and whether it is already
@@ -804,6 +953,7 @@ impl LocalModelRuntime {
         };
         let engine = self.engine.clone();
         let loaded_name = self.loaded_name.clone();
+        let loaded_reasoning = self.loaded_reasoning.clone();
         tokio::task::spawn_blocking(move || {
             let file_name = model_path
                 .file_name()
@@ -887,16 +1037,43 @@ impl LocalModelRuntime {
                 trained = model.n_ctx_train(),
                 "local model loaded"
             );
+            // Resolve the reasoning dialect: a curated override wins, else read
+            // the tags out of the model's own chat template, else none. A
+            // `RIGA_LOCAL_REASONING` env value then forces it on or off.
+            let template = model
+                .chat_template(None)
+                .ok()
+                .and_then(|template| template.to_str().ok().map(str::to_owned));
+            let detected = curated
+                .and_then(|entry| entry.reasoning)
+                .map(ReasoningTags::to_format)
+                .unwrap_or_else(|| {
+                    ReasoningFormat::detect_from_template(template.as_deref().unwrap_or_default())
+                });
+            let reasoning = parse_reasoning_override(
+                std::env::var("RIGA_LOCAL_REASONING").ok().as_deref(),
+                detected,
+            );
+            tracing::info!(
+                model = %file_name,
+                reasoning = reasoning.enabled(),
+                open = %reasoning.open,
+                "local model reasoning dialect resolved"
+            );
             let loaded = LoadedModel {
                 model,
                 backend,
                 context_size,
+                reasoning: reasoning.clone(),
             };
             *engine
                 .lock()
                 .map_err(|_| "Model engine state is unavailable")? = Some(loaded);
             if let Ok(mut guard) = loaded_name.lock() {
                 *guard = Some(file_name);
+            }
+            if let Ok(mut guard) = loaded_reasoning.lock() {
+                *guard = reasoning;
             }
             Ok::<(), String>(())
         })
@@ -912,6 +1089,9 @@ impl LocalModelRuntime {
             .map_err(|_| "Model engine state is unavailable")? = None;
         if let Ok(mut guard) = self.loaded_name.lock() {
             *guard = None;
+        }
+        if let Ok(mut guard) = self.loaded_reasoning.lock() {
+            *guard = ReasoningFormat::none();
         }
         Ok(())
     }
@@ -1029,13 +1209,10 @@ impl LocalModelRuntime {
                 None => break (prompt, tokens),
             }
         };
-        // A template that ends with ` thinking` has already opened the reasoning
-        // block; the model's first tokens are the reasoning itself. Written as an
-        // escape: literal angle-bracket tags get mangled by tooling.
-        reasoning_expected.store(
-            prompt.trim_end().ends_with("\u{3c}think\u{3e}"),
-            Ordering::Relaxed,
-        );
+        // A template that opened the block leaves the model's first tokens as the
+        // reasoning itself, with no opening tag of its own. `loaded.reasoning` is
+        // the dialect resolved at load time, so this is model-agnostic.
+        reasoning_expected.store(loaded.reasoning.opens_in_prompt(&prompt), Ordering::Relaxed);
         let max_tokens = resolve_max_tokens(max_tokens, tokens.len() as u32, context_size)?;
         // Bound the decode batch independently of the context window. n_batch /
         // n_ubatch drive compute-buffer sizing, so tying them to n_ctx would turn
@@ -1283,10 +1460,46 @@ fn _now_epoch() -> u64 {
 mod tests {
     use super::{
         CATALOG, Capability, DEFAULT_CONTEXT, LocalBudget, LocalModelRuntime, MAX_BUDGET_TOKENS,
-        MAX_CONTEXT, MAX_DECODE_BATCH, MAX_TURNS, MIN_CONTEXT, accelerator_label,
-        context_params_with, parse_context_override, requested_context, resolve_context,
-        resolve_max_tokens,
+        MAX_CONTEXT, MAX_DECODE_BATCH, MAX_TURNS, MIN_CONTEXT, ReasoningFormat, accelerator_label,
+        context_params_with, parse_context_override, parse_reasoning_override, requested_context,
+        resolve_context, resolve_max_tokens,
     };
+
+    #[test]
+    fn reasoning_format_detects_dialects_from_the_template() {
+        // A template that names the tags (Qwen3) resolves to that dialect, so a
+        // manually copied GGUF works without a code change.
+        assert_eq!(
+            ReasoningFormat::detect_from_template("...\u{3c}think\u{3e}...\u{3c}/think\u{3e}..."),
+            ReasoningFormat::think()
+        );
+        // A template with no reasoning tags means the model has no channel.
+        assert!(!ReasoningFormat::detect_from_template("<|im_start|>assistant\n").enabled());
+    }
+
+    #[test]
+    fn reasoning_format_strips_only_its_own_dialect() {
+        let think = ReasoningFormat::think();
+        assert_eq!(
+            think.strip("\u{3c}think\u{3e}\nwhy\n\u{3c}/think\u{3e}\nanswer"),
+            "answer"
+        );
+        // A model with no reasoning channel strips nothing.
+        assert_eq!(
+            ReasoningFormat::none().strip("\u{3c}think\u{3e}\nanswer"),
+            "\u{3c}think\u{3e}\nanswer"
+        );
+    }
+
+    #[test]
+    fn reasoning_override_forces_the_dialect_on_or_off() {
+        assert!(!parse_reasoning_override(Some("off"), ReasoningFormat::think()).enabled());
+        assert!(parse_reasoning_override(Some("on"), ReasoningFormat::none()).enabled());
+        assert_eq!(
+            parse_reasoning_override(Some("auto"), ReasoningFormat::think()),
+            ReasoningFormat::think()
+        );
+    }
 
     #[test]
     fn context_defaults_to_the_safe_window_unless_overridden() {

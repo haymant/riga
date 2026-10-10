@@ -219,8 +219,13 @@ struct LocalDeltaStream {
     /// `None` until the turn's shape is known; `Some(true)` prose, `Some(false)`
     /// a tool call.
     decided: Option<bool>,
-    /// True while inside a ` thinking…` block, whose text streams as reasoning.
+    /// True while inside a reasoning block, whose text streams as reasoning.
     in_reasoning: bool,
+    /// False until the first non-empty reasoning chunk is emitted, so the leading
+    /// whitespace after the opening tag is dropped once.
+    reasoning_started: bool,
+    /// How the loaded model tags reasoning, resolved per model at load time.
+    format: crate::local_model::ReasoningFormat,
     /// Set by `generate` once the prompt is formatted. Read on the first token:
     /// a template that opened the reasoning block means the output starts with
     /// the reasoning and carries no opening tag of its own.
@@ -231,14 +236,11 @@ struct LocalDeltaStream {
 
 impl LocalDeltaStream {
     const MARKER: &'static str = "<tool_call>";
-    /// Qwen3-style reasoning block; streamed as reasoning, not reply text.
-    // `<` and `>` written as escapes: the literal tag is stripped by tooling.
-    const REASONING_OPEN: &'static str = "\u{3c}think\u{3e}";
-    const REASONING_CLOSE: &'static str = "\u{3c}/think\u{3e}";
 
     fn new(
         sender: mpsc::Sender<ToolTraceEvent>,
         streamed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        format: crate::local_model::ReasoningFormat,
         reasoning_expected: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
@@ -246,6 +248,8 @@ impl LocalDeltaStream {
             pending: String::new(),
             decided: None,
             in_reasoning: false,
+            reasoning_started: false,
+            format,
             reasoning_expected,
             reasoning_checked: false,
             streamed,
@@ -255,9 +259,10 @@ impl LocalDeltaStream {
     fn push(&mut self, delta: &str) {
         if !self.reasoning_checked {
             self.reasoning_checked = true;
-            if self
-                .reasoning_expected
-                .load(std::sync::atomic::Ordering::Relaxed)
+            if self.format.enabled()
+                && self
+                    .reasoning_expected
+                    .load(std::sync::atomic::Ordering::Relaxed)
             {
                 self.in_reasoning = true;
             }
@@ -270,25 +275,32 @@ impl LocalDeltaStream {
             return;
         }
         self.pending.push_str(delta);
+        // Cloned so the borrow of `self.pending` below does not conflict with
+        // `self.emit_*`; the tags are tiny.
+        let open = self.format.open.clone();
+        let close = self.format.close.clone();
         loop {
             if self.in_reasoning {
+                // Leading whitespace after the opening tag is not part of the
+                // reasoning; drop it before the first chunk is emitted.
+                if !self.reasoning_started {
+                    self.pending = self.pending.trim_start().to_owned();
+                }
                 // A reasoning model may repeat the opening tag the template
                 // already added; drop it from the reasoning text.
                 let start = self.pending.len() - self.pending.trim_start().len();
-                if self.pending[start..].starts_with(Self::REASONING_OPEN) {
-                    self.pending = self.pending[start + Self::REASONING_OPEN.len()..]
-                        .trim_start()
-                        .to_owned();
+                if self.pending[start..].starts_with(open.as_str()) {
+                    self.pending = self.pending[start + open.len()..].trim_start().to_owned();
                 }
-                if let Some(end) = self.pending.find(Self::REASONING_CLOSE) {
+                if let Some(end) = self.pending.find(close.as_str()) {
                     let reasoning = self.pending[..end].to_owned();
                     self.emit_reasoning(&reasoning);
-                    self.pending = self.pending[end + Self::REASONING_CLOSE.len()..].to_owned();
+                    self.pending = self.pending[end + close.len()..].to_owned();
                     self.in_reasoning = false;
                 } else {
                     // Stream reasoning as it arrives, holding back a short tail that
                     // may be the start of the closing tag. Snap to a char boundary.
-                    let keep = Self::REASONING_CLOSE.len();
+                    let keep = close.len();
                     if self.pending.len() > keep {
                         let split = (0..=self.pending.len() - keep)
                             .rev()
@@ -302,8 +314,8 @@ impl LocalDeltaStream {
                 }
             } else {
                 let start = self.pending.len() - self.pending.trim_start().len();
-                if self.pending[start..].starts_with(Self::REASONING_OPEN) {
-                    self.pending = self.pending[start + Self::REASONING_OPEN.len()..].to_owned();
+                if !open.is_empty() && self.pending[start..].starts_with(open.as_str()) {
+                    self.pending = self.pending[start + open.len()..].trim_start().to_owned();
                     self.in_reasoning = true;
                     continue;
                 }
@@ -313,12 +325,17 @@ impl LocalDeltaStream {
                     self.pending.clear();
                     return;
                 }
-                if trimmed.len() >= Self::MARKER.len() || !Self::MARKER.starts_with(trimmed) {
-                    self.decided = Some(true);
-                    let buffered = std::mem::take(&mut self.pending);
-                    self.emit_text(&buffered);
+                // Wait while the buffered text could still become the tool-call
+                // marker or the opening reasoning tag; a partial tag (`<`, `<th`,
+                // …) must not be mistaken for prose.
+                let could_be_marker = Self::MARKER.starts_with(trimmed);
+                let could_be_open = !open.is_empty() && open.starts_with(trimmed);
+                if could_be_marker || could_be_open {
                     return;
                 }
+                self.decided = Some(true);
+                let buffered = std::mem::take(&mut self.pending);
+                self.emit_text(&buffered);
                 return;
             }
         }
@@ -355,6 +372,7 @@ impl LocalDeltaStream {
         if delta.is_empty() {
             return;
         }
+        self.reasoning_started = true;
         let _ = self.sender.blocking_send(ToolTraceEvent::Ui(
             riga_kernel::events::RigaEvent::ReasoningDelta {
                 delta: delta.to_owned(),
@@ -3035,35 +3053,11 @@ struct ParsedToolCall {
     arguments: serde_json::Value,
 }
 
-/// Remove Qwen3-style ` thinking…</think>` reasoning from a reply.
-///
-/// The reasoning is not part of the answer; leaving it in would show up as prose
-/// and be fed back to the model on the next turn. An unterminated block (a turn
-/// cut off mid-thought) drops the tail rather than leaking half of it.
-fn strip_reasoning(text: &str) -> String {
-    // Angle-bracket tags written as escapes: literal tag text is mangled by tooling.
-    const OPEN: &str = "\u{3c}think\u{3e}";
-    const CLOSE: &str = "\u{3c}/think\u{3e}";
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    // A template-opened reasoning block (Qwen3 `add_generation_prompt`) carries
-    // no opening tag in the generated text: the reply starts inside the block, so
-    // the first marker is the close tag. Drop everything up to and including it.
-    if let Some(end) = rest.find(CLOSE)
-        && rest.find(OPEN).is_none_or(|open| end < open)
-    {
-        rest = &rest[end + CLOSE.len()..];
-    }
-    while let Some(start) = rest.find(OPEN) {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + OPEN.len()..];
-        match after.find(CLOSE) {
-            Some(end) => rest = &after[end + CLOSE.len()..],
-            None => return out.trim().to_owned(),
-        }
-    }
-    out.push_str(rest);
-    out.trim().to_owned()
+/// Remove a model's reasoning blocks from a reply, using the dialect resolved
+/// for the loaded model. An unterminated block (a turn cut off mid-thought)
+/// drops the tail rather than leaking half of it.
+fn strip_reasoning(text: &str, format: &crate::local_model::ReasoningFormat) -> String {
+    format.strip(text)
 }
 
 /// Extract `<tool_call>{...}</tool_call>` blocks and return them alongside the
@@ -3608,8 +3602,13 @@ async fn run_local_loop(
         // opened a reasoning block. The streamer reads it on its first token.
         let reasoning_expected = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let reasoning_flag = reasoning_expected.clone();
+        // The loaded model's reasoning dialect, so the streamer classifies this
+        // model's tags. Read before the generation holds `engine`.
+        let reasoning_format = local_models.reasoning_format();
+        let stream_format = reasoning_format.clone();
         let generated = tokio::task::spawn_blocking(move || {
-            let mut stream = LocalDeltaStream::new(stream_sender, streamed_flag, reasoning_flag);
+            let mut stream =
+                LocalDeltaStream::new(stream_sender, streamed_flag, stream_format, reasoning_flag);
             let result = runtime.generate(
                 &request,
                 budget.max_tokens,
@@ -3625,7 +3624,7 @@ async fn run_local_loop(
         })
         .await
         .map_err(|error| format!("local inference worker failed: {error}"))??;
-        let text = strip_reasoning(&generated.text);
+        let text = strip_reasoning(&generated.text, &reasoning_format);
         let truncated = generated.truncated;
         generated_total += generated.tokens;
         if generated.timed_out {
@@ -4603,11 +4602,13 @@ mod tests {
     use riga_kernel::events::RigaEvent;
     use tokio::sync::mpsc;
 
+    use crate::local_model::ReasoningFormat;
+
     #[test]
     fn reasoning_is_stripped_before_the_tool_call_is_parsed() {
         // The shape a Qwen3-style model emits: a reasoning block, then the call.
         let reply = "\u{3c}think\u{3e}\nThe user wants files.\n\u{3c}/think\u{3e}\n<tool_call>{\"name\": \"glob\", \"arguments\": {\"pattern\": \".\"}}</tool_call>";
-        let stripped = strip_reasoning(reply);
+        let stripped = strip_reasoning(reply, &ReasoningFormat::think());
         assert_eq!(
             stripped,
             "<tool_call>{\"name\": \"glob\", \"arguments\": {\"pattern\": \".\"}}</tool_call>"
@@ -4620,7 +4621,13 @@ mod tests {
 
     #[test]
     fn an_unterminated_reasoning_block_is_dropped() {
-        assert_eq!(strip_reasoning("\u{3c}think\u{3e}\nstill thinking"), "");
+        assert_eq!(
+            strip_reasoning(
+                "\u{3c}think\u{3e}\nstill thinking",
+                &ReasoningFormat::think()
+            ),
+            ""
+        );
     }
 
     #[test]
@@ -4629,7 +4636,10 @@ mod tests {
         // has no opening tag: it starts inside the block and only the close tag
         // marks where the answer begins.
         let reply = "The user wants files.\n\u{3c}/think\u{3e}\nHere is the answer.";
-        assert_eq!(strip_reasoning(reply), "Here is the answer.");
+        assert_eq!(
+            strip_reasoning(reply, &ReasoningFormat::think()),
+            "Here is the answer."
+        );
     }
 
     #[test]
@@ -6038,11 +6048,13 @@ mod tests {
             (text, reasoning)
         };
         let no_reasoning = || Arc::new(AtomicBool::new(false));
+        let think = || crate::local_model::ReasoningFormat::think();
 
         // Prose streams, including a short turn held back until it settles.
         let (sender, receiver) = mpsc::channel(16);
         let flag = Arc::new(AtomicBool::new(false));
-        let mut stream = super::LocalDeltaStream::new(sender, flag.clone(), no_reasoning());
+        let mut stream =
+            super::LocalDeltaStream::new(sender, flag.clone(), think(), no_reasoning());
         stream.push("The answer is ");
         stream.push("42.");
         stream.finish();
@@ -6053,7 +6065,8 @@ mod tests {
         // streamed (the tool result is what carries it).
         let (sender, receiver) = mpsc::channel(16);
         let flag = Arc::new(AtomicBool::new(false));
-        let mut stream = super::LocalDeltaStream::new(sender, flag.clone(), no_reasoning());
+        let mut stream =
+            super::LocalDeltaStream::new(sender, flag.clone(), think(), no_reasoning());
         stream.push("<tool_call>{\"name\":\"read\",");
         stream.push("\"arguments\":{\"path\":\"a\"}}</tool_call>");
         stream.finish();
@@ -6065,8 +6078,12 @@ mod tests {
         // the output carries no ` thinking` tag of its own.
         let (sender, receiver) = mpsc::channel(16);
         let flag = Arc::new(AtomicBool::new(false));
-        let mut stream =
-            super::LocalDeltaStream::new(sender, flag.clone(), Arc::new(AtomicBool::new(true)));
+        let mut stream = super::LocalDeltaStream::new(
+            sender,
+            flag.clone(),
+            think(),
+            Arc::new(AtomicBool::new(true)),
+        );
         stream.push("The user wants files.");
         stream.push("\u{3c}/think\u{3e}");
         stream.push("<tool_call>{\"name\":\"glob\",\"arguments\":{\"pattern\":\".\"}}</tool_call>");
@@ -6081,8 +6098,12 @@ mod tests {
         // close tag is prose.
         let (sender, receiver) = mpsc::channel(16);
         let flag = Arc::new(AtomicBool::new(false));
-        let mut stream =
-            super::LocalDeltaStream::new(sender, flag.clone(), Arc::new(AtomicBool::new(true)));
+        let mut stream = super::LocalDeltaStream::new(
+            sender,
+            flag.clone(),
+            think(),
+            Arc::new(AtomicBool::new(true)),
+        );
         stream.push("Okay, list files.\n");
         stream.push("First, I need to list.");
         stream.push("\u{3c}/think\u{3e}");
@@ -6095,13 +6116,56 @@ mod tests {
         // The model repeating the template's opening tag is not reasoning text.
         let (sender, receiver) = mpsc::channel(16);
         let flag = Arc::new(AtomicBool::new(false));
-        let mut stream =
-            super::LocalDeltaStream::new(sender, flag.clone(), Arc::new(AtomicBool::new(true)));
+        let mut stream = super::LocalDeltaStream::new(
+            sender,
+            flag.clone(),
+            think(),
+            Arc::new(AtomicBool::new(true)),
+        );
         stream.push("\u{3c}think\u{3e}\nReasoning.");
         stream.push("\u{3c}/think\u{3e}");
         stream.finish();
         let (text, reasoning) = drain(receiver);
         assert_eq!(reasoning, "Reasoning.");
         assert_eq!(text, "");
+    }
+
+    #[test]
+    fn inline_reasoning_tags_stream_as_reasoning_without_a_template_block() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        // Qwen3's template does not open the block; the model emits ` thinking`
+        // itself, and the tokenizer can split it across deltas. The streamer must
+        // hold a partial tag back (never mistake `<thi` for prose) and then route
+        // the block to reasoning, not reply text.
+        let (sender, mut receiver) = mpsc::channel(16);
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut stream = super::LocalDeltaStream::new(
+            sender,
+            flag.clone(),
+            crate::local_model::ReasoningFormat::think(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        stream.push("<");
+        stream.push("thi");
+        stream.push("nk>");
+        stream.push("\nI should list files.");
+        stream.push("</thi");
+        stream.push("nk>");
+        stream.push("The answer is 42.");
+        stream.finish();
+        let (mut text, mut reasoning) = (String::new(), String::new());
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                super::ToolTraceEvent::Ui(RigaEvent::TextDelta { delta }) => text.push_str(&delta),
+                super::ToolTraceEvent::Ui(RigaEvent::ReasoningDelta { delta }) => {
+                    reasoning.push_str(&delta)
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "I should list files.");
+        assert_eq!(text, "The answer is 42.");
     }
 }
