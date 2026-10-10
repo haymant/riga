@@ -68,6 +68,10 @@ impl TextBuffer {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
         match key.code {
+            KeyCode::Char('\n' | '\r') => {
+                self.insert('\n');
+                InputAction::Changed
+            }
             KeyCode::Char(_character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 InputAction::Ignored
             }

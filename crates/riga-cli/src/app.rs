@@ -113,6 +113,19 @@ impl UiState {
             .collect();
     }
 
+    fn archive_active_run(&mut self) {
+        if let Some(prompt) = self.current_prompt.take() {
+            self.state
+                .session_history
+                .push(TranscriptItem::UserText(prompt));
+        }
+        if let Some(run_id) = self.state.active_run.as_deref()
+            && let Some(run) = self.state.run(run_id)
+        {
+            self.state.session_history.extend(run.transcript.clone());
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<UiCommand> {
         if self.confirm_quit {
             match key.code {
@@ -171,6 +184,14 @@ impl UiState {
             let _ = self.draft.handle_key(key);
             return None;
         }
+        if let KeyCode::Char(character @ ('\n' | '\r')) = key.code {
+            if character == '\r' {
+                self.draft.insert('\n');
+            } else {
+                let _ = self.draft.handle_key(key);
+            }
+            return None;
+        }
         match key.code {
             KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.panel = UiPanel::History;
@@ -187,9 +208,13 @@ impl UiState {
                 self.panel_cursor = 0;
                 return None;
             }
-            KeyCode::Char(',') | KeyCode::F(2)
-                if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char(',') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.panel = UiPanel::Settings;
+                self.provider_field = 0;
+                self.sync_provider_input();
+                return None;
+            }
+            KeyCode::F(2) => {
                 self.panel = UiPanel::Settings;
                 self.provider_field = 0;
                 self.sync_provider_input();
@@ -732,6 +757,7 @@ pub async fn run_with_transport<T: RigaTransport>(
         {
             match command {
                 UiCommand::StartRun { session_id, prompt } => {
+                    app.archive_active_run();
                     app.current_prompt = Some(prompt.clone());
                     let run_id = format!(
                         "cli-{}",
@@ -1116,9 +1142,10 @@ mod tests {
         let mut app = UiState::default();
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-        assert_eq!(app.draft.text(), "rt\nx");
+        assert_eq!(app.draft.text(), "rt,\nx");
         assert!(!app.reasoning_collapsed);
         assert!(!app.tools_collapsed);
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
@@ -1128,12 +1155,42 @@ mod tests {
     }
 
     #[test]
+    fn starting_a_new_run_archives_the_previous_visible_turn() {
+        let mut app = UiState {
+            current_prompt: Some("first".into()),
+            ..UiState::default()
+        };
+        app.state.active_run = Some("run-1".into());
+        app.state
+            .apply_event(riga_kernel::events::RigaEventEnvelope {
+                protocol_version: riga_kernel::PROTOCOL_VERSION,
+                event_id: "event-1".into(),
+                session_id: "session-1".into(),
+                run_id: "run-1".into(),
+                sequence: 1,
+                timestamp: "now".into(),
+                event: riga_kernel::events::RigaEvent::TextDelta {
+                    delta: "reply".into(),
+                },
+            });
+        app.archive_active_run();
+        assert!(matches!(
+            app.state.session_history.as_slice(),
+            [
+                crate::model::TranscriptItem::UserText(prompt),
+                crate::model::TranscriptItem::AssistantText(reply)
+            ] if prompt == "first" && reply == "reply"
+        ));
+    }
+
+    #[test]
     fn raw_shift_enter_adds_a_newline_and_control_shortcuts_select_panels() {
         let mut app = UiState::default();
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
-        assert_eq!(app.draft.text(), "a\nb");
+        app.handle_key(KeyEvent::new(KeyCode::Char('\r'), KeyModifiers::NONE));
+        assert_eq!(app.draft.text(), "a\nb\n");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('\u{4}'), KeyModifiers::NONE));
         assert_eq!(app.panel, UiPanel::RunDeck);

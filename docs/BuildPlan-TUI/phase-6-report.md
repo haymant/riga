@@ -1,9 +1,5 @@
 
 
-## Transcript and history follow-up
+## Latest interaction fixes
 
-Streaming deltas are now coalesced into stable assistant, reasoning, and per-tool-output blocks before rendering. The TUI labels model output as `Assistant`, not `You`; user prompts are rendered separately. Reasoning is shown as a distinct `Thinking` block and tool activity remains distinct from assistant prose, with detailed tool state available in RunDeck.
-
-The terminal now enables full keyboard escape-code reporting so compatible terminals preserve Shift+Enter. The TUI also accepts raw newline events as multiline composer input. Persisted conversation turns are loaded from the same server store when the TUI starts and whenever a history session is selected. GUI and TUI therefore share sessions and messages when `DATABASE_URL`, or alternatively `RIGA_DATA_DIR` plus `RIGA_TOKEN`, are identical.
-
-Automated coverage now includes adjacent-delta coalescing, assistant-role rendering, multiline input, and the existing history and model-selection regressions. The CLI suite passes with **30 tests**; workspace clippy and tests pass.
+The comma key is now ordinary composer input; only Ctrl+Comma and F2 open settings. User and assistant labels now use distinct colors, and the message bodies use separate foreground colors as well. Starting another run archives the previous visible prompt and assistant transcript into the current session view instead of replacing the transcript with only the newest run. Raw LF and CR composer events are normalized to newline input in addition to enhanced Shift+Enter events.

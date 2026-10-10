@@ -418,11 +418,11 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
         match item {
             crate::model::TranscriptItem::UserText(text) => lines.push(Line::from(vec![
                 Span::styled("You ", Style::default().fg(Color::Green)),
-                Span::raw(text),
+                Span::styled(text, Style::default().fg(Color::LightGreen)),
             ])),
             crate::model::TranscriptItem::AssistantText(text) => lines.push(Line::from(vec![
                 Span::styled("Assistant ", Style::default().fg(Color::Cyan)),
-                Span::raw(text),
+                Span::styled(text, Style::default().fg(Color::White)),
             ])),
             crate::model::TranscriptItem::AssistantReasoning(text) => {
                 lines.push(Line::from(Span::styled(
@@ -443,7 +443,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     if let Some(prompt) = &app.current_prompt {
         lines.push(Line::from(vec![
             Span::styled("You ", Style::default().fg(Color::Green)),
-            Span::raw(prompt),
+            Span::styled(prompt, Style::default().fg(Color::LightGreen)),
         ]));
     }
     if let Some(run_id) = &app.state.active_run {
@@ -474,11 +474,11 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                 lines.push(match item {
                     crate::model::TranscriptItem::UserText(text) => Line::from(vec![
                         Span::styled("You ", Style::default().fg(Color::Green)),
-                        Span::raw(text),
+                        Span::styled(text, Style::default().fg(Color::LightGreen)),
                     ]),
                     crate::model::TranscriptItem::AssistantText(text) => Line::from(vec![
                         Span::styled("Assistant ", Style::default().fg(Color::Cyan)),
-                        Span::raw(text),
+                        Span::styled(text, Style::default().fg(Color::White)),
                     ]),
                     crate::model::TranscriptItem::AssistantReasoning(text) => {
                         Line::from(Span::styled(
