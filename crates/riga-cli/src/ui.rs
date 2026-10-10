@@ -414,6 +414,38 @@ fn render_topbar(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     let mut lines = Vec::new();
+    for item in &app.state.session_history {
+        match item {
+            crate::model::TranscriptItem::UserText(text) => lines.push(Line::from(vec![
+                Span::styled("You ", Style::default().fg(Color::Green)),
+                Span::raw(text),
+            ])),
+            crate::model::TranscriptItem::AssistantText(text) => lines.push(Line::from(vec![
+                Span::styled("Assistant ", Style::default().fg(Color::Cyan)),
+                Span::raw(text),
+            ])),
+            crate::model::TranscriptItem::AssistantReasoning(text) => {
+                lines.push(Line::from(Span::styled(
+                    format!("Thinking · {text}"),
+                    Style::default().fg(Color::DarkGray),
+                )))
+            }
+            crate::model::TranscriptItem::System(text) => lines.push(Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::Magenta),
+            ))),
+            _ => lines.push(Line::from(Span::styled(
+                "[tool activity available in RunDeck]",
+                Style::default().fg(Color::Yellow),
+            ))),
+        }
+    }
+    if let Some(prompt) = &app.current_prompt {
+        lines.push(Line::from(vec![
+            Span::styled("You ", Style::default().fg(Color::Green)),
+            Span::raw(prompt),
+        ]));
+    }
     if let Some(run_id) = &app.state.active_run {
         if let Some(run) = app.state.run(run_id) {
             let capacity = area.height.saturating_sub(2) as usize * 3;
@@ -440,13 +472,17 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                     continue;
                 }
                 lines.push(match item {
-                    crate::model::TranscriptItem::AssistantText(text) => Line::from(vec![
+                    crate::model::TranscriptItem::UserText(text) => Line::from(vec![
                         Span::styled("You ", Style::default().fg(Color::Green)),
+                        Span::raw(text),
+                    ]),
+                    crate::model::TranscriptItem::AssistantText(text) => Line::from(vec![
+                        Span::styled("Assistant ", Style::default().fg(Color::Cyan)),
                         Span::raw(text),
                     ]),
                     crate::model::TranscriptItem::AssistantReasoning(text) => {
                         Line::from(Span::styled(
-                            format!("thinking · {text}"),
+                            format!("Thinking · {text}"),
                             Style::default().fg(Color::DarkGray),
                         ))
                     }
@@ -507,7 +543,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                 )));
             }
         }
-    } else {
+    } else if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "IPC ready. Select or create a session to begin.",
             Style::default().fg(Color::DarkGray),
@@ -627,6 +663,10 @@ mod tests {
         Terminal,
         backend::{Backend, TestBackend},
     };
+    use riga_kernel::{
+        PROTOCOL_VERSION,
+        events::{RigaEvent, RigaEventEnvelope},
+    };
 
     #[test]
     fn idle_view_renders_at_small_and_large_sizes() {
@@ -716,6 +756,45 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("Downloading 50.0%"));
+    }
+
+    #[test]
+    fn assistant_stream_is_labeled_assistant_not_you() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = UiState::default();
+        app.state.selected_session = Some("session-1".into());
+        app.state.select_run(Some("run-1".into()));
+        for (sequence, event) in [
+            RigaEvent::RunStarted,
+            RigaEvent::TextDelta {
+                delta: "Hel".into(),
+            },
+            RigaEvent::TextDelta { delta: "lo".into() },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.state.apply_event(RigaEventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                event_id: format!("event-{sequence}"),
+                session_id: "session-1".into(),
+                run_id: "run-1".into(),
+                sequence: sequence as u64 + 1,
+                timestamp: "now".into(),
+                event,
+            });
+        }
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Assistant Hello"));
+        assert!(!text.contains("You Hello"));
     }
 
     #[test]

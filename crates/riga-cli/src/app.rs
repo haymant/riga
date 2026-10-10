@@ -1,6 +1,6 @@
 use crate::{
     input::{InputAction, TextBuffer},
-    model::{AppState, CatalogEntry, DeckLens, ProviderForm, UiPanel},
+    model::{AppState, CatalogEntry, DeckLens, ProviderForm, TranscriptItem, UiPanel},
     transport::RigaTransport,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -84,6 +84,7 @@ pub struct UiState {
     pub busy: Option<String>,
     pub busy_tick: u64,
     pub clear_screen: bool,
+    pub current_prompt: Option<String>,
 }
 
 enum BackgroundResult {
@@ -100,6 +101,18 @@ enum BackgroundResult {
 }
 
 impl UiState {
+    pub fn set_session_history(&mut self, turns: Vec<riga_server::ws::ConversationTurn>) {
+        self.state.session_history = turns
+            .into_iter()
+            .map(|turn| match turn.role.as_str() {
+                "user" => TranscriptItem::UserText(turn.content),
+                "assistant" => TranscriptItem::AssistantText(turn.content),
+                "reasoning" => TranscriptItem::AssistantReasoning(turn.content),
+                role => TranscriptItem::System(format!("{role}: {}", turn.content)),
+            })
+            .collect();
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<UiCommand> {
         if self.confirm_quit {
             match key.code {
@@ -719,6 +732,7 @@ pub async fn run_with_transport<T: RigaTransport>(
         {
             match command {
                 UiCommand::StartRun { session_id, prompt } => {
+                    app.current_prompt = Some(prompt.clone());
                     let run_id = format!(
                         "cli-{}",
                         SystemTime::now()
@@ -764,8 +778,10 @@ pub async fn run_with_transport<T: RigaTransport>(
                         .retain(|active| active.run_id != run_id);
                 }
                 UiCommand::SelectSession { session_id } => {
+                    app.set_session_history(transport.session_history(session_id.clone()).await);
                     app.state.selected_session = Some(session_id);
                     app.state.active_run = None;
+                    app.current_prompt = None;
                 }
                 UiCommand::CreateSession { title, workspace } => {
                     let session = transport

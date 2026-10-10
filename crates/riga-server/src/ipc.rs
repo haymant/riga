@@ -85,6 +85,18 @@ impl IpcService {
         self.state.sessions.read().await.clone()
     }
 
+    pub async fn session_history(&self, session_id: &str) -> Vec<ws::ConversationTurn> {
+        crate::secure_store::load_json::<std::collections::HashMap<
+            String,
+            Vec<ws::ConversationTurn>,
+        >>("transcripts")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|history| history.get(session_id).cloned())
+        .unwrap_or_default()
+    }
+
     /// The runs currently executing. Mirrors the WebSocket `ListActiveRuns`
     /// response so the desktop can show and cancel active runs like the browser.
     pub async fn list_active_runs(&self) -> Vec<ws::ActiveRun> {

@@ -19,6 +19,10 @@ pub type TransportFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub trait RigaTransport: Clone + Send + Sync + 'static {
     fn subscribe_local_models(&self) -> broadcast::Receiver<LocalModelEvent>;
     fn local_models(&self) -> TransportFuture<LocalModelOverview>;
+    fn session_history(
+        &self,
+        session_id: String,
+    ) -> TransportFuture<Vec<riga_server::ws::ConversationTurn>>;
 
     fn local_model_action(
         &self,
@@ -90,6 +94,13 @@ impl IpcTransport {
 
     pub async fn list_sessions(&self) -> Vec<Session> {
         self.service.list_sessions().await
+    }
+
+    pub async fn session_history(
+        &self,
+        session_id: &str,
+    ) -> Vec<riga_server::ws::ConversationTurn> {
+        self.service.session_history(session_id).await
     }
 
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<Session, String> {
@@ -179,6 +190,14 @@ impl RigaTransport for IpcTransport {
     fn local_models(&self) -> TransportFuture<LocalModelOverview> {
         let transport = self.clone();
         Box::pin(async move { transport.local_models().await })
+    }
+
+    fn session_history(
+        &self,
+        session_id: String,
+    ) -> TransportFuture<Vec<riga_server::ws::ConversationTurn>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.session_history(&session_id).await })
     }
 
     fn local_model_action(

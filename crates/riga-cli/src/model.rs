@@ -108,6 +108,7 @@ impl ProviderForm {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptItem {
+    UserText(String),
     AssistantText(String),
     AssistantReasoning(String),
     ToolCall {
@@ -196,6 +197,29 @@ impl RunView {
     }
 
     fn push_transcript(&mut self, item: TranscriptItem) {
+        if let Some(last) = self.transcript.last_mut() {
+            match (last, &item) {
+                (TranscriptItem::AssistantText(existing), TranscriptItem::AssistantText(delta))
+                | (
+                    TranscriptItem::AssistantReasoning(existing),
+                    TranscriptItem::AssistantReasoning(delta),
+                ) => {
+                    existing.push_str(delta);
+                    return;
+                }
+                (
+                    TranscriptItem::ToolOutput {
+                        call_id: existing_id,
+                        output: existing,
+                    },
+                    TranscriptItem::ToolOutput { call_id, output },
+                ) if existing_id == call_id => {
+                    existing.push_str(output);
+                    return;
+                }
+                _ => {}
+            }
+        }
         self.transcript.push(item);
         if self.transcript.len() > MAX_TRANSCRIPT_ITEMS {
             let excess = self.transcript.len() - MAX_TRANSCRIPT_ITEMS;
@@ -276,6 +300,7 @@ pub struct AppState {
     pub active_run: Option<String>,
     pub runs: BTreeMap<String, RunView>,
     pub active_runs: Vec<ActiveRun>,
+    pub session_history: Vec<TranscriptItem>,
 }
 impl AppState {
     pub fn apply_event(&mut self, envelope: RigaEventEnvelope) -> ApplyOutcome {
@@ -554,6 +579,40 @@ mod tests {
             run.transcript[3],
             TranscriptItem::ToolOutput { .. }
         ));
+    }
+
+    #[test]
+    fn adjacent_deltas_render_as_one_assistant_or_reasoning_block() {
+        let mut app = AppState::default();
+        app.select_run(Some("run-1".into()));
+        app.apply_event(envelope(1, RigaEvent::RunStarted));
+        app.apply_event(envelope(
+            2,
+            RigaEvent::TextDelta {
+                delta: "Hel".into(),
+            },
+        ));
+        app.apply_event(envelope(3, RigaEvent::TextDelta { delta: "lo".into() }));
+        app.apply_event(envelope(
+            4,
+            RigaEvent::ReasoningDelta {
+                delta: "Think".into(),
+            },
+        ));
+        app.apply_event(envelope(
+            5,
+            RigaEvent::ReasoningDelta {
+                delta: "ing".into(),
+            },
+        ));
+        let run = app.run("run-1").unwrap();
+        assert_eq!(run.transcript.len(), 2);
+        assert!(
+            matches!(&run.transcript[0], TranscriptItem::AssistantText(text) if text == "Hello")
+        );
+        assert!(
+            matches!(&run.transcript[1], TranscriptItem::AssistantReasoning(text) if text == "Thinking")
+        );
     }
 
     #[test]

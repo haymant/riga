@@ -68,6 +68,9 @@ async fn main() -> Result<(), String> {
             local_models: Some(local_models),
             ..app::UiState::default()
         };
+        if let Some(session_id) = app.state.selected_session.clone() {
+            app.set_session_history(transport.session_history(&session_id).await);
+        }
         app.set_catalog(parse_catalog(transport.catalog().await));
         if let Ok(Some(provider)) = transport.provider().await {
             app.set_provider(ProviderForm {

@@ -117,10 +117,15 @@ upload accepts a local file path and stores the file in the selected session's
 worktree through the shared IPC service.
 
 `Ctrl+H` (or Backspace when the empty composer receives a terminal's Ctrl+H
-encoding) opens the same persisted session list used by the GUI. Both clients
-must use the same `RIGA_TOKEN` and secure-store data directory to see the same
-sessions and conversation history. `Ctrl+,` and **F2** both open Provider
-settings for terminals that do not reliably transmit Ctrl-comma.
+encoding) opens the same persisted session list used by the GUI. Selecting a
+session now reloads its persisted user and assistant messages into the TUI.
+Both clients must use the same persistence configuration: `DATABASE_URL` if a
+database is configured, or the same `RIGA_DATA_DIR` and `RIGA_TOKEN` otherwise.
+Without `RIGA_DATA_DIR`, the default data directory is
+`~/.local/share/riga`. A GUI started with a different token, database URL, or
+home directory will intentionally see a different store. `Ctrl+,` and **F2**
+both open Provider settings for terminals that do not reliably transmit
+Ctrl-comma.
 
 Never commit `.env.local`, provider keys, `RIGA_TOKEN`, or uploaded files. The API key is encrypted at rest by the server store and is write-only from the browser.
 
