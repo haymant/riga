@@ -232,8 +232,10 @@ re-dispatch the same way:
   call cannot succeed as written. Fix the input or switch tools.
 - **`the local model made more than 16 tool calls without finishing`** — the run
   is too broad; split it into graph nodes.
-- **`` `bash` is not available to this agent ``** — the profile lacks the tool;
-  `grant_tools` it (with approval) instead of re-dispatching the same way.
+- **`` `X` is not available to this agent ``** — the profile lacks the tool. This
+  is a redirect, not a fatal error: return the requested result as prose. If the
+  tool is genuinely needed, `grant_tools` it (with approval) instead of
+  re-dispatching the same way.
 - **`task node is blocked by incomplete dependencies`** — dispatch the
   dependencies first; do not force the node.
 

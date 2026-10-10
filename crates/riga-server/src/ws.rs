@@ -3187,7 +3187,10 @@ async fn dispatch_subagent(
     if ok {
         Ok(result)
     } else {
-        Err(format!("{} subagent failed: {result}", profile.name))
+        Err(format!(
+            "{} subagent failed: {result}. Do not re-dispatch it the same way — change its prompt or profile, or do the work directly.",
+            profile.name
+        ))
     }
 }
 
@@ -4060,7 +4063,10 @@ async fn run_local_loop(
             let disallowed =
                 allowed_tools.is_some_and(|allowed| !allowed.iter().any(|name| name == &call.name));
             let result = if disallowed {
-                Err(format!("`{}` is not available to this agent", call.name))
+                Err(format!(
+                    "`{}` is not available to this agent. A read-only subagent cannot dispatch or write — return the requested result as prose and stop.",
+                    call.name
+                ))
             } else {
                 match authorize_tool(broker, &trace_sender, &call_id, &call.name, &call.arguments)
                     .await
@@ -4110,7 +4116,11 @@ async fn run_local_loop(
             };
             if ok {
                 consecutive_failures = 0;
-            } else {
+            } else if !disallowed {
+                // A disallowed tool is a profile boundary, not a transient
+                // failure: a `plan` agent that tries to dispatch is redirected,
+                // not killed after three tries. The per-tool cap and the
+                // no-progress set guard still bound a model that keeps calling it.
                 consecutive_failures += 1;
             }
             evidence.record(&call.name, ok);
