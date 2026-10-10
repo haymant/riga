@@ -15,6 +15,18 @@ impl TextBuffer {
         self.text.is_empty()
     }
 
+    pub fn cursor_position(&self) -> (u16, u16) {
+        let prefix = &self.text[..self.cursor];
+        let line = prefix.matches('\n').count() as u16;
+        let column = prefix
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .count() as u16;
+        (column, line)
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;

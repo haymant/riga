@@ -140,7 +140,7 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
         crate::model::UiPanel::Help => (
             "Help",
             vec![Line::from(
-                "Ctrl+H history · Ctrl+, settings/model · Ctrl+K catalog · Ctrl+D RunDeck · Ctrl+L local models · ? help · r reasoning · t tools · y/a/n approvals · Esc close/cancel · q quit",
+                "Ctrl+H history · Ctrl+,/F2 settings/model · Ctrl+K catalog · Ctrl+D RunDeck · Ctrl+L local models · ? help · Ctrl+R reasoning · Ctrl+T tools · y/a/n approvals · Esc close/cancel · q quit",
             )],
         ),
         crate::model::UiPanel::Transcript => unreachable!(),
@@ -512,6 +512,13 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
             .wrap(Wrap { trim: false }),
         area,
     );
+    let (column, line) = app.draft.cursor_position();
+    frame.set_cursor_position((
+        area.x.saturating_add(1).saturating_add(column),
+        area.y
+            .saturating_add(1)
+            .saturating_add(line.min(area.height.saturating_sub(3))),
+    ));
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
@@ -529,6 +536,17 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
             RunStatus::Unknown => "idle",
         })
         .unwrap_or("idle");
+    let notice = app.notice.as_deref().unwrap_or("");
+    if !notice.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!("ERROR: {notice}"),
+                Style::default().fg(Color::Yellow),
+            )),
+            area,
+        );
+        return;
+    }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ history ", Style::default().fg(Color::DarkGray)),
@@ -545,7 +563,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
             ),
             Span::raw(" · "),
             Span::styled(status, Style::default().fg(Color::Cyan)),
-            Span::raw(" · Ctrl+, settings/model · Ctrl+L local models · ? help · r reasoning · t tools · q quit"),
+            Span::raw(" · Ctrl+,/F2 settings/model · Ctrl+L local models · ? help · Ctrl+R reasoning · Ctrl+T tools · q quit"),
         ])),
         area,
     );
@@ -567,7 +585,10 @@ mod tests {
         input::TextBuffer,
         model::{AppState, ConnectionState, ProviderForm, UiPanel},
     };
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{
+        Terminal,
+        backend::{Backend, TestBackend},
+    };
 
     #[test]
     fn idle_view_renders_at_small_and_large_sizes() {
@@ -612,6 +633,30 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("disconnected"));
+    }
+
+    #[test]
+    fn composer_cursor_and_notice_are_rendered() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = UiState {
+            notice: Some("ERR".into()),
+            ..UiState::default()
+        };
+        app.draft.insert('x');
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("ERR"));
+        assert_eq!(
+            terminal.backend_mut().get_cursor_position().unwrap(),
+            (2, 21).into()
+        );
     }
 
     #[test]

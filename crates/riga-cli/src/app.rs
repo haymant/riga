@@ -78,10 +78,27 @@ pub struct UiState {
     pub local_model_error: Option<String>,
     pub local_model_status: Option<String>,
     pub local_attachment_input: bool,
+    pub notice: Option<String>,
+    pub confirm_quit: bool,
 }
 
 impl UiState {
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<UiCommand> {
+        if self.confirm_quit {
+            match key.code {
+                KeyCode::Char('y') => {
+                    self.confirm_quit = false;
+                    self.should_quit = true;
+                    return Some(UiCommand::Quit);
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.confirm_quit = false;
+                    self.notice = None;
+                    return None;
+                }
+                _ => return None,
+            }
+        }
         if let Some(approval) = self.state.pending_approval().cloned() {
             if self.approval_submission.is_some() {
                 return None;
@@ -115,13 +132,30 @@ impl UiState {
         if self.panel != UiPanel::Transcript {
             return self.handle_panel_key(key);
         }
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
+            let _ = self.draft.handle_key(key);
+            return None;
+        }
         match key.code {
             KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.panel = UiPanel::History;
                 self.panel_cursor = 0;
                 return None;
             }
-            KeyCode::Char(',') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Backspace if self.draft.is_empty() => {
+                self.panel = UiPanel::History;
+                self.panel_cursor = 0;
+                return None;
+            }
+            KeyCode::Char(',') | KeyCode::F(2)
+                if key.modifiers.is_empty() || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.panel = UiPanel::Settings;
+                self.provider_field = 0;
+                self.sync_provider_input();
+                return None;
+            }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.panel = UiPanel::Settings;
                 self.provider_field = 0;
                 self.sync_provider_input();
@@ -176,11 +210,11 @@ impl UiState {
                 self.jump_to_bottom();
                 return None;
             }
-            KeyCode::Char('r') if key.modifiers.is_empty() => {
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.reasoning_collapsed = !self.reasoning_collapsed;
                 return None;
             }
-            KeyCode::Char('t') if key.modifiers.is_empty() => {
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.tools_collapsed = !self.tools_collapsed;
                 return None;
             }
@@ -189,11 +223,13 @@ impl UiState {
                 return Some(UiCommand::Quit);
             }
             KeyCode::Esc => {
-                if let Some(run_id) = self.state.active_run.clone() {
-                    return Some(UiCommand::CancelRun { run_id });
-                }
-                self.should_quit = true;
-                return Some(UiCommand::Quit);
+                self.confirm_quit = true;
+                self.notice = Some(if self.state.active_run.is_some() {
+                    "Quit the TUI? Press y to quit or n to continue; use x in RunDeck to stop the run.".into()
+                } else {
+                    "Quit the TUI? Press y to quit or n/Esc to continue.".into()
+                });
+                return None;
             }
             _ => {}
         }
@@ -575,16 +611,22 @@ pub async fn run_with_transport<T: RigaTransport>(
                             .unwrap_or_default()
                             .as_nanos()
                     );
-                    let receiver = transport
+                    match transport
                         .start_run(run_id.clone(), session_id, prompt)
-                        .await?;
-                    app.state.active_runs.push(riga_server::ws::ActiveRun {
-                        run_id: run_id.clone(),
-                        session_id: app.state.selected_session.clone().unwrap_or_default(),
-                        local: false,
-                    });
-                    app.state.select_run(Some(run_id));
-                    events = Some(receiver);
+                        .await
+                    {
+                        Ok(receiver) => {
+                            app.notice = None;
+                            app.state.active_runs.push(riga_server::ws::ActiveRun {
+                                run_id: run_id.clone(),
+                                session_id: app.state.selected_session.clone().unwrap_or_default(),
+                                local: false,
+                            });
+                            app.state.select_run(Some(run_id));
+                            events = Some(receiver);
+                        }
+                        Err(error) => app.notice = Some(format!("Unable to start run: {error}")),
+                    }
                 }
                 UiCommand::Approve {
                     approval_id,
@@ -633,10 +675,15 @@ pub async fn run_with_transport<T: RigaTransport>(
                     }
                 }
                 UiCommand::ResumeRun { run_id, session_id } => {
-                    let receiver = transport.subscribe_run(run_id.clone(), 0).await?;
-                    app.state.selected_session = Some(session_id);
-                    app.state.select_run(Some(run_id));
-                    events = Some(receiver);
+                    match transport.subscribe_run(run_id.clone(), 0).await {
+                        Ok(receiver) => {
+                            app.notice = None;
+                            app.state.selected_session = Some(session_id);
+                            app.state.select_run(Some(run_id));
+                            events = Some(receiver);
+                        }
+                        Err(error) => app.notice = Some(format!("Unable to resume run: {error}")),
+                    }
                 }
                 UiCommand::LocalModelAction {
                     action,
@@ -889,5 +936,77 @@ mod tests {
                 path: Some("/models/local.gguf".into()),
             })
         );
+    }
+
+    #[test]
+    fn selected_downloaded_model_can_start_multiple_chat_threads() {
+        let mut app = UiState {
+            local_models: Some(riga_server::LocalModelOverview {
+                accelerator: "CPU (OpenMP)",
+                catalog: Vec::new(),
+                installed: vec![riga_server::local_model::InstalledModel {
+                    id: "downloaded-model".into(),
+                    name: "Downloaded model".into(),
+                    file_name: "model.gguf".into(),
+                    path: "/models/model.gguf".into(),
+                    size_bytes: 1,
+                    curated: true,
+                    recommended_context: Some(8192),
+                    license_url: None,
+                }],
+                loaded: Some("model.gguf".into()),
+            }),
+            ..UiState::default()
+        };
+        app.state.selected_session = Some("session-chat".into());
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        let Some(UiCommand::LocalModelAction { model_id, .. }) =
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("installed model should produce a load command")
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.provider.kind = riga_server::ws::ProviderKind::Local;
+        app.provider.model = model_id.expect("selected model id");
+        for prompt in ["first thread", "second thread"] {
+            for character in prompt.chars() {
+                app.draft.insert(character);
+            }
+            assert_eq!(
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Some(UiCommand::StartRun {
+                    session_id: "session-chat".into(),
+                    prompt: prompt.into(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn composer_accepts_r_and_t_and_shift_enter_without_submitting() {
+        let mut app = UiState::default();
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(app.draft.text(), "rt\nx");
+        assert!(!app.reasoning_collapsed);
+        assert!(!app.tools_collapsed);
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.reasoning_collapsed);
+        assert!(app.tools_collapsed);
+    }
+
+    #[test]
+    fn escape_requires_confirmation_and_f2_opens_settings() {
+        let mut app = UiState::default();
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::Settings);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.should_quit);
     }
 }

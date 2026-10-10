@@ -940,10 +940,14 @@ impl LocalModelRuntime {
         let backend = match self.backend.get() {
             Some(backend) => backend.clone(),
             None => {
-                let candidate = Arc::new(
-                    LlamaBackend::init()
-                        .map_err(|error| format!("Could not initialize llama.cpp: {error}"))?,
-                );
+                let mut initialized = LlamaBackend::init()
+                    .map_err(|error| format!("Could not initialize llama.cpp: {error}"))?;
+                // llama.cpp writes tensor-loader diagnostics directly to stderr.
+                // That stream is the terminal while the CLI owns the alternate
+                // screen, so forwarding it would corrupt the TUI. Runtime errors
+                // are returned through the normal Rust result path instead.
+                initialized.void_logs();
+                let candidate = Arc::new(initialized);
                 let _ = self.backend.set(candidate);
                 self.backend
                     .get()

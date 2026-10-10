@@ -14,6 +14,7 @@
     "test": "vitest run --coverage",
     "dev": "npm run dev --prefix demo",
     "start": "npm run dev",
+    "cli:cuda": "node scripts/riga-cuda.mjs",
     "tauri": "npm run tauri --prefix demo",
     "tauri:dev": "npm run tauri:dev --prefix demo",
     "tauri:build": "npm run tauri:build --prefix demo",

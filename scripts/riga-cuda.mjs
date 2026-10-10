@@ -1,0 +1,61 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+
+const root = process.cwd();
+const env = { ...process.env };
+const commandArgs = process.argv.slice(2);
+if (commandArgs[0] === "--") commandArgs.shift();
+
+function which(command) {
+  const result = spawnSync("sh", ["-lc", `command -v ${command}`], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  return result.status === 0 ? result.stdout.trim() : null;
+}
+
+const cmake = which("cmake");
+const compiler = which("c++") || which("g++");
+const nvcc = env.CUDACXX || env.CMAKE_CUDA_COMPILER || which("nvcc");
+if (!cmake || !compiler || !nvcc) {
+  console.error("CUDA CLI build requires cmake, a C++ compiler, and nvcc from the CUDA Toolkit.");
+  console.error("Install build-essential cmake ninja-build and the NVIDIA CUDA Toolkit, then retry.");
+  process.exit(2);
+}
+
+const cudaRoot = env.CUDA_PATH || env.CUDA_HOME || path.dirname(path.dirname(nvcc));
+env.CUDA_PATH ||= cudaRoot;
+env.CUDA_HOME ||= cudaRoot;
+env.CUDACXX ||= nvcc;
+env.CMAKE_CUDA_COMPILER ||= nvcc;
+env.CUDA_LIBRARY_PATH ||= cudaRoot;
+env.CMAKE_CUDA_ARCHITECTURES ||= "86";
+env.CMAKE_POSITION_INDEPENDENT_CODE ||= "ON";
+env.CMAKE_CUDA_FLAGS = `${env.CMAKE_CUDA_FLAGS || ""} -Xcompiler=-fPIC`.trim();
+
+// A killed or interrupted CMake configure can leave the Rust build script with
+// an out/build directory but no Makefile/build.ninja. Remove only that stale
+// output so cmake-build reconfigures instead of failing with "No rule to make
+// target 'Makefile'".
+for (const profile of ["debug", "release"]) {
+  const buildRoot = path.join(root, "target", profile, "build");
+  if (!fs.existsSync(buildRoot)) continue;
+  for (const entry of fs.readdirSync(buildRoot)) {
+    if (!entry.startsWith("llama-cpp-sys-2-")) continue;
+    const out = path.join(buildRoot, entry, "out");
+    const cmakeBuild = path.join(out, "build");
+    if (fs.existsSync(cmakeBuild) && !fs.existsSync(path.join(cmakeBuild, "Makefile")) && !fs.existsSync(path.join(cmakeBuild, "build.ninja"))) {
+      console.log(`Removing stale CUDA CMake output: ${cmakeBuild}`);
+      fs.rmSync(out, { recursive: true, force: true });
+    }
+  }
+}
+
+const result = spawnSync("cargo", ["run", "-p", "riga-cli", "--features", "riga-server/cuda", "--", ...commandArgs], {
+  cwd: root,
+  env,
+  stdio: "inherit",
+});
+process.exit(result.status ?? 1);

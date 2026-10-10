@@ -87,6 +87,22 @@ binary on a CUDA-capable machine does not enable GPU offload. The server still
 auto-fits local-model layers to currently available GPU memory. If no CUDA
 toolkit is installed, omit the feature and use the CPU command above.
 
+For the CLI CUDA path, use the repository wrapper when possible. It validates
+`cmake`, a C++ compiler, and `nvcc`, sets the CUDA/CMake variables, and removes
+only interrupted `llama-cpp-sys-2` output that has no `Makefile` or
+`build.ninja`:
+
+```bash
+npm run cli:cuda -- --tui
+```
+
+The CUDA build requires a compatible NVIDIA driver, the NVIDIA CUDA Toolkit
+(including `nvcc`), `cmake`, `ninja-build`, and a C++ toolchain (`build-essential`
+on Debian/Ubuntu). Set `CMAKE_CUDA_ARCHITECTURES` to the target GPU's compute
+capability when the default `86` is not appropriate. If a direct Cargo build
+was interrupted and reports `CMAKE = None` or `Makefile: No such file`, run
+`cargo clean -p llama-cpp-sys-2` once, or use the wrapper above, then rebuild.
+
 ### Selecting a model in the CLI
 
 Start the TUI with `cargo run -p riga-cli -- --tui`. From the transcript:
@@ -100,6 +116,12 @@ The local-model panel also shows the active accelerator, installed/catalog model
 download cancellation (`x`), unload (`u`), and attachment upload (`a`). Attachment
 upload accepts a local file path and stores the file in the selected session's
 worktree through the shared IPC service.
+
+`Ctrl+H` (or Backspace when the empty composer receives a terminal's Ctrl+H
+encoding) opens the same persisted session list used by the GUI. Both clients
+must use the same `RIGA_TOKEN` and secure-store data directory to see the same
+sessions and conversation history. `Ctrl+,` and **F2** both open Provider
+settings for terminals that do not reliably transmit Ctrl-comma.
 
 Never commit `.env.local`, provider keys, `RIGA_TOKEN`, or uploaded files. The API key is encrypted at rest by the server store and is write-only from the browser.
 
