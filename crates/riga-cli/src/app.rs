@@ -41,6 +41,7 @@ pub enum UiCommand {
     SaveProvider {
         config: riga_server::ws::ProviderConfig,
     },
+    LoadRemoteModels,
     InsertCatalog {
         text: String,
     },
@@ -97,6 +98,11 @@ pub struct UiState {
     pub deck_lens: DeckLens,
     pub deck_details_expanded: bool,
     pub local_models_expanded: bool,
+    pub model_picker_open: bool,
+    pub remote_models: Vec<String>,
+    pub remote_models_loading: bool,
+    pub remote_models_error: Option<String>,
+    pub remote_model_query: TextBuffer,
     pub local_models: Option<riga_server::LocalModelOverview>,
     pub local_model_error: Option<String>,
     pub local_model_status: Option<String>,
@@ -128,6 +134,13 @@ enum BackgroundResult {
         model_id: Option<String>,
         result: Result<(), String>,
     },
+    RemoteModels(Result<Vec<String>, String>),
+}
+
+enum SlashCommandResult {
+    NotCommand,
+    Consumed,
+    Execute(UiCommand),
 }
 
 impl UiState {
@@ -378,6 +391,7 @@ impl UiState {
 
     fn show_sidebar_panel(&mut self, panel: UiPanel) {
         self.panel = panel;
+        self.model_picker_open = false;
         self.last_sidebar_panel = Some(panel);
         self.rundeck_open = panel == UiPanel::RunDeck;
         self.transcript_focused = false;
@@ -385,6 +399,7 @@ impl UiState {
     }
 
     fn focus_composer(&mut self) {
+        self.model_picker_open = false;
         if self.panel != UiPanel::Transcript {
             self.last_sidebar_panel = Some(self.panel);
         }
@@ -417,8 +432,13 @@ impl UiState {
                 self.panel_input.insert_str(text)
             }
             UiPanel::Settings => {
-                self.panel_input.insert_str(text);
-                self.commit_provider_input();
+                if self.model_picker_open {
+                    self.remote_model_query.insert_str(text);
+                    self.panel_cursor = 0;
+                } else {
+                    self.panel_input.insert_str(text);
+                    self.commit_provider_input();
+                }
             }
             UiPanel::Catalog => self.catalog_query.insert_str(text),
             UiPanel::LocalModels if self.local_attachment_input => {
@@ -543,6 +563,7 @@ impl UiState {
         }
         if key.code == KeyCode::Tab && self.panel != UiPanel::Transcript {
             let panel_tab_navigates = match self.panel {
+                UiPanel::Settings if self.model_picker_open => true,
                 UiPanel::Settings => false,
                 UiPanel::History if self.creating_session => false,
                 UiPanel::History if self.renaming_session.is_some() => true,
@@ -797,7 +818,10 @@ impl UiState {
                     return None;
                 }
             }
-            KeyCode::Enter if self.completion_trigger.is_some() => {
+            KeyCode::Enter
+                if self.completion_trigger.is_some()
+                    && !is_native_slash_command(self.draft.text()) =>
+            {
                 if self.accept_completion() {
                     return None;
                 }
@@ -893,6 +917,11 @@ impl UiState {
         match self.draft.handle_key(key) {
             InputAction::Changed => self.prompt_history_cursor = None,
             InputAction::Submit(prompt) => {
+                match self.handle_slash_command(&prompt) {
+                    SlashCommandResult::NotCommand => {}
+                    SlashCommandResult::Consumed => return None,
+                    SlashCommandResult::Execute(command) => return Some(command),
+                }
                 self.last_submitted = Some(prompt.clone());
                 self.prompt_history.push(prompt.clone());
                 self.prompt_history_cursor = None;
@@ -908,7 +937,15 @@ impl UiState {
     }
 
     fn handle_panel_key(&mut self, key: KeyEvent) -> Option<UiCommand> {
+        if key.code == KeyCode::Esc && self.panel == UiPanel::Settings && self.model_picker_open {
+            self.model_picker_open = false;
+            self.panel = UiPanel::Transcript;
+            self.last_sidebar_panel = Some(UiPanel::Settings);
+            self.transcript_focused = false;
+            return None;
+        }
         if key.code == KeyCode::Esc {
+            self.model_picker_open = false;
             self.last_sidebar_panel = Some(self.panel);
             self.panel = UiPanel::Transcript;
             self.rundeck_open = false;
@@ -988,6 +1025,43 @@ impl UiState {
                 }
             }
             UiPanel::Settings => {
+                if self.model_picker_open {
+                    match key.code {
+                        KeyCode::Up => self.panel_cursor = self.panel_cursor.saturating_sub(1),
+                        KeyCode::Down => {
+                            self.panel_cursor = self
+                                .panel_cursor
+                                .saturating_add(1)
+                                .min(self.filtered_remote_models().len().saturating_sub(1));
+                        }
+                        KeyCode::Enter => {
+                            let models = self.filtered_remote_models();
+                            let model = models.get(self.panel_cursor).copied().map(str::to_owned);
+                            let model = model.or_else(|| {
+                                (self.remote_models.is_empty()
+                                    && !self.remote_model_query.text().trim().is_empty())
+                                .then(|| self.remote_model_query.text().trim().to_owned())
+                            });
+                            if let Some(model) = model {
+                                self.provider.kind = riga_server::ws::ProviderKind::Remote;
+                                self.provider.model = model.clone();
+                                self.provider.error = None;
+                                self.model_picker_open = false;
+                                self.panel = UiPanel::Transcript;
+                                self.last_sidebar_panel = Some(UiPanel::Settings);
+                                self.notice = Some(format!("Switching to remote model {model}…"));
+                                return Some(UiCommand::SaveProvider {
+                                    config: self.provider.to_config(),
+                                });
+                            }
+                        }
+                        _ => {
+                            let _ = self.remote_model_query.handle_key(key);
+                            self.panel_cursor = 0;
+                        }
+                    }
+                    return None;
+                }
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
                     self.commit_provider_input();
                     return Some(UiCommand::SaveProvider {
@@ -1220,6 +1294,168 @@ impl UiState {
         self.provider = provider;
     }
 
+    pub fn filtered_remote_models(&self) -> Vec<&str> {
+        let query = self.remote_model_query.text().trim().to_lowercase();
+        self.remote_models
+            .iter()
+            .map(String::as_str)
+            .filter(|model| query.is_empty() || model.to_lowercase().contains(&query))
+            .collect()
+    }
+
+    fn open_model_picker(&mut self) -> UiCommand {
+        self.show_sidebar_panel(UiPanel::Settings);
+        self.model_picker_open = true;
+        self.remote_models.clear();
+        self.remote_models_loading = true;
+        self.remote_models_error = None;
+        self.remote_model_query.clear();
+        self.panel_cursor = 0;
+        self.notice = Some("Loading remote models from the configured provider…".into());
+        UiCommand::LoadRemoteModels
+    }
+
+    fn handle_slash_command(&mut self, prompt: &str) -> SlashCommandResult {
+        let trimmed = prompt.trim();
+        if !trimmed.starts_with('/') {
+            return SlashCommandResult::NotCommand;
+        }
+        let mut parts = trimmed.split_whitespace();
+        let name = parts.next().unwrap_or_default().to_ascii_lowercase();
+        let arguments = parts.collect::<Vec<_>>().join(" ");
+
+        match name.as_str() {
+            "/model" | "/models" => {
+                let model = arguments.strip_prefix("set ").unwrap_or(&arguments).trim();
+                if model.is_empty() || model.eq_ignore_ascii_case("list") {
+                    return SlashCommandResult::Execute(self.open_model_picker());
+                }
+                if self.provider.endpoint.trim().is_empty() {
+                    self.show_sidebar_panel(UiPanel::Settings);
+                    self.provider_field = 0;
+                    self.sync_provider_input();
+                    self.notice = Some(
+                        "Configure a provider endpoint in Settings before selecting a remote model."
+                            .into(),
+                    );
+                    return SlashCommandResult::Consumed;
+                }
+                self.provider.kind = riga_server::ws::ProviderKind::Remote;
+                self.provider.model = model.to_owned();
+                self.provider.error = None;
+                self.notice = Some(format!("Switching to remote model {model}…"));
+                SlashCommandResult::Execute(UiCommand::SaveProvider {
+                    config: self.provider.to_config(),
+                })
+            }
+            "/new" | "/clear" => {
+                if self.state.active_run.is_some() || self.busy.is_some() {
+                    self.notice = Some(
+                        "Wait for the active operation to finish before starting a new session."
+                            .into(),
+                    );
+                    return SlashCommandResult::Consumed;
+                }
+                let workspace = self
+                    .state
+                    .selected_session
+                    .as_ref()
+                    .and_then(|selected| {
+                        self.state
+                            .sessions
+                            .iter()
+                            .find(|session| &session.id == selected)
+                    })
+                    .map(|session| session.workspace.clone())
+                    .unwrap_or_else(|| ".".into());
+                SlashCommandResult::Execute(UiCommand::CreateSession {
+                    title: if arguments.is_empty() {
+                        "New session".into()
+                    } else {
+                        arguments
+                    },
+                    workspace,
+                })
+            }
+            "/resume" | "/sessions" => {
+                self.show_sidebar_panel(UiPanel::History);
+                if let Some(selected) = &self.state.selected_session
+                    && let Some(index) = self
+                        .state
+                        .sessions
+                        .iter()
+                        .position(|session| &session.id == selected)
+                {
+                    self.panel_cursor = index;
+                }
+                SlashCommandResult::Consumed
+            }
+            "/rename" => {
+                let Some(selected) = self.state.selected_session.clone() else {
+                    self.notice = Some("There is no session to rename yet.".into());
+                    return SlashCommandResult::Consumed;
+                };
+                let Some(index) = self
+                    .state
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == selected)
+                else {
+                    self.notice = Some("The selected session could not be found.".into());
+                    return SlashCommandResult::Consumed;
+                };
+                self.show_sidebar_panel(UiPanel::History);
+                self.panel_cursor = index;
+                if arguments.is_empty() {
+                    self.renaming_session = Some(selected);
+                    self.panel_input.clear();
+                    for character in self.state.sessions[index].title.chars() {
+                        self.panel_input.insert(character);
+                    }
+                    SlashCommandResult::Consumed
+                } else {
+                    SlashCommandResult::Execute(UiCommand::RenameSession {
+                        session_id: selected,
+                        title: arguments,
+                    })
+                }
+            }
+            "/status" => {
+                let model = if self.provider.model.is_empty() {
+                    "not configured"
+                } else {
+                    self.provider.model.as_str()
+                };
+                let session = self
+                    .state
+                    .selected_session
+                    .as_ref()
+                    .and_then(|selected| {
+                        self.state
+                            .sessions
+                            .iter()
+                            .find(|session| &session.id == selected)
+                    })
+                    .map(|session| session.title.as_str())
+                    .unwrap_or("none");
+                self.notice = Some(format!(
+                    "Connection {:?} · provider {:?} · model {model} · session {session}",
+                    self.state.connection, self.provider.kind
+                ));
+                SlashCommandResult::Consumed
+            }
+            "/help" => {
+                self.show_sidebar_panel(UiPanel::Help);
+                SlashCommandResult::Consumed
+            }
+            "/exit" | "/quit" => {
+                self.should_quit = true;
+                SlashCommandResult::Execute(UiCommand::Quit)
+            }
+            _ => SlashCommandResult::NotCommand,
+        }
+    }
+
     pub fn apply_event(&mut self, envelope: riga_kernel::events::RigaEventEnvelope) {
         let followed = self.follow_output;
         let outcome = self.state.apply_event(envelope);
@@ -1272,6 +1508,23 @@ fn session_title_from_response(response: &str) -> Option<String> {
     } else {
         Some(title.to_owned())
     }
+}
+
+fn is_native_slash_command(prompt: &str) -> bool {
+    matches!(
+        prompt.split_whitespace().next().unwrap_or_default(),
+        "/model"
+            | "/models"
+            | "/new"
+            | "/clear"
+            | "/resume"
+            | "/sessions"
+            | "/rename"
+            | "/status"
+            | "/help"
+            | "/exit"
+            | "/quit"
+    )
 }
 
 pub async fn run_with_transport<T: RigaTransport>(
@@ -1337,6 +1590,35 @@ pub async fn run_with_transport<T: RigaTransport>(
                         app.local_model_error = Some(error);
                     }
                 },
+                BackgroundResult::RemoteModels(result) => {
+                    app.remote_models_loading = false;
+                    match result {
+                        Ok(models) => {
+                            app.remote_models = models;
+                            app.remote_models_error = None;
+                            if let Some(index) = app
+                                .remote_models
+                                .iter()
+                                .position(|model| model == &app.provider.model)
+                            {
+                                app.panel_cursor = index;
+                            }
+                            app.notice = Some(format!(
+                                "Loaded {} remote model{}.",
+                                app.remote_models.len(),
+                                if app.remote_models.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                }
+                            ));
+                        }
+                        Err(error) => {
+                            app.remote_models_error = Some(error.clone());
+                            app.notice = Some(error);
+                        }
+                    }
+                }
             }
         }
         while let Ok(event) = local_events.try_recv() {
@@ -1557,6 +1839,10 @@ pub async fn run_with_transport<T: RigaTransport>(
                                     workspace,
                                 })
                                 .await?;
+                            if app.state.active_run.is_none() {
+                                app.set_session_history(Vec::new());
+                                app.current_prompt = None;
+                            }
                             app.state.selected_session = Some(session.id.clone());
                             app.state.sessions.push(session);
                         }
@@ -1579,13 +1865,32 @@ pub async fn run_with_transport<T: RigaTransport>(
                             }
                         }
                         UiCommand::SaveProvider { config } => {
+                            let selected_model = config.model.clone();
                             match transport.configure_provider(config).await {
                                 Ok(_) => {
                                     app.provider.error = None;
+                                    app.model_picker_open = false;
                                     app.panel = UiPanel::Transcript;
+                                    app.notice = Some(format!(
+                                        "Provider settings saved · model {selected_model}."
+                                    ));
                                 }
-                                Err(error) => app.provider.error = Some(error),
+                                Err(error) => {
+                                    app.provider.error = Some(error.clone());
+                                    app.notice = Some(format!("Could not save provider: {error}"));
+                                }
                             }
+                        }
+                        UiCommand::LoadRemoteModels => {
+                            app.remote_models_loading = true;
+                            app.remote_models_error = None;
+                            let tx = completion_tx.clone();
+                            let transport = transport.clone();
+                            tokio::spawn(async move {
+                                let _ = tx.send(BackgroundResult::RemoteModels(
+                                    transport.remote_models().await,
+                                ));
+                            });
                         }
                         UiCommand::InsertCatalog { text } => {
                             for character in text.chars() {
@@ -1727,6 +2032,98 @@ mod tests {
         );
         assert!(app.draft.is_empty());
     }
+
+    fn submit_text(app: &mut UiState, text: &str) -> Option<UiCommand> {
+        for character in text.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn slash_model_opens_remote_picker_and_direct_model_selection_saves_provider() {
+        let mut app = UiState::default();
+        app.provider.endpoint = "https://provider.example/v1".into();
+        app.set_completion_candidates(vec![CompletionItem {
+            trigger: '/',
+            category: "Commands".into(),
+            label: "/model".into(),
+            detail: "Choose a remote model".into(),
+            insert_text: "/model".into(),
+        }]);
+        assert_eq!(
+            submit_text(&mut app, "/model"),
+            Some(UiCommand::LoadRemoteModels)
+        );
+        assert!(app.model_picker_open);
+        assert_eq!(app.panel, UiPanel::Settings);
+
+        let mut direct = UiState::default();
+        direct.provider.endpoint = "https://provider.example/v1".into();
+        let command = submit_text(&mut direct, "/model set org/model-v2");
+        assert!(matches!(
+            command,
+            Some(UiCommand::SaveProvider { config })
+                if config.model == "org/model-v2"
+                    && config.kind == riga_server::ws::ProviderKind::Remote
+        ));
+    }
+
+    #[test]
+    fn remote_model_picker_filters_and_selects_the_active_provider_model() {
+        let mut app = UiState {
+            panel: UiPanel::Settings,
+            model_picker_open: true,
+            remote_models: vec!["alpha".into(), "beta-chat".into(), "beta-code".into()],
+            ..UiState::default()
+        };
+        app.handle_paste("beta");
+        assert_eq!(app.filtered_remote_models(), vec!["beta-chat", "beta-code"]);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(UiCommand::SaveProvider { config }) if config.model == "beta-code"
+        ));
+        assert!(!app.model_picker_open);
+        assert_eq!(app.panel, UiPanel::Transcript);
+    }
+
+    #[test]
+    fn slash_new_and_resume_use_existing_session_state() {
+        let mut app = UiState::default();
+        app.state.sessions.push(riga_kernel::state::Session {
+            id: "session-1".into(),
+            title: "Current".into(),
+            workspace: "/project".into(),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        });
+        app.state.selected_session = Some("session-1".into());
+        assert_eq!(
+            submit_text(&mut app, "/new scratch"),
+            Some(UiCommand::CreateSession {
+                title: "scratch".into(),
+                workspace: "/project".into(),
+            })
+        );
+        assert!(submit_text(&mut app, "/resume").is_none());
+        assert_eq!(app.panel, UiPanel::History);
+        assert_eq!(app.panel_cursor, 0);
+    }
+
+    #[test]
+    fn unknown_slash_text_remains_a_normal_chat_prompt() {
+        let mut app = UiState::default();
+        app.state.selected_session = Some("session-1".into());
+        assert_eq!(
+            submit_text(&mut app, "/explain this syntax"),
+            Some(UiCommand::StartRun {
+                session_id: "session-1".into(),
+                prompt: "/explain this syntax".into(),
+            })
+        );
+    }
+
     #[test]
     fn approval_keys_emit_once_and_always_without_duplicate_submission() {
         let mut app = approval_app();

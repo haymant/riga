@@ -188,6 +188,22 @@ fn completion_candidates(
 ) -> Vec<CompletionItem> {
     let mut candidates = Vec::new();
 
+    for (command, detail) in [
+        ("/model", "Choose or set the active remote model"),
+        ("/models", "Alias for /model"),
+        ("/new", "Start a new session"),
+        ("/clear", "Alias for /new; keep the old session in history"),
+        ("/resume", "Open session history"),
+        ("/sessions", "Alias for /resume"),
+        ("/rename", "Rename the current session"),
+        ("/status", "Show connection, model, and session status"),
+        ("/help", "Open the Info panel"),
+        ("/exit", "Exit RIGA-CLI"),
+        ("/quit", "Alias for /exit"),
+    ] {
+        candidates.push(completion('/', "Commands", command, detail));
+    }
+
     if let Some(skills) = catalog.get("skills").and_then(serde_json::Value::as_array) {
         for skill in skills {
             let name = candidate_id(skill);
@@ -415,6 +431,10 @@ mod tests {
         assert!(labels.contains(&"/skills/rust-review"));
         assert!(labels.contains(&"/mcp/docs/search"));
         assert!(labels.contains(&"/mcp/riga-health-stdio/health"));
+        assert!(labels.contains(&"/model"));
+        assert!(labels.contains(&"/new"));
+        assert!(labels.contains(&"/resume"));
+        assert!(labels.contains(&"/status"));
         assert!(labels.contains(&"@src/main.rs"));
         assert!(labels.contains(&"@researcher"));
         assert!(!labels.contains(&"@rust-review"));

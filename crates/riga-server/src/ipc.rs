@@ -245,6 +245,15 @@ impl IpcService {
         }))
     }
 
+    /// Lists models from the configured OpenAI-compatible provider. Credentials
+    /// stay in the server's secure store and are never returned to the TUI.
+    pub async fn remote_models(&self) -> Result<Vec<String>, String> {
+        let config = secure_store::load_json::<ws::ProviderConfig>("provider")
+            .await?
+            .ok_or_else(|| "Configure a remote provider in Settings first.".to_string())?;
+        fetch_remote_models(&config).await
+    }
+
     pub async fn list_mcp_registry(&self) -> Vec<catalog::McpServerSummary> {
         let mut servers = self
             .state
@@ -501,6 +510,80 @@ impl IpcService {
     }
 }
 
+fn remote_models_url(endpoint: &str) -> Result<reqwest::Url, String> {
+    let mut url = reqwest::Url::parse(endpoint.trim())
+        .map_err(|_| "Provider endpoint must be a valid HTTP(S) URL.".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("Provider endpoint must use HTTP or HTTPS.".into());
+    }
+    let path = url.path().trim_end_matches('/');
+    let base_path = ["/chat/completions", "/responses", "/models"]
+        .into_iter()
+        .find_map(|suffix| path.strip_suffix(suffix))
+        .unwrap_or(path);
+    let models_path = if base_path.is_empty() {
+        "/models".to_string()
+    } else {
+        format!("{base_path}/models")
+    };
+    url.set_path(&models_path);
+    Ok(url)
+}
+
+fn parse_remote_model_ids(value: &serde_json::Value) -> Result<Vec<String>, String> {
+    let records = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array())
+        .ok_or_else(|| "Provider model list had an unsupported response shape.".to_string())?;
+    let mut ids = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .as_str()
+                .or_else(|| {
+                    record
+                        .get("id")
+                        .or_else(|| record.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                })
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+async fn fetch_remote_models(config: &ws::ProviderConfig) -> Result<Vec<String>, String> {
+    if config.endpoint.trim().is_empty() {
+        return Err("Configure a provider endpoint in Settings first.".into());
+    }
+    let url = remote_models_url(&config.endpoint)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| format!("Could not prepare provider request: {error}"))?;
+    let mut request = client.get(url);
+    if !config.api_key.trim().is_empty() {
+        request = request.bearer_auth(&config.api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("Could not load remote models: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Provider rejected the model-list request: {error}"))?;
+    let value = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("Could not read provider model list: {error}"))?;
+    parse_remote_model_ids(&value)
+}
+
 fn run_journal_path(run_id: &str) -> PathBuf {
     secure_store::data_root()
         .join("runs")
@@ -609,6 +692,59 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].content, "hello from history");
         assert_eq!(history[1].content, "welcome back");
+    }
+
+    #[tokio::test]
+    async fn remote_model_discovery_uses_provider_endpoint_and_bearer_auth() {
+        let auth_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let route_auth_seen = auth_seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let auth_seen = route_auth_seen.clone();
+                async move {
+                    auth_seen.store(
+                        headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            == Some("Bearer test-key"),
+                        Ordering::Relaxed,
+                    );
+                    axum::Json(serde_json::json!({
+                        "data": [{"id": "zeta-model"}, {"id": "alpha-model"}]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let config = ws::ProviderConfig {
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            api_key: "test-key".into(),
+            model: "current-model".into(),
+            reasoning_effort: "low".into(),
+            kind: ws::ProviderKind::Remote,
+            api: ws::ProviderApi::Chat,
+            subagent_model: None,
+        };
+
+        let models = fetch_remote_models(&config).await.unwrap();
+        server.abort();
+
+        assert_eq!(models, vec!["alpha-model", "zeta-model"]);
+        assert!(auth_seen.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn remote_model_response_parser_accepts_names_and_deduplicates_ids() {
+        let models = parse_remote_model_ids(&serde_json::json!({
+            "models": [{"name": "gemini-pro"}, "small", {"id": "small"}]
+        }))
+        .unwrap();
+        assert_eq!(models, vec!["gemini-pro", "small"]);
     }
 
     #[tokio::test]

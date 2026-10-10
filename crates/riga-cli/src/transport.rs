@@ -52,6 +52,8 @@ pub trait RigaTransport: Clone + Send + Sync + 'static {
         config: ProviderConfig,
     ) -> TransportFuture<Result<ProviderConfigured, String>>;
 
+    fn remote_models(&self) -> TransportFuture<Result<Vec<String>, String>>;
+
     fn start_run(
         &self,
         run_id: String,
@@ -126,6 +128,10 @@ impl IpcTransport {
         config: ProviderConfig,
     ) -> Result<ProviderConfigured, String> {
         self.service.configure_provider(config).await
+    }
+
+    pub async fn remote_models(&self) -> Result<Vec<String>, String> {
+        self.service.remote_models().await
     }
 
     pub async fn start_run(
@@ -255,6 +261,11 @@ impl RigaTransport for IpcTransport {
     ) -> TransportFuture<Result<ProviderConfigured, String>> {
         let transport = self.clone();
         Box::pin(async move { transport.configure_provider(config).await })
+    }
+
+    fn remote_models(&self) -> TransportFuture<Result<Vec<String>, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.remote_models().await })
     }
 
     fn start_run(

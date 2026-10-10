@@ -196,7 +196,10 @@ fn active_sidebar_panel(app: &UiState) -> UiPanel {
     }
 }
 
-fn sidebar_panel_title(panel: UiPanel) -> &'static str {
+fn sidebar_panel_title(panel: UiPanel, model_picker_open: bool) -> &'static str {
+    if panel == UiPanel::Settings && model_picker_open {
+        return "Models";
+    }
     match panel {
         UiPanel::History => "History",
         UiPanel::Settings => "Settings",
@@ -305,6 +308,9 @@ fn sidebar_panel_lines(
                     )));
                 }
             }
+        }
+        UiPanel::Settings if app.model_picker_open => {
+            lines.extend(render_remote_models_sidebar(app, max_lines, max_width));
         }
         UiPanel::Settings => {
             let provider = &app.provider;
@@ -420,6 +426,8 @@ fn sidebar_panel_lines(
                 Line::from("Ctrl+D · RunDeck"),
                 Line::from("/ · tools, skills, MCP"),
                 Line::from("@ · files, subagents"),
+                Line::from("/model · choose remote model"),
+                Line::from("/new · /resume · /rename · /status"),
                 Line::from("v · model choices / RunDeck details"),
                 Line::from("Ctrl+R / Ctrl+T · collapse output"),
                 Line::from("Tab / mouse · focus composer, chat, sidebar"),
@@ -448,6 +456,11 @@ fn sidebar_footer_hints(app: &UiState, panel: UiPanel) -> Vec<String> {
         UiPanel::History | UiPanel::Transcript => [
             "↑/↓ select · Enter open".into(),
             "n new · r rename · Esc close".into(),
+        ]
+        .into(),
+        UiPanel::Settings if app.model_picker_open => [
+            "Type to filter · ↑/↓ choose".into(),
+            "Enter select · Esc close · /model ID direct".into(),
         ]
         .into(),
         UiPanel::Settings => [
@@ -667,6 +680,78 @@ fn local_model_sidebar_item(
                 "catalog",
             )
         })
+}
+
+fn render_remote_models_sidebar(
+    app: &UiState,
+    max_lines: usize,
+    max_width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![sidebar_section("Remote models")];
+    let current = if app.provider.kind == riga_server::ws::ProviderKind::Remote {
+        app.provider.model.as_str()
+    } else {
+        "Local model active"
+    };
+    lines.push(sidebar_field("Current", current, max_width));
+    lines.push(sidebar_field(
+        "Filter",
+        app.remote_model_query.text(),
+        max_width,
+    ));
+    if app.remote_models_loading {
+        lines.push(Line::from("Loading provider catalog…"));
+    }
+    if let Some(error) = &app.remote_models_error {
+        lines.push(Line::from(vec![
+            Span::styled("Unavailable · ", Style::default().fg(Color::Red)),
+            Span::styled(
+                fit_sidebar_text(error, max_width.saturating_sub(13)),
+                Style::default().fg(Color::Red),
+            ),
+        ]));
+    }
+    let models = app.filtered_remote_models();
+    if models.is_empty() && !app.remote_models_loading {
+        lines.push(Line::from(if app.remote_models.is_empty() {
+            "No listed models · type an ID to set it"
+        } else {
+            "No models match this filter"
+        }));
+    }
+    for (index, model) in models.iter().enumerate() {
+        let selected = index == app.panel_cursor;
+        let active = app.provider.kind == riga_server::ws::ProviderKind::Remote
+            && *model == app.provider.model;
+        let marker = if selected {
+            "›"
+        } else if active {
+            "●"
+        } else {
+            "·"
+        };
+        let surface = if selected {
+            Color::Rgb(53, 53, 57)
+        } else {
+            Color::Rgb(29, 29, 31)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker} "),
+                Style::default()
+                    .fg(if active { Color::Green } else { Color::Cyan })
+                    .bg(surface),
+            ),
+            Span::styled(
+                fit_sidebar_text(model, max_width.saturating_sub(2)),
+                Style::default()
+                    .fg(if active { Color::White } else { Color::Gray })
+                    .bg(surface),
+            ),
+        ]));
+    }
+    lines.truncate(max_lines.max(1));
+    lines
 }
 
 fn run_status_label(status: RunStatus) -> &'static str {
@@ -935,6 +1020,7 @@ fn active_panel_editor(app: &UiState, panel: UiPanel) -> Option<(&'static str, S
             ("Title", &app.panel_input, false)
         }
         UiPanel::History if app.creating_session => ("Workspace", &app.workspace_input, false),
+        UiPanel::Settings if app.model_picker_open => return None,
         UiPanel::Settings => match app.provider_field {
             0 => ("Endpoint", &app.panel_input, false),
             1 => ("API key", &app.panel_input, true),
@@ -983,7 +1069,10 @@ fn render_panel_surface_body(
     let mut lines = Vec::new();
     if show_title {
         lines.push(Line::from(Span::styled(
-            format!("  {}", sidebar_panel_title(panel).to_uppercase()),
+            format!(
+                "  {}",
+                sidebar_panel_title(panel, app.model_picker_open).to_uppercase()
+            ),
             Style::default()
                 .fg(Color::Gray)
                 .add_modifier(Modifier::BOLD),
@@ -1139,7 +1228,10 @@ fn render_compact_panel_overlay(frame: &mut Frame<'_>, area: Rect, app: &UiState
     let background = Color::Rgb(31, 31, 34);
     frame.render_widget(
         Block::default()
-            .title(format!(" {} · Esc close ", sidebar_panel_title(panel)))
+            .title(format!(
+                " {} · Esc close ",
+                sidebar_panel_title(panel, app.model_picker_open)
+            ))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .style(Style::default().fg(Color::Gray).bg(background)),
@@ -2381,6 +2473,39 @@ mod tests {
             .collect();
         assert!(!text.contains("do-not-display"));
         assert!(text.contains("Configured"));
+    }
+
+    #[test]
+    fn remote_model_picker_is_readable_in_sidebar_and_narrow_overlay() {
+        for (width, height) in [(120, 40), (80, 24)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let app = UiState {
+                panel: UiPanel::Settings,
+                model_picker_open: true,
+                remote_models: vec!["alpha-model".into(), "beta-model".into()],
+                provider: ProviderForm {
+                    endpoint: "https://provider.example/v1".into(),
+                    model: "beta-model".into(),
+                    ..ProviderForm::default()
+                },
+                ..UiState::default()
+            };
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                text.to_lowercase().contains("models"),
+                "width {width}: {text}"
+            );
+            assert!(text.contains("beta-model"), "width {width}: {text}");
+            assert!(text.contains("Enter select"), "width {width}: {text}");
+        }
     }
 
     #[test]
