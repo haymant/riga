@@ -83,6 +83,7 @@ pub struct UiState {
     pub confirm_quit: bool,
     pub busy: Option<String>,
     pub busy_tick: u64,
+    pub clear_screen: bool,
 }
 
 enum BackgroundResult {
@@ -114,6 +115,11 @@ impl UiState {
                 }
                 _ => return None,
             }
+        }
+        if key.code == KeyCode::Esc && self.busy.is_some() && self.state.active_run.is_some() {
+            return Some(UiCommand::CancelRun {
+                run_id: self.state.active_run.clone().unwrap_or_default(),
+            });
         }
         if let Some(approval) = self.state.pending_approval().cloned() {
             if self.approval_submission.is_some() {
@@ -158,6 +164,11 @@ impl UiState {
                 self.panel_cursor = 0;
                 return None;
             }
+            KeyCode::Char('\u{8}') => {
+                self.panel = UiPanel::History;
+                self.panel_cursor = 0;
+                return None;
+            }
             KeyCode::Backspace if self.draft.is_empty() => {
                 self.panel = UiPanel::History;
                 self.panel_cursor = 0;
@@ -184,6 +195,11 @@ impl UiState {
                 return None;
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.panel = UiPanel::RunDeck;
+                self.panel_cursor = 0;
+                return None;
+            }
+            KeyCode::Char('\u{4}') => {
                 self.panel = UiPanel::RunDeck;
                 self.panel_cursor = 0;
                 return None;
@@ -611,6 +627,7 @@ pub async fn run_with_transport<T: RigaTransport>(
                         app.local_model_error = None;
                         if action == "load" {
                             app.busy = None;
+                            app.clear_screen = true;
                             if let Some(id) = model_id {
                                 app.provider.kind = riga_server::ws::ProviderKind::Local;
                                 app.provider.model = id;
@@ -626,6 +643,7 @@ pub async fn run_with_transport<T: RigaTransport>(
                     }
                     Err(error) => {
                         app.busy = None;
+                        app.clear_screen = true;
                         app.local_model_error = Some(error);
                     }
                 },
@@ -685,6 +703,10 @@ pub async fn run_with_transport<T: RigaTransport>(
                 }
             }
         }
+        if app.clear_screen {
+            terminal.clear().map_err(|error| error.to_string())?;
+            app.clear_screen = false;
+        }
         terminal
             .draw(|frame| crate::ui::render(frame, &app))
             .map_err(|error| error.to_string())?;
@@ -735,6 +757,8 @@ pub async fn run_with_transport<T: RigaTransport>(
                 }
                 UiCommand::CancelRun { run_id } => {
                     let _ = transport.cancel_run(run_id.clone()).await;
+                    events = None;
+                    app.busy = None;
                     app.state
                         .active_runs
                         .retain(|active| active.run_id != run_id);
@@ -1085,6 +1109,37 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert!(app.reasoning_collapsed);
         assert!(app.tools_collapsed);
+    }
+
+    #[test]
+    fn raw_shift_enter_adds_a_newline_and_control_shortcuts_select_panels() {
+        let mut app = UiState::default();
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(app.draft.text(), "a\nb");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('\u{4}'), KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::RunDeck);
+        app.panel = UiPanel::Transcript;
+        app.handle_key(KeyEvent::new(KeyCode::Char('\u{8}'), KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::History);
+    }
+
+    #[test]
+    fn escape_cancels_a_thinking_run_instead_of_quitting() {
+        let mut app = UiState {
+            busy: Some("Thinking...".into()),
+            ..UiState::default()
+        };
+        app.state.active_run = Some("run-1".into());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Some(UiCommand::CancelRun {
+                run_id: "run-1".into()
+            })
+        );
+        assert!(!app.should_quit);
     }
 
     #[test]

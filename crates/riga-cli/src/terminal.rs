@@ -1,6 +1,7 @@
 use std::io::{self, Stdout};
 
 use crossterm::{
+    event::{KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -14,7 +15,15 @@ impl TerminalGuard {
     pub fn enter() -> Result<Self, String> {
         enable_raw_mode().map_err(|error| error.to_string())?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnterAlternateScreen) {
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+            )
+        ) {
             let _ = disable_raw_mode();
             return Err(error.to_string());
         }
@@ -29,12 +38,20 @@ impl TerminalGuard {
     {
         self.terminal.draw(render)
     }
+
+    pub fn clear(&mut self) -> io::Result<()> {
+        self.terminal.clear()
+    }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            PopKeyboardEnhancementFlags,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }

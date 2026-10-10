@@ -43,7 +43,17 @@ async fn main() -> Result<(), String> {
     let transport = IpcTransport::new(ServerState::default());
 
     if args.tui {
-        let sessions = transport.list_sessions().await;
+        let mut sessions = transport.list_sessions().await;
+        if sessions.is_empty() {
+            sessions.push(
+                transport
+                    .create_session(CreateSessionRequest {
+                        title: "Default chat".into(),
+                        workspace: ".".into(),
+                    })
+                    .await?,
+            );
+        }
         let active_runs = transport.list_active_runs().await;
         let local_models = transport.local_models().await;
         let mut app = app::UiState {
