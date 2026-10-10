@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use rig_agent::tool::{ToolContext, server::ToolServer, server::ToolServerHandle};
 use rig_rmcp::{McpClientHandler, rmcp};
@@ -15,6 +19,7 @@ pub struct McpRuntime {
     tools: ToolServerHandle,
     connected: Arc<RwLock<Vec<String>>>,
     aliases: Arc<RwLock<HashMap<String, String>>>,
+    server_tools: Arc<RwLock<HashMap<String, Vec<String>>>>,
 }
 
 impl McpRuntime {
@@ -23,6 +28,7 @@ impl McpRuntime {
             tools: ToolServer::new().owner("riga-mcp").run(),
             connected: Arc::new(RwLock::new(Vec::new())),
             aliases: Arc::new(RwLock::new(HashMap::new())),
+            server_tools: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -41,6 +47,14 @@ impl McpRuntime {
         {
             return;
         }
+        let existing_tools = self
+            .tools
+            .tool_defs(None)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<HashSet<_>>();
         let handler = McpClientHandler::new(ClientInfo::default(), self.tools.clone())
             .with_refresh_timeout(Duration::from_secs(20));
         let name = record.summary.name.clone();
@@ -95,6 +109,22 @@ impl McpRuntime {
                 return;
             }
         };
+        let mut discovered_tools = record.summary.tools.clone();
+        discovered_tools.extend(
+            self.tools
+                .tool_defs(None)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|definition| !existing_tools.contains(&definition.name))
+                .map(|definition| definition.name),
+        );
+        discovered_tools.sort();
+        discovered_tools.dedup();
+        self.server_tools
+            .write()
+            .await
+            .insert(name.clone(), discovered_tools);
         {
             let mut aliases = self.aliases.write().await;
             for tool in &record.summary.tools {
@@ -163,6 +193,15 @@ impl McpRuntime {
 
     pub async fn connected_names(&self) -> Vec<String> {
         self.connected.read().await.clone()
+    }
+
+    pub async fn server_tool_names(&self, server: &str) -> Vec<String> {
+        self.server_tools
+            .read()
+            .await
+            .get(server)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 

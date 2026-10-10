@@ -10,7 +10,7 @@
 //   CMAKE_CUDA_ARCHITECTURES=89 npm run tauri:build:cuda
 import { spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { basename, delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 
 const mode = process.argv[2] ?? "dev";
 if (!["dev", "build"].includes(mode)) {
@@ -73,8 +73,11 @@ function configureCoherentCudaToolkit() {
 
 configureCoherentCudaToolkit();
 
-const targetRoot =
-  process.env.CARGO_TARGET_DIR || join(process.cwd(), "src-tauri", "target");
+const targetRoot = resolve(
+  process.env.CARGO_TARGET_DIR || join(process.cwd(), "src-tauri", "target"),
+);
+const backendTargetRoot = resolve(join(process.cwd(), "..", "target"));
+const targetRoots = [...new Set([targetRoot, backendTargetRoot])];
 
 // Flags that must reach every CUDA compile. CMake seeds CMAKE_CUDA_FLAGS from the
 // CUDAFLAGS environment variable, so this is the only injection point that also
@@ -248,8 +251,8 @@ applyCudaHeaderShim();
 
 const LLAMA_SYS = "llama-cpp-sys-2";
 
-function removeLlamaSysArtifacts(profile) {
-  const profileRoot = join(targetRoot, profile);
+function removeLlamaSysArtifacts(profile, root) {
+  const profileRoot = join(root, profile);
   const prefixed = [LLAMA_SYS, `lib${LLAMA_SYS.replace(/-/g, "_")}-`];
   for (const dir of ["build", "deps", ".fingerprint"]) {
     const root = join(profileRoot, dir);
@@ -261,17 +264,30 @@ function removeLlamaSysArtifacts(profile) {
   }
 }
 
-function staleReason(profile) {
-  const profileRoot = join(targetRoot, profile);
+function hasMissingBindings(profile, root) {
+  const buildRoot = join(root, profile, "build");
+  const entries = (existsSync(buildRoot) ? readdirSync(buildRoot) : [])
+    .filter((entry) => entry.startsWith(`${LLAMA_SYS}-`))
+    .map((entry) => join(buildRoot, entry));
+  return entries.some((entry) => !existsSync(join(entry, "out", "bindings.rs")));
+}
+
+function staleReason(profile, root) {
+  const profileRoot = join(root, profile);
   const depsRoot = join(profileRoot, "deps");
   const hasArtifacts =
     existsSync(depsRoot) &&
     readdirSync(depsRoot).some((entry) => entry.startsWith(`lib${LLAMA_SYS.replace(/-/g, "_")}-`));
 
   const buildRoot = join(profileRoot, "build");
-  const trees = (existsSync(buildRoot) ? readdirSync(buildRoot) : [])
+  const entries = (existsSync(buildRoot) ? readdirSync(buildRoot) : [])
     .filter((entry) => entry.startsWith(`${LLAMA_SYS}-`))
-    .map((entry) => join(buildRoot, entry, "out", "build"))
+    .map((entry) => join(buildRoot, entry));
+  if (entries.some((entry) => !existsSync(join(entry, "out", "bindings.rs")))) {
+    return "missing generated Rust bindings";
+  }
+  const trees = entries
+    .map((entry) => join(entry, "out", "build"))
     .filter((dir) => existsSync(dir));
 
   if (trees.length === 0) return hasArtifacts ? "archive without a CMake tree" : null;
@@ -292,13 +308,19 @@ function staleReason(profile) {
 
 function resetStaleLlamaCpp() {
   const stale = [];
-  for (const profile of ["debug", "release"]) {
-    const reason = staleReason(profile);
-    if (reason) stale.push([profile, reason]);
+  for (const root of targetRoots) {
+    for (const profile of ["debug", "release"]) {
+      const reason = root === targetRoot
+        ? staleReason(profile, root)
+        : hasMissingBindings(profile, root)
+          ? "missing generated Rust bindings"
+          : null;
+      if (reason) stale.push([profile, reason, root]);
+    }
   }
-  for (const [profile, reason] of stale) {
-    console.log(`Rebuilding llama.cpp for ${profile}: ${reason}`);
-    removeLlamaSysArtifacts(profile);
+  for (const [profile, reason, root] of stale) {
+    console.log(`Rebuilding llama.cpp for ${profile} in ${root}: ${reason}`);
+    removeLlamaSysArtifacts(profile, root);
   }
 }
 

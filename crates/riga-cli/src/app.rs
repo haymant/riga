@@ -1,6 +1,8 @@
 use crate::{
     input::{InputAction, TextBuffer},
-    model::{AppState, CatalogEntry, DeckLens, ProviderForm, TranscriptItem, UiPanel},
+    model::{
+        AppState, CatalogEntry, CompletionItem, DeckLens, ProviderForm, TranscriptItem, UiPanel,
+    },
     transport::RigaTransport,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -97,7 +99,8 @@ pub struct UiState {
     pub rundeck_open: bool,
     pub completion_trigger: Option<char>,
     pub completion_cursor: usize,
-    pub command_candidates: Vec<String>,
+    pub completion_range: Option<(usize, usize)>,
+    pub completion_candidates: Vec<CompletionItem>,
 }
 
 enum BackgroundResult {
@@ -155,72 +158,89 @@ impl UiState {
         true
     }
 
-    pub fn set_command_candidates(&mut self, candidates: Vec<String>) {
-        self.command_candidates = candidates;
+    pub fn set_completion_candidates(&mut self, candidates: Vec<CompletionItem>) {
+        self.completion_candidates = candidates;
+        self.refresh_completion();
     }
 
-    fn matching_candidates(&self, token: &str) -> Vec<String> {
-        self.command_candidates
+    fn matching_candidates(&self, token: &str) -> Vec<CompletionItem> {
+        let query = token.to_lowercase();
+        self.completion_candidates
             .iter()
-            .filter(|candidate| candidate.starts_with(token))
+            .filter(|candidate| {
+                candidate.trigger == token.chars().next().unwrap_or_default()
+                    && candidate.label.to_lowercase().starts_with(&query)
+            })
             .cloned()
             .collect()
     }
 
-    pub fn completion_items(&self) -> Vec<String> {
+    pub fn completion_items(&self) -> Vec<CompletionItem> {
+        let Some((start, end)) = self.completion_range else {
+            return Vec::new();
+        };
         let text = self.draft.text();
-        let start = text
+        let cursor = self.draft.cursor_byte_position();
+        self.matching_candidates(&text[start..cursor.min(end)])
+    }
+
+    fn active_completion_range(&self) -> Option<(char, usize, usize)> {
+        let text = self.draft.text();
+        let cursor = self.draft.cursor_byte_position();
+        let prefix = &text[..cursor];
+        let start = prefix
             .char_indices()
             .rev()
             .find(|(_, character)| character.is_whitespace())
-            .map(|(index, _)| index + 1)
+            .map(|(index, character)| index + character.len_utf8())
             .unwrap_or(0);
-        self.matching_candidates(&text[start..])
+        let token = &text[start..cursor];
+        let trigger = token.chars().next()?;
+        if !matches!(trigger, '/' | '@') {
+            return None;
+        }
+        let end = text[cursor..]
+            .char_indices()
+            .find(|(_, character)| character.is_whitespace())
+            .map(|(index, _)| cursor + index)
+            .unwrap_or(text.len());
+        Some((trigger, start, end))
     }
 
     fn refresh_completion(&mut self) {
-        let text = self.draft.text();
-        let start = text
-            .char_indices()
-            .rev()
-            .find(|(_, character)| character.is_whitespace())
-            .map(|(index, _)| index + 1)
-            .unwrap_or(0);
-        let token = &text[start..];
-        if !matches!(token.chars().next(), Some('/' | '@')) {
+        let Some((trigger, start, end)) = self.active_completion_range() else {
             self.completion_trigger = None;
+            self.completion_range = None;
             return;
-        }
-        self.completion_trigger = token.chars().next();
+        };
+        self.completion_trigger = Some(trigger);
+        self.completion_range = Some((start, end));
         self.completion_cursor = self
             .completion_cursor
-            .min(self.matching_candidates(token).len().saturating_sub(1));
+            .min(self.completion_items().len().saturating_sub(1));
     }
 
     fn accept_completion(&mut self) -> bool {
-        let Some(_) = self.completion_trigger else {
+        let Some((start, end)) = self.completion_range else {
             return false;
         };
-        let text = self.draft.text().to_owned();
-        let start = text
-            .char_indices()
-            .rev()
-            .find(|(_, character)| character.is_whitespace())
-            .map(|(index, _)| index + 1)
-            .unwrap_or(0);
-        let token = &text[start..];
-        let matches = self.matching_candidates(token);
+        let matches = self.completion_items();
         let Some(candidate) = matches.get(self.completion_cursor) else {
             return false;
         };
-        for _ in token.chars() {
-            self.draft.backspace();
+        let text = self.draft.text().to_owned();
+        let mut insertion = candidate.insert_text.clone();
+        if !insertion.chars().last().is_some_and(char::is_whitespace)
+            && !text[end..].chars().next().is_some_and(char::is_whitespace)
+        {
+            insertion.push(' ');
         }
-        for character in candidate.chars() {
-            self.draft.insert(character);
+        if !self.draft.replace_range(start, end, &insertion) {
+            return false;
         }
-        self.draft.insert(' ');
         self.completion_trigger = None;
+        self.completion_range = None;
+        self.refresh_completion();
         true
     }
 
@@ -271,6 +291,9 @@ impl UiState {
                 _ => return None,
             }
         }
+        if key.code == KeyCode::Esc && self.panel != UiPanel::Transcript {
+            return self.handle_panel_key(key);
+        }
         if key.code == KeyCode::Esc && self.busy.is_some() && self.state.active_run.is_some() {
             return Some(UiCommand::CancelRun {
                 run_id: self.state.active_run.clone().unwrap_or_default(),
@@ -311,6 +334,75 @@ impl UiState {
             }
         }
         if self.panel != UiPanel::Transcript {
+            match key.code {
+                KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.panel = UiPanel::Help;
+                    return None;
+                }
+                KeyCode::F(1) => {
+                    self.panel = UiPanel::Help;
+                    return None;
+                }
+                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.panel = UiPanel::History;
+                    self.panel_cursor = 0;
+                    return None;
+                }
+                KeyCode::Char('\u{8}') => {
+                    self.panel = UiPanel::History;
+                    self.panel_cursor = 0;
+                    return None;
+                }
+                KeyCode::Char(',') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.panel = UiPanel::Settings;
+                    self.provider_field = 0;
+                    self.sync_provider_input();
+                    return None;
+                }
+                KeyCode::F(2) => {
+                    self.panel = UiPanel::Settings;
+                    self.provider_field = 0;
+                    self.sync_provider_input();
+                    return None;
+                }
+                KeyCode::Char('s')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && self.panel != UiPanel::Settings =>
+                {
+                    self.panel = UiPanel::Settings;
+                    self.provider_field = 0;
+                    self.sync_provider_input();
+                    return None;
+                }
+                KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.panel = UiPanel::LocalModels;
+                    self.panel_cursor = 0;
+                    self.local_attachment_input = false;
+                    return None;
+                }
+                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.panel = UiPanel::Catalog;
+                    self.panel_cursor = 0;
+                    self.catalog_query.clear();
+                    return None;
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if self.panel == UiPanel::RunDeck {
+                        self.rundeck_open = false;
+                        UiPanel::Transcript
+                    } else {
+                        self.rundeck_open = true;
+                        UiPanel::RunDeck
+                    };
+                    self.panel = if self.panel == UiPanel::RunDeck {
+                        UiPanel::Transcript
+                    } else {
+                        UiPanel::RunDeck
+                    };
+                    return None;
+                }
+                _ => {}
+            }
             return self.handle_panel_key(key);
         }
         if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
@@ -375,10 +467,20 @@ impl UiState {
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.rundeck_open = !self.rundeck_open;
+                self.panel = if self.rundeck_open {
+                    UiPanel::RunDeck
+                } else {
+                    UiPanel::Transcript
+                };
                 return None;
             }
             KeyCode::Char('\u{4}') => {
                 self.rundeck_open = !self.rundeck_open;
+                self.panel = if self.rundeck_open {
+                    UiPanel::RunDeck
+                } else {
+                    UiPanel::Transcript
+                };
                 return None;
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -387,7 +489,11 @@ impl UiState {
                 self.local_attachment_input = false;
                 return None;
             }
-            KeyCode::Char('?') => {
+            KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.panel = UiPanel::Help;
+                return None;
+            }
+            KeyCode::F(1) => {
                 self.panel = UiPanel::Help;
                 return None;
             }
@@ -396,8 +502,16 @@ impl UiState {
                 return None;
             }
             KeyCode::Down if self.completion_trigger.is_some() => {
-                self.completion_cursor = self.completion_cursor.saturating_add(1);
+                self.completion_cursor = self
+                    .completion_cursor
+                    .saturating_add(1)
+                    .min(self.completion_items().len().saturating_sub(1));
                 return None;
+            }
+            KeyCode::Tab if self.completion_trigger.is_some() => {
+                if self.accept_completion() {
+                    return None;
+                }
             }
             KeyCode::Enter if self.completion_trigger.is_some() => {
                 if self.accept_completion() {
@@ -423,10 +537,20 @@ impl UiState {
                 return None;
             }
             KeyCode::Up => {
+                if self.draft.text().contains('\n') {
+                    self.draft.move_vertical(false);
+                    self.refresh_completion();
+                    return None;
+                }
                 self.navigate_prompt_history(false);
                 return None;
             }
             KeyCode::Down => {
+                if self.draft.text().contains('\n') {
+                    self.draft.move_vertical(true);
+                    self.refresh_completion();
+                    return None;
+                }
                 self.navigate_prompt_history(true);
                 return None;
             }
@@ -441,11 +565,21 @@ impl UiState {
                 return None;
             }
             KeyCode::Home => {
+                if !self.draft.is_empty() {
+                    self.draft.move_home();
+                    self.refresh_completion();
+                    return None;
+                }
                 self.follow_output = false;
                 self.transcript_scroll = usize::MAX;
                 return None;
             }
             KeyCode::End => {
+                if !self.draft.is_empty() {
+                    self.draft.move_end();
+                    self.refresh_completion();
+                    return None;
+                }
                 self.jump_to_bottom();
                 return None;
             }
@@ -491,6 +625,9 @@ impl UiState {
 
     fn handle_panel_key(&mut self, key: KeyEvent) -> Option<UiCommand> {
         if key.code == KeyCode::Esc {
+            if self.panel == UiPanel::RunDeck {
+                self.rundeck_open = false;
+            }
             self.panel = UiPanel::Transcript;
             self.creating_session = false;
             self.renaming_session = None;
@@ -1429,6 +1566,22 @@ mod tests {
     }
 
     #[test]
+    fn multiline_composer_arrows_move_the_caret_without_replacing_the_draft() {
+        let mut app = UiState::default();
+        app.draft.replace("first\nsecond");
+        app.draft.move_end();
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.draft.cursor_position(), (5, 0));
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.draft.cursor_position(), (0, 0));
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.draft.cursor_position(), (0, 1));
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.draft.cursor_position(), (6, 1));
+        assert_eq!(app.draft.text(), "first\nsecond");
+    }
+
+    #[test]
     fn focused_transcript_up_down_controls_follow_offset() {
         let mut app = UiState {
             transcript_focused: true,
@@ -1635,6 +1788,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char('\u{4}'), KeyModifiers::NONE));
         assert!(app.rundeck_open);
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert_eq!(app.draft.text(), "a\nb\n\n");
         app.panel = UiPanel::Transcript;
@@ -1645,22 +1799,88 @@ mod tests {
     #[test]
     fn slash_and_at_commands_filter_and_insert_candidates() {
         let mut app = UiState {
-            command_candidates: vec![
-                "/tools/read".into(),
-                "/tools/write".into(),
-                "@README.md".into(),
+            completion_candidates: vec![
+                CompletionItem {
+                    trigger: '/',
+                    category: "Tools".into(),
+                    label: "/tools/read".into(),
+                    detail: "Read a file".into(),
+                    insert_text: "Use the read tool: ".into(),
+                },
+                CompletionItem {
+                    trigger: '/',
+                    category: "Tools".into(),
+                    label: "/tools/write".into(),
+                    detail: "Write a file".into(),
+                    insert_text: "/tools/write".into(),
+                },
+                CompletionItem {
+                    trigger: '@',
+                    category: "Files".into(),
+                    label: "@README.md".into(),
+                    detail: "Workspace file".into(),
+                    insert_text: "@README.md".into(),
+                },
             ],
             ..UiState::default()
         };
         app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
-        assert_eq!(app.completion_items(), vec!["/tools/read", "/tools/write"]);
+        assert_eq!(
+            app.completion_items()
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/tools/read", "/tools/write"]
+        );
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(app.draft.text(), "/tools/read ");
+        assert_eq!(app.draft.text(), "Use the read tool: ");
         app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE));
-        assert_eq!(app.completion_items(), vec!["@README.md"]);
+        assert_eq!(
+            app.completion_items()
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["@README.md"]
+        );
+    }
+
+    #[test]
+    fn ctrl_i_opens_info_and_question_mark_remains_composer_text() {
+        let mut app = UiState::default();
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert_eq!(app.draft.text(), "?");
+        assert_eq!(app.panel, UiPanel::Transcript);
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL));
+        assert_eq!(app.panel, UiPanel::Help);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::Transcript);
+        assert_eq!(app.draft.text(), "?");
+    }
+
+    #[test]
+    fn completion_replaces_only_the_active_token_and_preserves_trailing_text() {
+        let mut app = UiState {
+            completion_candidates: vec![CompletionItem {
+                trigger: '@',
+                category: "Files".into(),
+                label: "@src/main.rs".into(),
+                detail: "Workspace file".into(),
+                insert_text: "@src/main.rs".into(),
+            }],
+            ..UiState::default()
+        };
+        app.draft.replace("ask @sr later");
+        app.draft.move_home();
+        for _ in 0..7 {
+            app.draft.move_right();
+        }
+        app.refresh_completion();
+        assert_eq!(app.completion_trigger, Some('@'));
+        app.accept_completion();
+        assert_eq!(app.draft.text(), "ask @src/main.rs later");
     }
 
     #[test]

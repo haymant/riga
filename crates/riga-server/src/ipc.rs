@@ -74,6 +74,13 @@ impl IpcService {
                 .iter()
                 .map(|record| record.summary.clone()),
         );
+        for server in &mut servers {
+            for tool in self.state.mcp_runtime.server_tool_names(&server.name).await {
+                if !server.tools.contains(&tool) {
+                    server.tools.push(tool);
+                }
+            }
+        }
         result.insert(
             "mcp_servers".into(),
             serde_json::to_value(servers).unwrap_or_default(),
@@ -239,13 +246,22 @@ impl IpcService {
     }
 
     pub async fn list_mcp_registry(&self) -> Vec<catalog::McpServerSummary> {
-        self.state
+        let mut servers = self
+            .state
             .mcp_registry
             .read()
             .await
             .iter()
             .map(|record| record.summary.clone())
-            .collect()
+            .collect::<Vec<_>>();
+        for server in &mut servers {
+            for tool in self.state.mcp_runtime.server_tool_names(&server.name).await {
+                if !server.tools.contains(&tool) {
+                    server.tools.push(tool);
+                }
+            }
+        }
+        servers
     }
 
     pub async fn save_mcp_registry(

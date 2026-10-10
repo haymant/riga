@@ -65,6 +65,15 @@ pub struct CatalogEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionItem {
+    pub trigger: char,
+    pub category: String,
+    pub label: String,
+    pub detail: String,
+    pub insert_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderForm {
     pub endpoint: String,
     pub api_key: String,
