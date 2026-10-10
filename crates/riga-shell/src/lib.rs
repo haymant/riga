@@ -92,7 +92,13 @@ fn bundled_skills_source() -> Option<std::path::PathBuf> {
 
 /// Copy each bundled `<name>/SKILL.md` into `<workspace>/skills/<name>/SKILL.md`.
 ///
-/// An existing workspace skill is left untouched, so a user's edited copy wins.
+/// A skill the user has edited is left untouched; an unedited copy is refreshed
+/// when the bundled version changes. A plain "copy only if missing" would never
+/// ship a skill update to an existing workspace, so a manifest at
+/// `<workspace>/.riga/skills-seed` records the bundled hash last written per
+/// skill — that is how an unedited copy is told from an edited one. A copy with
+/// no manifest entry (a first run of this seeder, or a hand-placed file) is
+/// treated as unedited, so a shipped update reaches an existing workspace.
 fn seed_bundled_skills(workspace: &std::path::Path, source: Option<&std::path::Path>) {
     let Some(source) = source else {
         return;
@@ -101,19 +107,67 @@ fn seed_bundled_skills(workspace: &std::path::Path, source: Option<&std::path::P
         return;
     };
     let dest = workspace.join("skills");
+    let manifest_path = workspace.join(".riga/skills-seed");
+    let mut manifest: std::collections::HashMap<String, String> =
+        std::fs::read_to_string(&manifest_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .map(|(name, hash)| (name.to_owned(), hash.to_owned()))
+            .collect();
     for entry in entries.flatten() {
         let from = entry.path();
         if !from.join("SKILL.md").is_file() {
             continue;
         }
-        let to = dest.join(entry.file_name());
-        if to.join("SKILL.md").exists() {
+        let Ok(bundled) = std::fs::read_to_string(from.join("SKILL.md")) else {
             continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let to = dest.join(entry.file_name()).join("SKILL.md");
+        match std::fs::read_to_string(&to) {
+            Ok(existing) => {
+                // Refresh a copy we wrote and the user has not since edited. With
+                // no manifest entry (first run of this seeder, or a hand-placed
+                // copy) the bundled skill is authoritative, so it refreshes too.
+                let unedited = manifest
+                    .get(&name)
+                    .map(|hash| hash == &content_hash(&existing))
+                    .unwrap_or(true);
+                if unedited && existing != bundled {
+                    let _ = std::fs::write(&to, &bundled);
+                }
+            }
+            Err(_) => {
+                if std::fs::create_dir_all(dest.join(entry.file_name())).is_ok() {
+                    let _ = std::fs::write(&to, &bundled);
+                }
+            }
         }
-        if std::fs::create_dir_all(&to).is_ok() {
-            let _ = std::fs::copy(from.join("SKILL.md"), to.join("SKILL.md"));
-        }
+        manifest.insert(name, content_hash(&bundled));
     }
+    if let Some(parent) = manifest_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut names: Vec<&String> = manifest.keys().collect();
+    names.sort();
+    let text: String = names
+        .into_iter()
+        .filter_map(|name| manifest.get(name).map(|hash| format!("{name}\t{hash}\n")))
+        .collect();
+    let _ = std::fs::write(&manifest_path, text);
+}
+
+/// Stable FNV-1a hash of a skill's contents, for the seed manifest. Not
+/// `DefaultHasher`, whose output is not guaranteed stable across releases — a
+/// changed hash would make an unedited copy look edited and stop refreshing.
+fn content_hash(content: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in content.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// `git init` plus an empty initial commit, so worktrees can fork from `HEAD`.
@@ -166,20 +220,21 @@ mod tests {
     }
 
     #[test]
-    fn ensure_workspace_seeds_bundled_skills_without_overwriting() {
+    fn ensure_workspace_seeds_and_refreshes_bundled_skills() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("bundled");
         std::fs::create_dir_all(source.join("demo")).unwrap();
         std::fs::write(source.join("demo/SKILL.md"), "bundled").unwrap();
 
-        // An existing workspace skill wins over the bundled copy.
+        // A copy with no manifest entry is treated as an old bundled copy and
+        // refreshed, so a shipped skill update reaches an existing workspace.
         let workspace = dir.path().join("workspace");
         std::fs::create_dir_all(workspace.join("skills/demo")).unwrap();
-        std::fs::write(workspace.join("skills/demo/SKILL.md"), "local").unwrap();
+        std::fs::write(workspace.join("skills/demo/SKILL.md"), "stale").unwrap();
         super::seed_bundled_skills(&workspace, Some(&source));
         assert_eq!(
             std::fs::read_to_string(workspace.join("skills/demo/SKILL.md")).unwrap(),
-            "local"
+            "bundled"
         );
 
         // A fresh workspace receives the bundled skill.
@@ -189,5 +244,31 @@ mod tests {
             std::fs::read_to_string(fresh.join("skills/demo/SKILL.md")).unwrap(),
             "bundled"
         );
+    }
+
+    #[test]
+    fn ensure_workspace_refreshes_an_unedited_skill_but_keeps_an_edited_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("bundled");
+        std::fs::create_dir_all(source.join("demo")).unwrap();
+        std::fs::write(source.join("demo/SKILL.md"), "v1").unwrap();
+        let workspace = dir.path().join("workspace");
+        let read = || std::fs::read_to_string(workspace.join("skills/demo/SKILL.md")).unwrap();
+
+        // First seed installs v1 and records its hash.
+        super::seed_bundled_skills(&workspace, Some(&source));
+        assert_eq!(read(), "v1");
+
+        // The bundled skill changes: an unedited copy is refreshed, which a
+        // plain "copy only if missing" would never do.
+        std::fs::write(source.join("demo/SKILL.md"), "v2").unwrap();
+        super::seed_bundled_skills(&workspace, Some(&source));
+        assert_eq!(read(), "v2");
+
+        // A user edit is preserved across the next bundled change.
+        std::fs::write(workspace.join("skills/demo/SKILL.md"), "mine").unwrap();
+        std::fs::write(source.join("demo/SKILL.md"), "v3").unwrap();
+        super::seed_bundled_skills(&workspace, Some(&source));
+        assert_eq!(read(), "mine");
     }
 }
