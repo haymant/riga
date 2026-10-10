@@ -2,9 +2,9 @@
 
 ## Status
 
-**Planning handoff only.** This document specifies how a coding agent should extend `crates/riga-cli` from its current scaffold into a full terminal UI that provides feature parity with `@rigai/assistant-ui` while using the same RIGA protocol and runtime semantics.
+**Active phased implementation.** This document specifies how to extend `crates/riga-cli` into a full terminal UI that provides feature parity with `@rigai/assistant-ui` while using the same RIGA protocol and runtime semantics. TUI-0 (IPC headless transport) and TUI-1 (headless projection) are complete; later phases remain implementation work.
 
-No TUI implementation is included in this phase.
+The Ratatui renderer is intentionally deferred to the later terminal-lifecycle phases. Current implementation reports live under `docs/BuildPlan-TUI/`.
 
 ## Mandatory provenance and licensing boundary
 

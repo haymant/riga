@@ -65,4 +65,5 @@ cargo run -p riga-cli -- --list-sessions
 
 ## Next phase
 
-TUI-1: application state and event projection, then TUI-2 Ratatui terminal lifecycle.
+TUI-1 is complete; see `phase-1-report.md`. The next implementation phase is TUI-2:
+terminal lifecycle, application event loop, Ratatui rendering, and idle/composer UI.

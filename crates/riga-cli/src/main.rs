@@ -1,3 +1,4 @@
+mod model;
 mod transport;
 
 use clap::Parser;

@@ -1,3 +1,5 @@
+use std::{future::Future, pin::Pin};
+
 use riga_kernel::{events::RigaEventEnvelope, state::Session};
 use riga_server::{
     CreateSessionRequest, HealthResponse, LocalModelOverview, ServerState,
@@ -7,6 +9,29 @@ use riga_server::{
     ws::{ActiveRun, ProviderConfig},
 };
 use tokio::sync::broadcast;
+
+pub type TransportFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
+
+/// Transport boundary consumed by the application layer. IPC is the default
+/// implementation; a WebSocket adapter can implement the same semantic seam
+/// without changing projection or rendering code.
+#[allow(dead_code)]
+pub trait RigaTransport: Clone + Send + Sync + 'static {
+    fn start_run(
+        &self,
+        run_id: String,
+        session_id: String,
+        prompt: String,
+    ) -> TransportFuture<Result<broadcast::Receiver<RigaEventEnvelope>, String>>;
+
+    fn subscribe_run(
+        &self,
+        run_id: String,
+        after_sequence: u64,
+    ) -> TransportFuture<Result<broadcast::Receiver<RigaEventEnvelope>, String>>;
+
+    fn cancel_run(&self, run_id: String) -> TransportFuture<bool>;
+}
 
 /// The default CLI transport. It deliberately delegates to the same in-process
 /// service used by the Tauri adapter instead of starting a second server.
@@ -111,6 +136,32 @@ impl IpcTransport {
 
     pub async fn upload_attachment(&self, attachment: IpcAttachment) -> Result<Attachment, String> {
         self.service.upload_attachment(attachment).await
+    }
+}
+
+impl RigaTransport for IpcTransport {
+    fn start_run(
+        &self,
+        run_id: String,
+        session_id: String,
+        prompt: String,
+    ) -> TransportFuture<Result<broadcast::Receiver<RigaEventEnvelope>, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.start_run(run_id, session_id, prompt).await })
+    }
+
+    fn subscribe_run(
+        &self,
+        run_id: String,
+        after_sequence: u64,
+    ) -> TransportFuture<Result<broadcast::Receiver<RigaEventEnvelope>, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.subscribe_run(&run_id, after_sequence).await })
+    }
+
+    fn cancel_run(&self, run_id: String) -> TransportFuture<bool> {
+        let transport = self.clone();
+        Box::pin(async move { transport.cancel_run(&run_id).await })
     }
 }
 
