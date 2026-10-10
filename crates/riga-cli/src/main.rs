@@ -6,7 +6,7 @@ mod transport;
 mod ui;
 
 use clap::Parser;
-use model::ConnectionState;
+use model::{CatalogEntry, ConnectionState, ProviderForm};
 use riga_server::{CreateSessionRequest, ServerState};
 use serde_json::json;
 use transport::IpcTransport;
@@ -44,26 +44,33 @@ async fn main() -> Result<(), String> {
 
     if args.tui {
         let sessions = transport.list_sessions().await;
-        let state = model::AppState {
-            connection: ConnectionState::Connected,
-            selected_session: sessions.first().map(|session| session.id.clone()),
-            sessions,
-            ..model::AppState::default()
-        };
-        return app::run_with_transport(
-            app::UiState {
-                state,
-                follow_output: true,
-                ..app::UiState::default()
+        let mut app = app::UiState {
+            state: model::AppState {
+                connection: ConnectionState::Connected,
+                selected_session: sessions.first().map(|session| session.id.clone()),
+                sessions,
+                ..model::AppState::default()
             },
-            transport,
-        )
-        .await;
+            follow_output: true,
+            ..app::UiState::default()
+        };
+        app.set_catalog(parse_catalog(transport.catalog().await));
+        if let Ok(Some(provider)) = transport.provider().await {
+            app.set_provider(ProviderForm {
+                endpoint: provider.endpoint,
+                model: provider.model,
+                reasoning_effort: provider.reasoning_effort,
+                kind: provider.kind,
+                api: provider.api,
+                subagent_model: provider.subagent_model.unwrap_or_default(),
+                ..ProviderForm::default()
+            });
+        }
+        return app::run_with_transport(app, transport).await;
     }
 
-    // TUI-0 intentionally has a deterministic headless surface. Interactive
-    // Ratatui mode is added in the next phase, while IPC remains the default
-    // runtime boundary for both modes.
+    // The headless flags remain deterministic; interactive mode uses the same
+    // IPC runtime boundary and is enabled explicitly with --tui.
     if args.health || (!args.list_sessions && args.create_session.is_none() && !args.catalog) {
         println!(
             "{}",
@@ -102,4 +109,46 @@ async fn main() -> Result<(), String> {
 
     let _ = args.plain;
     Ok(())
+}
+
+fn parse_catalog(
+    catalog: std::collections::BTreeMap<String, serde_json::Value>,
+) -> Vec<CatalogEntry> {
+    let mut entries = Vec::new();
+    for (kind, value) in catalog {
+        let Some(items) = value.as_array() else {
+            continue;
+        };
+        for item in items {
+            let id = item
+                .get("id")
+                .or_else(|| item.get("name"))
+                .or_else(|| item.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if id.is_empty() {
+                continue;
+            }
+            entries.push(CatalogEntry {
+                id: id.into(),
+                kind: kind.clone(),
+                description: item
+                    .get("description")
+                    .or_else(|| item.get("purpose"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .into(),
+                insert_text: item
+                    .get("insert_text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .into(),
+                requires_approval: item
+                    .get("requires_approval")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            });
+        }
+    }
+    entries
 }

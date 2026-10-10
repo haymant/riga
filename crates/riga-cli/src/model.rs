@@ -8,7 +8,7 @@ use riga_kernel::{
     state::Session,
     task::{Graph, Plan, TaskRecord, TaskState, TodoList},
 };
-use riga_server::ws::ActiveRun;
+use riga_server::ws::{ActiveRun, ProviderApi, ProviderConfig, ProviderKind};
 
 const MAX_TRANSCRIPT_ITEMS: usize = 2_000;
 const MAX_TOOL_OUTPUT_CHARS: usize = 100_000;
@@ -33,6 +33,67 @@ pub enum RunStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UiPanel {
+    #[default]
+    Transcript,
+    History,
+    Settings,
+    Catalog,
+    Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogEntry {
+    pub id: String,
+    pub kind: String,
+    pub description: String,
+    pub insert_text: String,
+    pub requires_approval: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderForm {
+    pub endpoint: String,
+    pub api_key: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub kind: ProviderKind,
+    pub api: ProviderApi,
+    pub subagent_model: String,
+    pub error: Option<String>,
+}
+
+impl Default for ProviderForm {
+    fn default() -> Self {
+        Self {
+            endpoint: String::new(),
+            api_key: String::new(),
+            model: String::new(),
+            reasoning_effort: "low".into(),
+            kind: ProviderKind::Remote,
+            api: ProviderApi::Chat,
+            subagent_model: String::new(),
+            error: None,
+        }
+    }
+}
+
+impl ProviderForm {
+    pub fn to_config(&self) -> ProviderConfig {
+        ProviderConfig {
+            endpoint: self.endpoint.trim().into(),
+            api_key: self.api_key.clone(),
+            model: self.model.trim().into(),
+            reasoning_effort: self.reasoning_effort.clone(),
+            kind: self.kind,
+            api: self.api,
+            subagent_model: (!self.subagent_model.trim().is_empty())
+                .then(|| self.subagent_model.trim().into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

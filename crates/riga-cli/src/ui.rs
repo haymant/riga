@@ -10,6 +10,10 @@ use crate::app::UiState;
 use crate::model::{ConnectionState, RunStatus};
 
 pub fn render(frame: &mut Frame<'_>, app: &UiState) {
+    if app.panel != crate::model::UiPanel::Transcript {
+        render_panel(frame, app);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -24,6 +28,125 @@ pub fn render(frame: &mut Frame<'_>, app: &UiState) {
     render_transcript(frame, chunks[1], app);
     render_composer(frame, chunks[2], app);
     render_footer(frame, chunks[3], app);
+}
+
+fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
+    let area = frame.area();
+    let (title, lines) = match app.panel {
+        crate::model::UiPanel::History => {
+            let mut lines = vec![Line::from(
+                "↑/↓ select · Enter switch · n new session · Esc close",
+            )];
+            if app.creating_session {
+                lines.push(Line::from(format!(
+                    "New session title: {}",
+                    app.panel_input.text()
+                )));
+                lines.push(Line::from(format!(
+                    "Workspace (Tab switches): {}",
+                    app.workspace_input.text()
+                )));
+                lines.push(Line::from("Enter create · Esc cancel"));
+            } else if app.state.sessions.is_empty() {
+                lines.push(Line::from("No sessions. Press n to create one."));
+            } else {
+                for (index, session) in app.state.sessions.iter().enumerate() {
+                    lines.push(Line::from(format!(
+                        "{} {} · {} · {} · updated {}",
+                        if index == app.panel_cursor {
+                            "▶"
+                        } else {
+                            " "
+                        },
+                        session.title,
+                        session.id,
+                        session.workspace,
+                        session.updated_at
+                    )));
+                }
+            }
+            ("Session history", lines)
+        }
+        crate::model::UiPanel::Settings => {
+            let p = &app.provider;
+            let masked = if p.api_key.is_empty() {
+                "(unchanged/empty)".into()
+            } else {
+                "•".repeat(p.api_key.chars().count().min(32))
+            };
+            let values = [
+                format!("endpoint: {}", p.endpoint),
+                format!("api key: {masked}"),
+                format!("model: {}", p.model),
+                format!("reasoning effort: {}", p.reasoning_effort),
+                format!("provider kind: {:?}", p.kind),
+                format!("provider API: {:?}", p.api),
+                format!("subagent model: {}", p.subagent_model),
+            ];
+            let mut lines = vec![Line::from("Tab/Shift+Tab fields · Ctrl+S save · Esc close")];
+            for (index, value) in values.into_iter().enumerate() {
+                lines.push(Line::from(format!(
+                    "{} {}",
+                    if index == app.provider_field {
+                        "▶"
+                    } else {
+                        " "
+                    },
+                    value
+                )));
+            }
+            if let Some(error) = &p.error {
+                lines.push(Line::from(format!("ERROR: {error}")));
+            }
+            ("Provider settings", lines)
+        }
+        crate::model::UiPanel::Catalog => {
+            let entries = app.filtered_catalog();
+            let mut lines = vec![Line::from(format!(
+                "Filter: {} · ↑/↓ select · Enter insert · Esc close",
+                app.catalog_query.text()
+            ))];
+            if entries.is_empty() {
+                lines.push(Line::from("No server catalog entries match the filter."));
+            }
+            for (index, entry) in entries
+                .iter()
+                .enumerate()
+                .take(area.height.saturating_sub(4) as usize)
+            {
+                lines.push(Line::from(format!(
+                    "{} [{}] {} — {}{}",
+                    if index == app.panel_cursor {
+                        "▶"
+                    } else {
+                        " "
+                    },
+                    entry.kind,
+                    entry.id,
+                    entry.description,
+                    if entry.requires_approval {
+                        " · approval"
+                    } else {
+                        ""
+                    }
+                )));
+            }
+            ("Command palette (server catalog)", lines)
+        }
+        crate::model::UiPanel::Help => (
+            "Help",
+            vec![Line::from(
+                "Ctrl+H history · Ctrl+, settings · Ctrl+K catalog · r reasoning · t tools · y/a/n approvals · Esc close/cancel · q quit",
+            )],
+        ),
+        crate::model::UiPanel::Transcript => unreachable!(),
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn composer_height(app: &UiState, area: Rect) -> u16 {
@@ -241,7 +364,7 @@ mod tests {
     use crate::{
         app::UiState,
         input::TextBuffer,
-        model::{AppState, ConnectionState},
+        model::{AppState, ConnectionState, ProviderForm, UiPanel},
     };
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -288,5 +411,29 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("disconnected"));
+    }
+
+    #[test]
+    fn provider_settings_mask_api_keys() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = UiState {
+            panel: UiPanel::Settings,
+            ..UiState::default()
+        };
+        app.set_provider(ProviderForm {
+            api_key: "do-not-display".into(),
+            ..ProviderForm::default()
+        });
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!text.contains("do-not-display"));
+        assert!(text.contains("••••"));
     }
 }

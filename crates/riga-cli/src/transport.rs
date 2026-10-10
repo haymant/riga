@@ -17,6 +17,16 @@ pub type TransportFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// without changing projection or rendering code.
 #[allow(dead_code)]
 pub trait RigaTransport: Clone + Send + Sync + 'static {
+    fn create_session(
+        &self,
+        request: CreateSessionRequest,
+    ) -> TransportFuture<Result<Session, String>>;
+
+    fn configure_provider(
+        &self,
+        config: ProviderConfig,
+    ) -> TransportFuture<Result<ProviderConfigured, String>>;
+
     fn start_run(
         &self,
         run_id: String,
@@ -147,6 +157,22 @@ impl IpcTransport {
 }
 
 impl RigaTransport for IpcTransport {
+    fn create_session(
+        &self,
+        request: CreateSessionRequest,
+    ) -> TransportFuture<Result<Session, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.create_session(request).await })
+    }
+
+    fn configure_provider(
+        &self,
+        config: ProviderConfig,
+    ) -> TransportFuture<Result<ProviderConfigured, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.configure_provider(config).await })
+    }
+
     fn start_run(
         &self,
         run_id: String,
