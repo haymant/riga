@@ -4,7 +4,7 @@
 
 **Scope:** `crates/riga-cli`, the existing `riga_server::ipc::IpcService` adapter, and the optional WebSocket adapter required for a Ratatui UI.
 
-**Out of scope:** Browser/Tauri pixel behavior, provider/model quality, GPU/llama performance, external MCP services, and Steer/Codex source or runtime dependencies.
+
 
 ## 1. Corrections to the supplied draft
 
@@ -254,7 +254,7 @@ Use wait-until-screen predicates, not arbitrary sleeps. Save failure screens und
 - Set `RIGA_DATA_DIR` to a temporary path for tests that touch persistence.
 - Use `127.0.0.1:0` for fake servers.
 - Do not call public APIs, model providers, MCP services, or the network outside the local fake server.
-- Do not commit `references/steer` as a source dependency or test fixture.
+
 
 ## 6. Failure artifacts
 

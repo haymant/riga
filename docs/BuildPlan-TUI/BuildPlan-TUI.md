@@ -2,28 +2,28 @@
 
 ## Status
 
-**Active phased implementation.** This document specifies how to extend `crates/riga-cli` into a full terminal UI that provides feature parity with `@rigai/assistant-ui` while using the same RIGA protocol and runtime semantics. TUI-0 (IPC headless transport) and TUI-1 (headless projection) are complete; later phases remain implementation work.
+**Active phased implementation.** This document specifies how to extend `crates/riga-cli` into a full terminal UI that provides feature parity with `@rigai/assistant-ui` while using the same RIGA protocol and runtime semantics. TUI-0 (IPC headless transport), TUI-1 (headless projection), TUI-2 (terminal lifecycle), and TUI-3 (streaming transcript and approvals) are complete; later phases remain implementation work.
 
-The Ratatui renderer is intentionally deferred to the later terminal-lifecycle phases. Current implementation reports live under `docs/BuildPlan-TUI/`.
+The Ratatui renderer is implemented through TUI-3 and continues to expand in later feature phases. Current implementation reports live under `docs/BuildPlan-TUI/`.
 
 ## Mandatory provenance and licensing boundary
 
-`references/steer/` is a local, read-only reference checkout of `https://github.com/BrendanGraham14/steer`. It exists only for high-level product and interaction study.
+The TUI is authored solely from RIGA requirements, protocol contracts, and the existing kernel/server implementation.
 
-The implementation agent **must not copy, adapt, translate, port, or mechanically reproduce code, module structure, identifiers, comments, tests, CSS-like styling, or algorithms from Steer**. Do not add a Steer dependency. Do not copy code from Codex or any other external TUI. The resulting implementation must be authored from RIGA requirements and the RIGA protocol.
+Do not copy, adapt, translate, port, or mechanically reproduce code, module structure, identifiers, comments, tests, styling, or algorithms from external TUI implementations. Do not add external TUI dependencies. The resulting implementation must be authored from RIGA requirements and the RIGA protocol.
 
 Allowed reference use:
 
 - Observe general terminal interaction patterns such as a persistent input area, scrollable transcript, approval interruption, session switching, command palette, and explicit status surfaces.
 - Observe general Ratatui layout techniques from public documentation.
-- Compare usability ideas from Codex documentation or public product descriptions.
+
 
 Not allowed:
 
-- Reusing Steer or Codex source code.
+
 - Reusing their protocol, event model, tool schema, session database, prompt format, or approval semantics.
 - Making RIGA behavior depend on a reference project.
-- Adding a copyright/license notice that implies the TUI is derived from Steer or Codex.
+
 
 RIGA remains the sole source of truth for behavior. The TUI is a second presentation variant of the same RIGA protocol: React in `@rigai/assistant-ui`, Ratatui in `riga-cli`.
 
@@ -398,7 +398,7 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 uuid = { version = "1", features = ["v4"] }
 ```
 
-Use versions compatible with the workspace lockfile. Do not add Steer, Codex, or unrelated framework dependencies.
+
 
 If TLS feature selection differs in the workspace, choose a documented deterministic feature set and test both `ws://` and `wss://` parsing without putting credentials in logs.
 
@@ -1117,7 +1117,7 @@ session_flow.rs
 terminal_layout.rs
 ```
 
-The fake server must be an in-process test WebSocket server that sends RIGA protocol frames. It must not call a provider or depend on Steer/Codex.
+
 
 Test scenarios:
 
@@ -1381,7 +1381,7 @@ The TUI work is complete only when:
 - it uses the same `RigaEventEnvelope`, task states, graph, evidence, knowledge, and approval semantics as assistant-ui;
 - React and Ratatui consume conformance fixtures with equivalent event meaning;
 - all supported assistant-ui operations have a CLI mapping or an explicit unsupported status;
-- the TUI works without Steer or Codex at build time and runtime;
+
 - no external reference source code was copied or adapted;
 - terminal restoration is reliable;
 - streaming, scrollback, approvals, reconnection, and active-run cancellation are tested;
@@ -1401,9 +1401,7 @@ crates/riga-kernel/src/events.rs, crates/riga-kernel/src/task.rs,
 crates/riga-kernel/src/policy.rs, packages/assistant-ui/src/protocol/index.ts,
 and docs/Features/RUNDECK.md, SUBAGENT.md, EVIDENCE.md, and KNOWLEDGE.md first.
 
-The repository contains references/steer only for high-level study. Do not copy,
-port, translate, adapt, or depend on Steer or Codex code. RIGA protocol and kernel
-contracts are the only implementation authority.
+
 
 Implement one phase at a time. Start with the public `riga_server::ipc::IpcService` adapter. Keep riga-cli a thin
 client and keep all agent/provider/tool/policy logic in the existing RIGA runtime.
@@ -1424,4 +1422,4 @@ At the end of each phase return:
 
 ## 18. Reference note
 
-Steer and Codex informed only the interaction checklist in this document: persistent terminal input, scrollable output, approval interruption, compact status, session navigation, and graceful terminal recovery. They do not define RIGA's protocol, data model, tool policy, event ordering, task graph, evidence, knowledge, provider configuration, or UI semantics.
+

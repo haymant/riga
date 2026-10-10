@@ -43,15 +43,22 @@ async fn main() -> Result<(), String> {
     let transport = IpcTransport::new(ServerState::default());
 
     if args.tui {
+        let sessions = transport.list_sessions().await;
         let state = model::AppState {
             connection: ConnectionState::Connected,
-            sessions: transport.list_sessions().await,
+            selected_session: sessions.first().map(|session| session.id.clone()),
+            sessions,
             ..model::AppState::default()
         };
-        return app::run(app::UiState {
-            state,
-            ..app::UiState::default()
-        });
+        return app::run_with_transport(
+            app::UiState {
+                state,
+                follow_output: true,
+                ..app::UiState::default()
+            },
+            transport,
+        )
+        .await;
     }
 
     // TUI-0 intentionally has a deterministic headless surface. Interactive

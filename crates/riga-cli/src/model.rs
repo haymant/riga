@@ -40,6 +40,8 @@ pub enum TranscriptItem {
     AssistantText(String),
     AssistantReasoning(String),
     ToolCall {
+        call_id: String,
+        tool: String,
         call: serde_json::Value,
     },
     ToolOutput {
@@ -47,6 +49,7 @@ pub enum TranscriptItem {
         output: String,
     },
     ToolResult {
+        call_id: Option<String>,
         result: serde_json::Value,
     },
     TaskResult {
@@ -132,13 +135,17 @@ impl RunView {
     fn append_bounded(value: &mut String, delta: &str, limit: usize) {
         value.push_str(delta);
         if value.len() > limit {
-            let cut = value.len() - limit;
+            let marker = "… [truncated]";
+            let keep = limit.saturating_sub(marker.len());
             let boundary = value
                 .char_indices()
                 .map(|(index, _)| index)
-                .find(|index| *index >= cut)
+                .find(|index| *index >= value.len().saturating_sub(keep))
                 .unwrap_or(0);
-            value.drain(..boundary);
+            let tail = value[boundary..].to_owned();
+            value.clear();
+            value.push_str(marker);
+            value.push_str(&tail);
         }
     }
 
@@ -158,7 +165,13 @@ impl RunView {
 
     fn settle(&mut self, status: RunStatus) {
         self.status = status;
-        self.approvals.clear();
+        if status == RunStatus::Failed || status == RunStatus::Cancelled {
+            for approval in self.approvals.values_mut() {
+                if approval.resolved.is_none() {
+                    approval.resolved = Some(false);
+                }
+            }
+        }
     }
 }
 
@@ -218,13 +231,21 @@ impl AppState {
             }
             RigaEvent::ReasoningDelta { delta } => run.append_reasoning(&delta),
             RigaEvent::ToolCallStarted { call } => {
-                run.push_transcript(TranscriptItem::ToolCall { call });
+                let call_id =
+                    json_string(&call, &["call_id", "id"]).unwrap_or_else(|| "unknown-call".into());
+                let tool = json_string(&call, &["tool", "name"]).unwrap_or_else(|| "tool".into());
+                run.push_transcript(TranscriptItem::ToolCall {
+                    call_id,
+                    tool,
+                    call,
+                });
             }
             RigaEvent::ToolOutputDelta { call_id, delta } => {
                 run.append_tool_output(&call_id, &delta);
             }
             RigaEvent::ToolResult { result } => {
-                run.push_transcript(TranscriptItem::ToolResult { result });
+                let call_id = json_string(&result, &["call_id", "id"]);
+                run.push_transcript(TranscriptItem::ToolResult { call_id, result });
             }
             RigaEvent::PlanUpdated { plan } => run.plan = Some(*plan),
             RigaEvent::TodoUpdated { list } => run.todos = Some(*list),
@@ -329,7 +350,6 @@ impl AppState {
                 if let Some(approval) = run.approvals.get_mut(&approval_id) {
                     approval.resolved = Some(approved);
                 }
-                run.approvals.remove(&approval_id);
                 if run.status == RunStatus::WaitingForApproval {
                     run.status = RunStatus::Running;
                 }
@@ -362,6 +382,23 @@ impl AppState {
     pub fn run(&self, run_id: &str) -> Option<&RunView> {
         self.runs.get(run_id)
     }
+
+    pub fn pending_approval(&self) -> Option<&ApprovalView> {
+        self.active_run
+            .as_deref()
+            .and_then(|id| self.runs.get(id))
+            .and_then(|run| {
+                run.approvals
+                    .values()
+                    .find(|approval| approval.resolved.is_none())
+            })
+    }
+}
+
+fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::to_owned)
 }
 
 fn trim_front<T>(values: &mut Vec<T>, max: usize) {
@@ -407,7 +444,7 @@ mod tests {
         app.apply_event(envelope(
             4,
             RigaEvent::ToolCallStarted {
-                call: serde_json::json!({"name": "read"}),
+                call: serde_json::json!({"id": "call-1", "name": "read"}),
             },
         ));
         app.apply_event(envelope(
@@ -478,7 +515,7 @@ mod tests {
         ));
         let run = app.run("run-1").unwrap();
         assert_eq!(run.status, RunStatus::Failed);
-        assert!(run.approvals.is_empty());
+        assert_eq!(run.approvals["approval-1"].resolved, Some(false));
         assert!(
             run.transcript.iter().any(
                 |item| matches!(item, TranscriptItem::System(text) if text.contains("denied"))
@@ -499,5 +536,41 @@ mod tests {
             }
         );
         assert!(app.runs.is_empty());
+    }
+
+    #[test]
+    fn approval_resolution_stays_visible_and_pending_lookup_is_scoped() {
+        let mut app = AppState::default();
+        app.select_run(Some("run-1".into()));
+        app.apply_event(envelope(
+            1,
+            RigaEvent::ApprovalRequested {
+                approval_id: "approval-1".into(),
+                task_id: "task-1".into(),
+                tool: "bash".into(),
+                summary: "run tests".into(),
+            },
+        ));
+        assert_eq!(app.pending_approval().unwrap().approval_id, "approval-1");
+        app.apply_event(envelope(
+            2,
+            RigaEvent::ApprovalResolved {
+                approval_id: "approval-1".into(),
+                approved: true,
+                reason: None,
+            },
+        ));
+        assert!(app.pending_approval().is_none());
+        assert_eq!(
+            app.run("run-1").unwrap().approvals["approval-1"].resolved,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn bounded_streams_keep_utf8_validity_and_mark_truncation() {
+        let mut value = String::new();
+        RunView::append_bounded(&mut value, &"界".repeat(50_000), MAX_TOOL_OUTPUT_CHARS);
+        assert!(value.starts_with("… [truncated]"));
     }
 }

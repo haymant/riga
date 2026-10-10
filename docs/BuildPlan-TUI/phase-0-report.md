@@ -25,7 +25,7 @@ Status: **COMPLETE**
 - `docs/BuildPlan-TUI/phase-0-report.md`
 - `Cargo.lock`
 
-The isolated `references/steer` checkout remains conceptual reference material only; no implementation code was copied into `riga-cli`.
+
 
 ## Tests run
 

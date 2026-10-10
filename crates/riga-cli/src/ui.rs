@@ -66,13 +66,29 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     let mut lines = Vec::new();
     if let Some(run_id) = &app.state.active_run {
         if let Some(run) = app.state.run(run_id) {
-            for item in run
+            let capacity = area.height.saturating_sub(2) as usize * 3;
+            let start = run
                 .transcript
-                .iter()
-                .rev()
-                .take(area.height as usize * 3)
-                .rev()
-            {
+                .len()
+                .saturating_sub(capacity)
+                .saturating_sub(app.transcript_scroll);
+            let end = (start + capacity).min(run.transcript.len());
+            for item in &run.transcript[start..end] {
+                if app.reasoning_collapsed
+                    && matches!(item, crate::model::TranscriptItem::AssistantReasoning(_))
+                {
+                    continue;
+                }
+                if app.tools_collapsed
+                    && matches!(
+                        item,
+                        crate::model::TranscriptItem::ToolCall { .. }
+                            | crate::model::TranscriptItem::ToolOutput { .. }
+                            | crate::model::TranscriptItem::ToolResult { .. }
+                    )
+                {
+                    continue;
+                }
                 lines.push(match item {
                     crate::model::TranscriptItem::AssistantText(text) => Line::from(vec![
                         Span::styled("You ", Style::default().fg(Color::Green)),
@@ -84,8 +100,12 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                             Style::default().fg(Color::DarkGray),
                         ))
                     }
-                    crate::model::TranscriptItem::ToolCall { call } => Line::from(Span::styled(
-                        format!("tool · {call}"),
+                    crate::model::TranscriptItem::ToolCall {
+                        call_id,
+                        tool,
+                        call,
+                    } => Line::from(Span::styled(
+                        format!("tool {tool} [{call_id}] · {call}"),
                         Style::default().fg(Color::Yellow),
                     )),
                     crate::model::TranscriptItem::ToolOutput { call_id, output } => {
@@ -94,9 +114,15 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                             Style::default().fg(Color::Yellow),
                         ))
                     }
-                    crate::model::TranscriptItem::ToolResult { result } => {
+                    crate::model::TranscriptItem::ToolResult { call_id, result } => {
                         Line::from(Span::styled(
-                            format!("tool result · {result}"),
+                            format!(
+                                "tool result{} · {result}",
+                                call_id
+                                    .as_deref()
+                                    .map(|id| format!(" [{id}]"))
+                                    .unwrap_or_default()
+                            ),
                             Style::default().fg(Color::Yellow),
                         ))
                     }
@@ -146,10 +172,15 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
-    let title = if app.state.active_run.is_some() {
-        "Composer · Esc stop · Enter send"
+    let title = if let Some(approval) = app.state.pending_approval() {
+        format!(
+            "Approval · {} / {} · y allow · a always · n deny",
+            approval.tool, approval.approval_id
+        )
+    } else if app.state.active_run.is_some() {
+        "Composer · Esc stop · Enter send".to_owned()
     } else {
-        "Composer · Shift+Enter newline · Enter send"
+        "Composer · Shift+Enter newline · Enter send".to_owned()
     };
     frame.render_widget(
         Paragraph::new(app.draft.text())
@@ -178,8 +209,19 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
         Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ history ", Style::default().fg(Color::DarkGray)),
             Span::raw("· "),
+            Span::styled(
+                if app.new_events > 0 {
+                    format!("{} new events", app.new_events)
+                } else if app.follow_output {
+                    "following".into()
+                } else {
+                    "paused · End to follow".into()
+                },
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(" · "),
             Span::styled(status, Style::default().fg(Color::Cyan)),
-            Span::raw(" · q quit"),
+            Span::raw(" · r reasoning · t tools · q quit"),
         ])),
         area,
     );
@@ -213,6 +255,7 @@ mod tests {
                 draft: TextBuffer::default(),
                 last_submitted: None,
                 should_quit: false,
+                ..UiState::default()
             };
             terminal.draw(|frame| render(frame, &app)).unwrap();
             let buffer = terminal.backend().buffer();
@@ -234,6 +277,7 @@ mod tests {
             draft: TextBuffer::default(),
             last_submitted: None,
             should_quit: false,
+            ..UiState::default()
         };
         terminal.draw(|frame| render(frame, &app)).unwrap();
         let text: String = terminal

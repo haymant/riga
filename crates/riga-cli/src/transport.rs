@@ -31,6 +31,13 @@ pub trait RigaTransport: Clone + Send + Sync + 'static {
     ) -> TransportFuture<Result<broadcast::Receiver<RigaEventEnvelope>, String>>;
 
     fn cancel_run(&self, run_id: String) -> TransportFuture<bool>;
+
+    fn respond_to_approval(
+        &self,
+        approval_id: String,
+        approved: bool,
+        always: bool,
+    ) -> TransportFuture<bool>;
 }
 
 /// The default CLI transport. It deliberately delegates to the same in-process
@@ -162,6 +169,20 @@ impl RigaTransport for IpcTransport {
     fn cancel_run(&self, run_id: String) -> TransportFuture<bool> {
         let transport = self.clone();
         Box::pin(async move { transport.cancel_run(&run_id).await })
+    }
+
+    fn respond_to_approval(
+        &self,
+        approval_id: String,
+        approved: bool,
+        always: bool,
+    ) -> TransportFuture<bool> {
+        let transport = self.clone();
+        Box::pin(async move {
+            transport
+                .respond_to_approval(&approval_id, approved, always)
+                .await
+        })
     }
 }
 
