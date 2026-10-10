@@ -208,7 +208,73 @@ fn sidebar_panel_title(panel: UiPanel) -> &'static str {
     }
 }
 
-fn sidebar_panel_lines(app: &UiState, panel: UiPanel, max_lines: usize) -> Vec<Line<'static>> {
+fn fit_sidebar_text(text: &str, max_width: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if max_width == 0 {
+        return String::new();
+    }
+    if Line::from(compact.clone()).width() as usize <= max_width {
+        return compact;
+    }
+    let mut output = String::new();
+    for character in compact.chars() {
+        let candidate = format!("{output}{character}…");
+        if Line::from(candidate).width() as usize > max_width {
+            break;
+        }
+        output.push(character);
+    }
+    output.push('…');
+    output
+}
+
+fn sidebar_section(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        title.to_uppercase(),
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn sidebar_field(label: &str, value: &str, max_width: usize) -> Line<'static> {
+    sidebar_field_color(label, value, max_width, Color::Gray)
+}
+
+fn sidebar_field_color(
+    label: &str,
+    value: &str,
+    max_width: usize,
+    value_color: Color,
+) -> Line<'static> {
+    let prefix = format!("{label} · ");
+    let value_width = max_width.saturating_sub(Line::from(prefix.as_str()).width() as usize);
+    Line::from(vec![
+        Span::styled(prefix, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            fit_sidebar_text(value, value_width),
+            Style::default().fg(value_color),
+        ),
+    ])
+}
+
+fn sidebar_setting_line(
+    index: usize,
+    selected: usize,
+    label: &str,
+    value: &str,
+    max_width: usize,
+) -> Line<'static> {
+    let marker = if index == selected { "›" } else { " " };
+    sidebar_field(&format!("{marker} {label}"), value, max_width)
+}
+
+fn sidebar_panel_lines(
+    app: &UiState,
+    panel: UiPanel,
+    max_lines: usize,
+    max_width: usize,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match panel {
         UiPanel::History | UiPanel::Transcript => {
@@ -217,16 +283,12 @@ fn sidebar_panel_lines(app: &UiState, panel: UiPanel, max_lines: usize) -> Vec<L
                 lines.push(Line::from(format!("Title: {}", app.panel_input.text())));
                 lines.push(Line::from(format!(
                     "Workspace: {}",
-                    app.workspace_input.text()
+                    fit_sidebar_text(app.workspace_input.text(), max_width.saturating_sub(11))
                 )));
-                lines.push(Line::from("Enter save · Esc cancel"));
             } else if app.renaming_session.is_some() {
                 lines.push(Line::from("Rename session"));
                 lines.push(Line::from(app.panel_input.text().to_owned()));
-                lines.push(Line::from("Enter save · Esc cancel"));
             } else {
-                lines.push(Line::from("Tab chat · +/- resize"));
-                lines.push(Line::from("Ctrl+H · n new · r rename"));
                 if app.state.sessions.is_empty() {
                     lines.push(Line::from("No sessions yet"));
                 }
@@ -237,54 +299,115 @@ fn sidebar_panel_lines(app: &UiState, panel: UiPanel, max_lines: usize) -> Vec<L
                         app.state.selected_session.as_deref() == Some(&session.id)
                     };
                     let marker = if selected { "●" } else { "○" };
-                    lines.push(Line::from(format!("{marker} {}", session.title)));
+                    lines.push(Line::from(format!(
+                        "{marker} {}",
+                        fit_sidebar_text(&session.title, max_width.saturating_sub(2))
+                    )));
                 }
             }
         }
         UiPanel::Settings => {
             let provider = &app.provider;
-            let api_key = if provider.api_key.is_empty() {
-                "(empty)".to_owned()
-            } else {
-                "•".repeat(provider.api_key.chars().count().min(24))
-            };
-            lines.extend([
-                Line::from("Ctrl+, · Tab fields · Ctrl+S save"),
-                Line::from(format!("Endpoint: {}", provider.endpoint)),
-                Line::from(format!("API key: {api_key}")),
-                Line::from(format!("Model: {}", provider.model)),
-                Line::from(format!("Reasoning: {}", provider.reasoning_effort)),
-                Line::from(format!("Provider: {:?}", provider.kind)),
-                Line::from(format!("API: {:?}", provider.api)),
-                Line::from(format!("Subagent: {}", provider.subagent_model)),
-            ]);
+            lines.push(sidebar_section("Connection"));
+            lines.push(sidebar_setting_line(
+                0,
+                app.provider_field,
+                "Endpoint",
+                if provider.endpoint.is_empty() {
+                    "Not configured"
+                } else {
+                    &provider.endpoint
+                },
+                max_width,
+            ));
+            lines.push(sidebar_setting_line(
+                1,
+                app.provider_field,
+                "API key",
+                if provider.api_key.is_empty() {
+                    "Not configured"
+                } else {
+                    "Configured"
+                },
+                max_width,
+            ));
+            lines.push(sidebar_setting_line(
+                2,
+                app.provider_field,
+                "Model",
+                if provider.model.is_empty() {
+                    "Not configured"
+                } else {
+                    &provider.model
+                },
+                max_width,
+            ));
+            lines.push(sidebar_section("Behavior"));
+            lines.push(sidebar_setting_line(
+                3,
+                app.provider_field,
+                "Reasoning",
+                &provider.reasoning_effort,
+                max_width,
+            ));
+            lines.push(sidebar_setting_line(
+                4,
+                app.provider_field,
+                "Provider",
+                &format!("{:?}", provider.kind),
+                max_width,
+            ));
+            lines.push(sidebar_setting_line(
+                5,
+                app.provider_field,
+                "API",
+                &format!("{:?}", provider.api),
+                max_width,
+            ));
+            lines.push(sidebar_setting_line(
+                6,
+                app.provider_field,
+                "Subagent",
+                if provider.subagent_model.is_empty() {
+                    "Default"
+                } else {
+                    &provider.subagent_model
+                },
+                max_width,
+            ));
             if let Some(error) = &provider.error {
-                lines.push(Line::from(format!("Error: {error}")));
+                lines.push(Line::from(vec![
+                    Span::styled("Error · ", Style::default().fg(Color::Red)),
+                    Span::styled(
+                        fit_sidebar_text(error, max_width.saturating_sub(9)),
+                        Style::default().fg(Color::Red),
+                    ),
+                ]));
             }
         }
         UiPanel::LocalModels => {
-            lines.extend(render_local_models(app));
-            if let Some(progress) = app.local_model_progress {
-                lines.push(Line::from(format!("Downloading {:.1}%", progress * 100.0)));
-            } else if let Some(busy) = &app.busy {
-                lines.push(Line::from(format!("{busy} …")));
-            }
+            lines.extend(render_local_models_sidebar(app, max_lines, max_width));
         }
         UiPanel::RunDeck => {
-            lines.extend(render_rundeck(app));
-            lines.push(Line::from("Tab chat · ←/→ change view · Esc close"));
+            lines.extend(render_rundeck_sidebar(app, max_lines, max_width));
         }
         UiPanel::Catalog => {
-            lines.push(Line::from(format!("Filter: {}", app.catalog_query.text())));
-            for entry in app
-                .filtered_catalog()
-                .into_iter()
-                .take(max_lines.saturating_sub(2))
-            {
-                lines.push(Line::from(format!("[{}] {}", entry.kind, entry.id)));
+            let entries = app.filtered_catalog();
+            lines.push(sidebar_field("Filter", app.catalog_query.text(), max_width));
+            lines.push(sidebar_field(
+                "Matches",
+                &format!("{} entries", entries.len()),
+                max_width,
+            ));
+            if let Some(entry) = entries.get(app.panel_cursor) {
+                lines.push(sidebar_section("Selected"));
+                lines.push(sidebar_field("Type", &entry.kind, max_width));
+                lines.push(Line::from(fit_sidebar_text(&entry.id, max_width)));
                 if !entry.description.is_empty() {
-                    lines.push(Line::from(format!("  {}", entry.description)));
+                    lines.push(sidebar_field("About", &entry.description, max_width));
                 }
+            } else if entries.is_empty() {
+                lines.push(Line::from("No matching entries"));
             }
         }
         UiPanel::Help => {
@@ -297,6 +420,7 @@ fn sidebar_panel_lines(app: &UiState, panel: UiPanel, max_lines: usize) -> Vec<L
                 Line::from("Ctrl+D · RunDeck"),
                 Line::from("/ · tools, skills, MCP"),
                 Line::from("@ · files, subagents"),
+                Line::from("v · model choices / RunDeck details"),
                 Line::from("Ctrl+R / Ctrl+T · collapse output"),
                 Line::from("Tab / mouse · focus composer, chat, sidebar"),
                 Line::from("Shift+drag select · Ctrl+C copy · Ctrl+Shift+V paste"),
@@ -304,6 +428,502 @@ fn sidebar_panel_lines(app: &UiState, panel: UiPanel, max_lines: usize) -> Vec<L
             ]);
         }
     }
+    lines.truncate(max_lines.max(1));
+    lines
+}
+
+fn sidebar_footer_hints(app: &UiState, panel: UiPanel) -> Vec<String> {
+    if app.panel != panel {
+        return vec![
+            "Tab focus · +/- resize".into(),
+            "Ctrl+H history · Ctrl+I info".into(),
+        ];
+    }
+    match panel {
+        UiPanel::History if app.creating_session || app.renaming_session.is_some() => [
+            "Enter save · Esc cancel".into(),
+            "Tab chat · Ctrl+H history".into(),
+        ]
+        .into(),
+        UiPanel::History | UiPanel::Transcript => [
+            "↑/↓ select · Enter open".into(),
+            "n new · r rename · Esc close".into(),
+        ]
+        .into(),
+        UiPanel::Settings => [
+            "Tab fields · Ctrl+S save".into(),
+            "↑/↓ change · Esc close".into(),
+        ]
+        .into(),
+        UiPanel::LocalModels if app.local_attachment_input => [
+            "Enter upload · Esc cancel".into(),
+            "Tab chat · Ctrl+L models".into(),
+        ]
+        .into(),
+        UiPanel::LocalModels => [
+            "↑/↓ choose · Enter load/get".into(),
+            "v list · a attach · u unload".into(),
+            "x cancel download · Esc close".into(),
+        ]
+        .into(),
+        UiPanel::RunDeck => [
+            "←/→ lens · ↑/↓ runs".into(),
+            format!(
+                "v {} · Enter resume",
+                if app.deck_details_expanded {
+                    "summary"
+                } else {
+                    "details"
+                }
+            ),
+            "x stop · Esc close".into(),
+        ]
+        .into(),
+        UiPanel::Catalog => [
+            "Type filter · ↑/↓ select".into(),
+            "Enter insert · Esc close".into(),
+        ]
+        .into(),
+        UiPanel::Help => vec![
+            "Tab focus · Esc close".into(),
+            "q quit · Ctrl+I info".into(),
+        ],
+    }
+}
+
+fn sidebar_footer_height(app: &UiState, panel: UiPanel, available_height: u16) -> u16 {
+    if available_height < 5 {
+        0
+    } else {
+        (sidebar_footer_hints(app, panel).len() as u16).min(available_height.saturating_sub(1))
+    }
+}
+
+fn render_sidebar_footer(frame: &mut Frame<'_>, area: Rect, app: &UiState, panel: UiPanel) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let background = Color::Rgb(25, 25, 27);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(background)),
+        area,
+    );
+    let hints = sidebar_footer_hints(app, panel);
+    let lines = hints
+        .into_iter()
+        .take(area.height as usize)
+        .map(|hint| {
+            Line::from(Span::styled(
+                fit_sidebar_text(&hint, area.width.saturating_sub(1) as usize),
+                Style::default().fg(Color::DarkGray).bg(background),
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(Style::default().bg(background)),
+        area,
+    );
+}
+
+fn render_local_models_sidebar(
+    app: &UiState,
+    max_lines: usize,
+    max_width: usize,
+) -> Vec<Line<'static>> {
+    if app.local_attachment_input {
+        return vec![
+            sidebar_section("Attach file"),
+            sidebar_field("Path", app.panel_input.text(), max_width),
+        ];
+    }
+    let Some(overview) = &app.local_models else {
+        let mut lines = vec![sidebar_section("Runtime"), Line::from("No model inventory")];
+        if let Some(progress) = app.local_model_progress {
+            lines.push(sidebar_field(
+                "Downloading",
+                &format!("{:.1}%", progress * 100.0),
+                max_width,
+            ));
+        } else if let Some(activity) = app.local_model_status.as_deref().or(app.busy.as_deref()) {
+            lines.push(sidebar_field("Activity", activity, max_width));
+        }
+        if let Some(error) = &app.local_model_error {
+            lines.push(sidebar_field("Error", error, max_width));
+        }
+        lines.truncate(max_lines.max(1));
+        return lines;
+    };
+
+    let mut lines = vec![sidebar_section("Runtime")];
+    lines.push(sidebar_field("Device", overview.accelerator, max_width));
+    lines.push(sidebar_field(
+        "Loaded",
+        overview.loaded.as_deref().unwrap_or("None"),
+        max_width,
+    ));
+
+    let total = overview.installed.len() + overview.catalog.len();
+    if let Some(progress) = app.local_model_progress {
+        let downloading =
+            local_model_sidebar_item(overview, app.panel_cursor.min(total.saturating_sub(1)))
+                .map(|(name, _, _)| name)
+                .unwrap_or_else(|| "model".into());
+        lines.push(sidebar_field(
+            "Downloading",
+            &format!("{downloading} · {:.1}%", progress * 100.0),
+            max_width,
+        ));
+    } else if let Some(status) = &app.local_model_status {
+        lines.push(sidebar_field("Activity", status, max_width));
+    } else if let Some(busy) = &app.busy {
+        lines.push(sidebar_field("Activity", busy, max_width));
+    }
+
+    lines.push(sidebar_section("Library"));
+    lines.push(sidebar_field(
+        "Models",
+        &format!(
+            "{} installed · {} catalog",
+            overview.installed.len(),
+            overview.catalog.len()
+        ),
+        max_width,
+    ));
+
+    if total == 0 {
+        lines.push(Line::from("No models available"));
+    } else if app.local_models_expanded {
+        lines.push(sidebar_section("Choices"));
+        let list_capacity = max_lines.saturating_sub(lines.len()).max(1);
+        let selected = app.panel_cursor.min(total - 1);
+        let start = selected
+            .saturating_sub(list_capacity / 2)
+            .min(total.saturating_sub(list_capacity));
+        for index in start..(start + list_capacity).min(total) {
+            if let Some((name, detail, kind)) = local_model_sidebar_item(overview, index) {
+                let marker = if index == selected { "›" } else { "·" };
+                lines.push(Line::from(fit_sidebar_text(
+                    &format!("{marker} {name} · {kind} · {detail}"),
+                    max_width,
+                )));
+            }
+        }
+    } else {
+        let selected = app.panel_cursor.min(total - 1);
+        if let Some((name, detail, kind)) = local_model_sidebar_item(overview, selected) {
+            lines.push(sidebar_field(
+                "Selected",
+                &format!("{}/{} · {kind}", selected + 1, total),
+                max_width,
+            ));
+            lines.push(Line::from(Span::styled(
+                fit_sidebar_text(&name, max_width),
+                Style::default().fg(Color::White),
+            )));
+            lines.push(sidebar_field("Details", &detail, max_width));
+        }
+    }
+
+    if let Some(error) = &app.local_model_error {
+        lines.push(Line::from(vec![
+            Span::styled("Error · ", Style::default().fg(Color::Red)),
+            Span::styled(
+                fit_sidebar_text(error, max_width.saturating_sub(9)),
+                Style::default().fg(Color::Red),
+            ),
+        ]));
+    }
+    lines.truncate(max_lines.max(1));
+    lines
+}
+
+fn local_model_sidebar_item(
+    overview: &riga_server::LocalModelOverview,
+    index: usize,
+) -> Option<(String, String, &'static str)> {
+    if let Some(model) = overview.installed.get(index) {
+        return Some((
+            model.name.clone(),
+            format!(
+                "{} · {:.1} GiB",
+                model.id,
+                model.size_bytes as f64 / 1_073_741_824.0
+            ),
+            "installed",
+        ));
+    }
+    overview
+        .catalog
+        .get(index.saturating_sub(overview.installed.len()))
+        .map(|model| {
+            (
+                model.name.clone(),
+                format!(
+                    "{} · {:.1} GiB · ctx {}",
+                    model.id,
+                    model.size_bytes as f64 / 1_073_741_824.0,
+                    model.recommended_context
+                ),
+                "catalog",
+            )
+        })
+}
+
+fn run_status_label(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Unknown => "Unknown",
+        RunStatus::Running => "Running",
+        RunStatus::WaitingForApproval => "Needs approval",
+        RunStatus::Completed => "Completed",
+        RunStatus::Failed => "Failed",
+        RunStatus::Cancelled => "Cancelled",
+    }
+}
+
+fn run_status_color(status: RunStatus) -> Color {
+    match status {
+        RunStatus::Running => Color::Cyan,
+        RunStatus::WaitingForApproval => Color::Yellow,
+        RunStatus::Completed => Color::Green,
+        RunStatus::Failed => Color::Red,
+        RunStatus::Cancelled | RunStatus::Unknown => Color::DarkGray,
+    }
+}
+
+fn render_rundeck_sidebar(app: &UiState, max_lines: usize, max_width: usize) -> Vec<Line<'static>> {
+    let lens = match app.deck_lens {
+        crate::model::DeckLens::Execution => "Execution",
+        crate::model::DeckLens::Evidence => "Evidence",
+        crate::model::DeckLens::Knowledge => "Knowledge",
+    };
+    let mut lines = vec![sidebar_section(lens)];
+
+    let run_count = app.state.active_runs.len();
+    let selected_index = app.panel_cursor.min(run_count.saturating_sub(1));
+    let selected_active = app.state.active_runs.get(selected_index);
+    let run_id = selected_active
+        .map(|active| active.run_id.as_str())
+        .or(app.state.active_run.as_deref());
+
+    if run_count > 0 {
+        lines.push(sidebar_field(
+            "Run",
+            &format!("{} of {} active", selected_index + 1, run_count),
+            max_width,
+        ));
+    }
+    let Some(run_id) = run_id else {
+        lines.push(Line::from("No active runs"));
+        lines.truncate(max_lines.max(1));
+        return lines;
+    };
+    let Some(run) = app.state.runs.get(run_id) else {
+        lines.push(sidebar_field("Run", run_id, max_width));
+        lines.push(Line::from("Waiting for run details"));
+        lines.truncate(max_lines.max(1));
+        return lines;
+    };
+
+    lines.push(sidebar_field_color(
+        "Status",
+        run_status_label(run.status),
+        max_width,
+        run_status_color(run.status),
+    ));
+    let session_id = selected_active
+        .map(|active| active.session_id.as_str())
+        .unwrap_or(run.session_id.as_str());
+    let session_name = app
+        .state
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .map(|session| session.title.as_str())
+        .unwrap_or(session_id);
+    lines.push(sidebar_field("Session", session_name, max_width));
+
+    if let Some(todos) = &run.todos {
+        let (done, total) = todos.progress();
+        lines.push(sidebar_field(
+            "Progress",
+            &format!("{done}/{total} todos"),
+            max_width,
+        ));
+    } else if !run.tasks.is_empty() {
+        let completed = run
+            .tasks
+            .values()
+            .filter(|task| task.state == riga_kernel::task::TaskState::Completed)
+            .count();
+        let running = run
+            .tasks
+            .values()
+            .filter(|task| task.state == riga_kernel::task::TaskState::Running)
+            .count();
+        lines.push(sidebar_field(
+            "Tasks",
+            &format!("{completed}/{} · {running} running", run.tasks.len()),
+            max_width,
+        ));
+    }
+    let waiting_approvals = run
+        .approvals
+        .values()
+        .filter(|approval| approval.resolved.is_none())
+        .count();
+    if waiting_approvals > 0 {
+        lines.push(sidebar_field_color(
+            "Approvals",
+            &format!("{waiting_approvals} waiting"),
+            max_width,
+            Color::Yellow,
+        ));
+    }
+
+    match app.deck_lens {
+        crate::model::DeckLens::Execution => {
+            if let Some(plan) = &run.plan {
+                lines.push(sidebar_field("Plan", &plan.title, max_width));
+                if let Some(step) = plan.steps.get(plan.active_index) {
+                    lines.push(sidebar_field("Next", &step.label, max_width));
+                } else if !plan.steps.is_empty() {
+                    lines.push(sidebar_field("Next", "Plan complete", max_width));
+                }
+            } else if let Some(todo) = run.todos.as_ref().and_then(|todos| {
+                todos
+                    .items
+                    .iter()
+                    .find(|item| item.status == riga_kernel::task::TodoStatus::Active)
+                    .or_else(|| {
+                        todos
+                            .items
+                            .iter()
+                            .find(|item| item.status == riga_kernel::task::TodoStatus::Pending)
+                    })
+            }) {
+                lines.push(sidebar_field("Next", &todo.text, max_width));
+            } else if let Some(graph) = &run.graph {
+                lines.push(sidebar_field("Graph", &graph.title, max_width));
+            } else {
+                lines.push(Line::from("Waiting for execution updates"));
+            }
+
+            if app.deck_details_expanded {
+                if let Some(plan) = &run.plan {
+                    lines.push(sidebar_section("Plan steps"));
+                    for (index, step) in plan.steps.iter().enumerate() {
+                        let marker = if index == plan.active_index {
+                            "›"
+                        } else {
+                            "·"
+                        };
+                        lines.push(Line::from(fit_sidebar_text(
+                            &format!("{marker} {}", step.label),
+                            max_width,
+                        )));
+                    }
+                }
+                if let Some(todos) = &run.todos {
+                    lines.push(sidebar_section("Todos"));
+                    for item in &todos.items {
+                        lines.push(Line::from(fit_sidebar_text(
+                            &format!("{:?} · {}", item.status, item.text),
+                            max_width,
+                        )));
+                    }
+                }
+                if !run.tasks.is_empty() {
+                    lines.push(sidebar_section("Subtasks"));
+                    for task in run.tasks.values() {
+                        let detail = task
+                            .record
+                            .as_ref()
+                            .map(|record| format!("{} · {}", record.agent, record.description))
+                            .or_else(|| task.result.clone())
+                            .unwrap_or_else(|| "Task details pending".into());
+                        lines.push(Line::from(fit_sidebar_text(
+                            &format!("{:?} · {detail}", task.state),
+                            max_width,
+                        )));
+                    }
+                }
+                if let Some(graph) = &run.graph {
+                    lines.push(sidebar_section("Graph"));
+                    for node in &graph.nodes {
+                        lines.push(Line::from(fit_sidebar_text(
+                            &format!("{} · {}", node.profile, node.description),
+                            max_width,
+                        )));
+                    }
+                }
+            }
+        }
+        crate::model::DeckLens::Evidence => {
+            lines.push(sidebar_field(
+                "Records",
+                &run.evidence.len().to_string(),
+                max_width,
+            ));
+            if let Some(latest) = run.evidence.last() {
+                lines.push(sidebar_field("Latest", &latest.claim, max_width));
+                lines.push(sidebar_field("Source", &latest.source_ref, max_width));
+                lines.push(sidebar_field(
+                    "Confidence",
+                    &format!("{}%", latest.confidence),
+                    max_width,
+                ));
+            } else {
+                lines.push(Line::from("No evidence captured yet"));
+            }
+            if app.deck_details_expanded {
+                lines.push(sidebar_section("Recent evidence"));
+                for evidence in run.evidence.iter().rev() {
+                    lines.push(Line::from(fit_sidebar_text(
+                        &format!("{} · {}%", evidence.claim, evidence.confidence),
+                        max_width,
+                    )));
+                    lines.push(sidebar_field("Source", &evidence.source_ref, max_width));
+                }
+            }
+        }
+        crate::model::DeckLens::Knowledge => {
+            lines.push(sidebar_field(
+                "Facts",
+                &run.knowledge.len().to_string(),
+                max_width,
+            ));
+            if let Some(latest) = run.knowledge.last() {
+                lines.push(sidebar_field("Latest", &latest.fact, max_width));
+                lines.push(sidebar_field(
+                    "Source run",
+                    &latest.source_run_id,
+                    max_width,
+                ));
+                lines.push(sidebar_field(
+                    "Confidence",
+                    &format!("{}%", latest.confidence),
+                    max_width,
+                ));
+            } else {
+                lines.push(Line::from("No reusable knowledge yet"));
+            }
+            if app.deck_details_expanded {
+                lines.push(sidebar_section("Recent facts"));
+                for knowledge in run.knowledge.iter().rev() {
+                    lines.push(Line::from(fit_sidebar_text(
+                        &format!("{} · {}%", knowledge.fact, knowledge.confidence),
+                        max_width,
+                    )));
+                    lines.push(sidebar_field(
+                        "Source run",
+                        &knowledge.source_run_id,
+                        max_width,
+                    ));
+                }
+            }
+        }
+    }
+
     lines.truncate(max_lines.max(1));
     lines
 }
@@ -350,9 +970,14 @@ fn render_panel_surface_body(
         return;
     }
     let editor = active_panel_editor(app, panel);
-    let editor_height = u16::from(editor.is_some() && area.height > 1);
+    let footer_height = sidebar_footer_height(app, panel, area.height);
+    let editor_height =
+        u16::from(editor.is_some() && area.height > footer_height.saturating_add(1));
     let body_area = Rect {
-        height: area.height.saturating_sub(editor_height),
+        height: area
+            .height
+            .saturating_sub(editor_height)
+            .saturating_sub(footer_height),
         ..area
     };
     let mut lines = Vec::new();
@@ -368,6 +993,7 @@ fn render_panel_surface_body(
         app,
         panel,
         body_area.height.saturating_sub(u16::from(show_title)) as usize,
+        body_area.width as usize,
     ));
     frame.render_widget(
         Paragraph::new(Text::from(lines))
@@ -378,10 +1004,22 @@ fn render_panel_surface_body(
 
     if let Some((label, value, cursor)) = editor {
         if editor_height == 0 {
+            if footer_height > 0 {
+                render_sidebar_footer(
+                    frame,
+                    Rect {
+                        y: area.y + area.height - footer_height,
+                        height: footer_height,
+                        ..area
+                    },
+                    app,
+                    panel,
+                );
+            }
             return;
         }
         let editor_area = Rect {
-            y: area.y + area.height - 1,
+            y: area.y + body_area.height,
             height: 1,
             ..area
         };
@@ -406,6 +1044,18 @@ fn render_panel_surface_body(
         if app.panel == panel {
             frame.set_cursor_position((cursor_x, editor_area.y));
         }
+    }
+    if footer_height > 0 {
+        render_sidebar_footer(
+            frame,
+            Rect {
+                y: area.y + area.height - footer_height,
+                height: footer_height,
+                ..area
+            },
+            app,
+            panel,
+        );
     }
 }
 
@@ -1415,7 +2065,10 @@ mod tests {
     use crate::{
         app::UiState,
         input::TextBuffer,
-        model::{AppState, ConnectionState, ProviderForm, TranscriptItem, UiPanel},
+        model::{
+            AppState, ConnectionState, DeckLens, ProviderForm, RunStatus, RunView, TranscriptItem,
+            UiPanel,
+        },
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{
@@ -1424,8 +2077,10 @@ mod tests {
     };
     use riga_kernel::{
         PROTOCOL_VERSION,
-        events::{RigaEvent, RigaEventEnvelope},
+        events::{EvidenceNode, KnowledgeNode, RigaEvent, RigaEventEnvelope},
+        task::{Plan, PlanStep},
     };
+    use std::collections::BTreeMap;
 
     #[test]
     fn idle_view_renders_at_small_and_large_sizes() {
@@ -1539,7 +2194,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Downloading 50.0%"));
+        assert!(text.contains("Downloading"));
+        assert!(text.contains("50.0%"));
     }
 
     #[test]
@@ -1724,7 +2380,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(!text.contains("do-not-display"));
-        assert!(text.contains("••••"));
+        assert!(text.contains("Configured"));
     }
 
     #[test]
@@ -1753,6 +2409,214 @@ mod tests {
         assert!(text.contains("Local models"));
         assert!(text.contains("Design review"));
         assert!(text.contains("Ctrl+I"));
+    }
+
+    #[test]
+    fn sidebar_shortcuts_are_in_the_footer_not_repeated_in_panel_content() {
+        for panel in [
+            UiPanel::History,
+            UiPanel::Settings,
+            UiPanel::LocalModels,
+            UiPanel::RunDeck,
+        ] {
+            let app = UiState {
+                panel,
+                ..UiState::default()
+            };
+            let body = sidebar_panel_lines(&app, panel, 24, 34)
+                .iter()
+                .map(line_plain_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let footer = sidebar_footer_hints(&app, panel).join("\n");
+            assert!(
+                !body.contains("Esc close"),
+                "panel body for {panel:?}: {body}"
+            );
+            assert!(
+                !body.contains("Tab chat"),
+                "panel body for {panel:?}: {body}"
+            );
+            assert!(!footer.is_empty());
+        }
+        let history = UiState {
+            panel: UiPanel::History,
+            ..UiState::default()
+        };
+        assert!(sidebar_footer_hints(&history, UiPanel::History)[1].contains("n new"));
+    }
+
+    #[test]
+    fn panel_shortcut_footers_render_in_wide_and_narrow_layouts() {
+        for (width, height) in [(120, 40), (80, 24), (48, 18)] {
+            for (panel, expected) in [
+                (UiPanel::LocalModels, "x cancel"),
+                (UiPanel::RunDeck, "x stop"),
+            ] {
+                let backend = TestBackend::new(width, height);
+                let mut terminal = Terminal::new(backend).unwrap();
+                let app = UiState {
+                    panel,
+                    ..UiState::default()
+                };
+                terminal.draw(|frame| render(frame, &app)).unwrap();
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(
+                    text.contains(expected),
+                    "footer hint `{expected}` missing at {width}x{height}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_model_sidebar_is_compact_and_expands_a_scroll_window_of_choices() {
+        let mut app = UiState {
+            panel: UiPanel::LocalModels,
+            local_models: Some(riga_server::LocalModelOverview {
+                accelerator: "CPU (OpenMP)",
+                catalog: Vec::new(),
+                installed: vec![riga_server::local_model::InstalledModel {
+                    id: "friendly-model-id".into(),
+                    name: "Friendly local model".into(),
+                    file_name: "model.gguf".into(),
+                    path: "/private/model/path.gguf".into(),
+                    size_bytes: 2_000_000_000,
+                    curated: true,
+                    recommended_context: Some(8192),
+                    license_url: None,
+                }],
+                loaded: None,
+            }),
+            ..UiState::default()
+        };
+        let compact = sidebar_panel_lines(&app, UiPanel::LocalModels, 20, 34);
+        let compact_text = compact
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(compact_text.contains("Friendly local model"));
+        assert!(compact_text.contains("1 installed"));
+        assert!(!compact_text.contains("/private/model/path.gguf"));
+        assert!(!compact_text.contains("Enter load/get"));
+        assert!(compact.iter().all(|line| line.width() <= 34));
+        assert!(sidebar_footer_hints(&app, UiPanel::LocalModels)[0].contains("Enter load/get"));
+
+        app.local_models_expanded = true;
+        let expanded = sidebar_panel_lines(&app, UiPanel::LocalModels, 20, 34);
+        let expanded_text = expanded
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(expanded_text.contains("CHOICES"));
+        assert!(expanded_text.contains("Friendly local model"));
+    }
+
+    #[test]
+    fn rundeck_lenses_show_compact_summaries_and_expand_details_on_demand() {
+        let mut app = UiState {
+            panel: UiPanel::RunDeck,
+            deck_lens: DeckLens::Execution,
+            ..UiState::default()
+        };
+        app.state.sessions.push(riga_kernel::state::Session {
+            id: "session-1".into(),
+            title: "Build session".into(),
+            workspace: ".".into(),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        });
+        app.state.active_run = Some("run-1".into());
+        app.state.active_runs.push(riga_server::ws::ActiveRun {
+            run_id: "run-1".into(),
+            session_id: "session-1".into(),
+            local: true,
+        });
+        app.state.runs.insert(
+            "run-1".into(),
+            RunView {
+                run_id: "run-1".into(),
+                session_id: "session-1".into(),
+                status: RunStatus::Running,
+                last_sequence: 1,
+                needs_replay: false,
+                output: String::new(),
+                reasoning: String::new(),
+                transcript: Vec::new(),
+                plan: Some(Plan {
+                    title: "Tidy the RunDeck sidebar".into(),
+                    steps: vec![PlanStep {
+                        id: "step-1".into(),
+                        label: "Summarize the selected run".into(),
+                        description: None,
+                    }],
+                    active_index: 0,
+                }),
+                todos: None,
+                graph: None,
+                tasks: BTreeMap::new(),
+                evidence: vec![
+                    EvidenceNode {
+                        id: "evidence-1".into(),
+                        claim: "Earlier verified result".into(),
+                        source_ref: "test:earlier".into(),
+                        confidence: 80,
+                        task_id: None,
+                    },
+                    EvidenceNode {
+                        id: "evidence-2".into(),
+                        claim: "Latest compact summary is clear".into(),
+                        source_ref: "test:latest".into(),
+                        confidence: 96,
+                        task_id: None,
+                    },
+                ],
+                knowledge: vec![KnowledgeNode {
+                    id: "knowledge-1".into(),
+                    fact: "Keyboard hints live in the footer".into(),
+                    source_run_id: "run-previous".into(),
+                    confidence: 91,
+                }],
+                approvals: BTreeMap::new(),
+                tool_outputs: BTreeMap::new(),
+            },
+        );
+
+        for (lens, expected) in [
+            (DeckLens::Execution, "Summarize the selected run"),
+            (DeckLens::Evidence, "Latest compact summary"),
+            (DeckLens::Knowledge, "Keyboard hints live"),
+        ] {
+            app.deck_lens = lens;
+            let lines = sidebar_panel_lines(&app, UiPanel::RunDeck, 20, 34);
+            let text = lines
+                .iter()
+                .map(line_plain_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(expected), "{lens:?} summary: {text}");
+            assert!(text.contains("Build session"));
+            assert!(lines.iter().all(|line| line.width() <= 34));
+        }
+
+        app.deck_lens = DeckLens::Evidence;
+        app.deck_details_expanded = true;
+        let detailed = sidebar_panel_lines(&app, UiPanel::RunDeck, 20, 34)
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(detailed.contains("RECENT EVIDENCE"));
+        assert!(detailed.contains("Earlier verified result"));
+        assert!(sidebar_footer_hints(&app, UiPanel::RunDeck)[1].contains("summary"));
     }
 
     #[test]

@@ -95,6 +95,8 @@ pub struct UiState {
     pub catalog: Vec<CatalogEntry>,
     pub catalog_query: TextBuffer,
     pub deck_lens: DeckLens,
+    pub deck_details_expanded: bool,
+    pub local_models_expanded: bool,
     pub local_models: Option<riga_server::LocalModelOverview>,
     pub local_model_error: Option<String>,
     pub local_model_status: Option<String>,
@@ -1060,6 +1062,9 @@ impl UiState {
                 }
             },
             UiPanel::RunDeck => match key.code {
+                KeyCode::Char('v') => {
+                    self.deck_details_expanded = !self.deck_details_expanded;
+                }
                 KeyCode::Left | KeyCode::Char('l') => {
                     self.deck_lens = match self.deck_lens {
                         DeckLens::Execution => DeckLens::Knowledge,
@@ -1111,6 +1116,9 @@ impl UiState {
                     match key.code {
                         KeyCode::Up => self.panel_cursor = self.panel_cursor.saturating_sub(1),
                         KeyCode::Down => self.panel_cursor = self.panel_cursor.saturating_add(1),
+                        KeyCode::Char('v') => {
+                            self.local_models_expanded = !self.local_models_expanded;
+                        }
                         KeyCode::Char('a') => {
                             self.local_attachment_input = true;
                             self.panel_input.clear();
@@ -2075,6 +2083,27 @@ mod tests {
                 session_id: "session-1".into(),
             })
         );
+    }
+
+    #[test]
+    fn sidebar_detail_toggles_preserve_the_selected_panel_and_lens() {
+        let mut rundeck = UiState {
+            panel: UiPanel::RunDeck,
+            deck_lens: DeckLens::Evidence,
+            ..UiState::default()
+        };
+        rundeck.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(rundeck.deck_details_expanded);
+        assert_eq!(rundeck.panel, UiPanel::RunDeck);
+        assert_eq!(rundeck.deck_lens, DeckLens::Evidence);
+
+        let mut models = UiState {
+            panel: UiPanel::LocalModels,
+            ..UiState::default()
+        };
+        models.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(models.local_models_expanded);
+        assert_eq!(models.panel, UiPanel::LocalModels);
     }
 
     #[test]
