@@ -26,6 +26,7 @@ export type Session = CreateSessionRequest & {
   created_at: string;
   updated_at: string;
 };
+export type ConversationTurn = { role: string; content: string };
 
 export type CatalogItem = {
   id: string;
@@ -138,6 +139,8 @@ export interface RigaTransport {
   catalog(): Promise<Catalog>;
   listSessions(): Promise<Session[]>;
   createSession(request: CreateSessionRequest): Promise<Session>;
+  sessionHistory(sessionId: string): Promise<ConversationTurn[]>;
+  renameSession(sessionId: string, title: string): Promise<Session>;
   configureProvider(
     endpoint: string,
     apiKey: string,
@@ -182,6 +185,8 @@ export const RIGA_TRANSPORT_METHODS = [
   "catalog",
   "listSessions",
   "createSession",
+  "sessionHistory",
+  "renameSession",
   "configureProvider",
   "startRun",
   "resumeRun",

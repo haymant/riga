@@ -41,6 +41,12 @@ pub trait RigaTransport: Clone + Send + Sync + 'static {
         request: CreateSessionRequest,
     ) -> TransportFuture<Result<Session, String>>;
 
+    fn rename_session(
+        &self,
+        session_id: String,
+        title: String,
+    ) -> TransportFuture<Result<Session, String>>;
+
     fn configure_provider(
         &self,
         config: ProviderConfig,
@@ -92,7 +98,7 @@ impl IpcTransport {
         self.service.catalog().await
     }
 
-    pub async fn list_sessions(&self) -> Vec<Session> {
+    pub async fn list_sessions(&self) -> Result<Vec<Session>, String> {
         self.service.list_sessions().await
     }
 
@@ -105,6 +111,10 @@ impl IpcTransport {
 
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<Session, String> {
         self.service.create_session(request).await
+    }
+
+    pub async fn rename_session(&self, session_id: &str, title: String) -> Result<Session, String> {
+        self.service.rename_session(session_id, title).await
     }
 
     pub async fn provider(&self) -> Result<Option<ProviderConfigured>, String> {
@@ -230,6 +240,15 @@ impl RigaTransport for IpcTransport {
         Box::pin(async move { transport.create_session(request).await })
     }
 
+    fn rename_session(
+        &self,
+        session_id: String,
+        title: String,
+    ) -> TransportFuture<Result<Session, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.rename_session(&session_id, title).await })
+    }
+
     fn configure_provider(
         &self,
         config: ProviderConfig,
@@ -299,6 +318,7 @@ mod tests {
             transport
                 .list_sessions()
                 .await
+                .expect("session list should load")
                 .iter()
                 .any(|item| item.id == session.id)
         );

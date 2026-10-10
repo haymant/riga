@@ -2424,7 +2424,7 @@ async fn append_turns(
     transcripts: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<String, Vec<ConversationTurn>>>,
     >,
-    secure_store: &Option<std::sync::Arc<crate::secure_store::SecureStore>>,
+    _secure_store: &Option<std::sync::Arc<crate::secure_store::SecureStore>>,
     session_id: &str,
     new_turns: &[ConversationTurn],
 ) {
@@ -2436,9 +2436,7 @@ async fn append_turns(
             .extend(new_turns.iter().cloned());
         guard.clone()
     };
-    if let Some(store) = secure_store {
-        let _ = store.save("transcripts", &snapshot);
-    }
+    let _ = crate::secure_store::save_json("transcripts", &snapshot).await;
 }
 
 /// Decide what actually serves a run, given the stored provider and whether a

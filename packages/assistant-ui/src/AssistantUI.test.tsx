@@ -21,12 +21,12 @@ const emptyModels = {
   loaded: null,
 };
 
-function envelope(event: RigaEventEnvelope["event"], sequence: number): RigaEventEnvelope {
+function envelope(event: RigaEventEnvelope["event"], sequence: number, runId = "run-1"): RigaEventEnvelope {
   return {
     protocol_version: 1,
     event_id: `event-${sequence}`,
     session_id: "riga",
-    run_id: "run-1",
+    run_id: runId,
     sequence,
     timestamp: "now",
     event,
@@ -42,7 +42,9 @@ function createTransport() {
     health: async () => ({ protocol_version: 1, adapter: "test" }),
     catalog: async () => emptyCatalog,
     listSessions: async () => [],
-    createSession: async (request) => ({ id: "session-1", title: request.title, workspace: request.workspace, created_at: "now", updated_at: "now" }),
+    createSession: async (request) => ({ id: "riga", title: request.title, workspace: request.workspace, created_at: "now", updated_at: "now" }),
+    sessionHistory: async () => [],
+    renameSession: async (sessionId, title) => ({ id: sessionId, title, workspace: ".", created_at: "now", updated_at: "now" }),
     configureProvider: async () => undefined,
     startRun: async () => undefined,
     resumeRun: async () => undefined,
@@ -65,8 +67,8 @@ function createTransport() {
       listeners = nextListeners;
       return transport;
     },
-    emit: (event: RigaEventEnvelope["event"], sequence: number) => {
-      act(() => listeners?.onEvent?.(envelope(event, sequence)));
+    emit: (event: RigaEventEnvelope["event"], sequence: number, runId?: string) => {
+      act(() => listeners?.onEvent?.(envelope(event, sequence, runId)));
     },
   };
 }
@@ -149,7 +151,7 @@ describe("AssistantUI subagent task card", () => {
   it("marks a failed subagent and shows the failure summary", async () => {
     const testTransport = createTransport();
     render(<AssistantUI transportFactory={testTransport.factory} />);
-    await waitFor(() => expect(screen.getByText("connected")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("New session")).toBeInTheDocument());
 
     testTransport.emit({
       TaskStarted: {
@@ -182,7 +184,7 @@ describe("AssistantUI subagent task card", () => {
   it("collapses persistently and supports execution scope and node drill-down", async () => {
     const testTransport = createTransport();
     render(<AssistantUI transportFactory={testTransport.factory} />);
-    await waitFor(() => expect(screen.getByText("connected")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("New session")).toBeInTheDocument());
 
     testTransport.emit({ RunStarted: {} }, 1);
     testTransport.emit({
@@ -222,7 +224,7 @@ describe("AssistantUI subagent task card", () => {
   it("resets the multiline composer after sending", async () => {
     const testTransport = createTransport();
     render(<AssistantUI transportFactory={testTransport.factory} />);
-    await waitFor(() => expect(screen.getByText("connected")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("New session")).toBeInTheDocument());
 
     const composer = screen.getByRole("textbox", { name: "" }) as HTMLTextAreaElement;
     Object.defineProperty(composer, "scrollHeight", { configurable: true, value: 120 });
@@ -236,7 +238,7 @@ describe("AssistantUI subagent task card", () => {
   it("does not follow streamed text after the user scrolls up", async () => {
     const testTransport = createTransport();
     const { container } = render(<AssistantUI transportFactory={testTransport.factory} />);
-    await waitFor(() => expect(screen.getByText("connected")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("New session")).toBeInTheDocument());
 
     const transcript = container.querySelector(".transcript") as HTMLDivElement;
     Object.defineProperties(transcript, {
@@ -254,5 +256,39 @@ describe("AssistantUI subagent task card", () => {
     fireEvent.scroll(transcript);
     testTransport.emit({ TextDelta: { delta: "follow from bottom" } }, 2);
     await waitFor(() => expect(HTMLElement.prototype.scrollTo).toHaveBeenCalled());
+  });
+
+  it("names a new session from its first assistant response", async () => {
+    const testTransport = createTransport();
+    const rename = vi.spyOn(testTransport.transport, "renameSession");
+    const startRun = vi.spyOn(testTransport.transport, "startRun");
+    render(<AssistantUI transportFactory={testTransport.factory} />);
+    await waitFor(() => expect(screen.getByText("New session")).toBeInTheDocument());
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "Explain the runtime" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send message" }));
+    const runId = startRun.mock.calls[0]?.[0];
+    expect(runId).toBeTruthy();
+    testTransport.emit({ RunStarted: {} }, 1, runId);
+    testTransport.emit({ TextDelta: { delta: "The runtime coordinates session execution." } }, 2, runId);
+    testTransport.emit({ RunCompleted: { output: "The runtime coordinates session execution." } }, 3, runId);
+
+    await waitFor(() => expect(rename).toHaveBeenCalledWith("riga", "The runtime coordinates session execution."));
+    await waitFor(() => expect(screen.getAllByText("The runtime coordinates session execution.").length).toBeGreaterThan(0));
+  });
+
+  it("lets the user rename a session from the GUI", async () => {
+    const testTransport = createTransport();
+    const rename = vi.spyOn(testTransport.transport, "renameSession");
+    render(<AssistantUI transportFactory={testTransport.factory} />);
+    await waitFor(() => expect(screen.getByText("New session")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Rename session New session" }));
+    const editor = screen.getByRole("textbox", { name: "Session name" });
+    fireEvent.change(editor, { target: { value: "Design notes" } });
+    fireEvent.keyDown(editor, { key: "Enter" });
+
+    await waitFor(() => expect(rename).toHaveBeenCalledWith("riga", "Design notes"));
+    await waitFor(() => expect(screen.getAllByText("Design notes").length).toBeGreaterThan(0));
   });
 });

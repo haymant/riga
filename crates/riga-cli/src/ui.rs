@@ -13,7 +13,10 @@ fn code_line_style(line: &str) -> Style {
     let trimmed = line.trim_start();
     let color = if trimmed.starts_with('{') || trimmed.starts_with('[') {
         Color::LightBlue
-    } else if trimmed.starts_with('$') || trimmed.starts_with("npm ") || trimmed.starts_with("cargo ") {
+    } else if trimmed.starts_with('$')
+        || trimmed.starts_with("npm ")
+        || trimmed.starts_with("cargo ")
+    {
         Color::LightYellow
     } else if trimmed.starts_with("enum ") || trimmed.contains("::") {
         Color::LightMagenta
@@ -58,27 +61,29 @@ fn push_rich_message(lines: &mut Vec<Line<'static>>, rail_color: Color, text: &s
             for raw_line in segment.lines() {
                 let trimmed = raw_line.trim_start();
                 let heading_level = trimmed.chars().take_while(|ch| *ch == '#').count();
-                let (content, style) = if heading_level > 0
-                    && trimmed.as_bytes().get(heading_level) == Some(&b' ')
-                {
-                    (
-                        trimmed[heading_level..].trim_start().to_owned(),
-                        Style::default()
-                            .fg(Color::LightCyan)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                } else if let Some(quote) = trimmed.strip_prefix("> ") {
-                    (
-                        format!("│ {quote}"),
-                        Style::default()
-                            .fg(Color::LightYellow)
-                            .add_modifier(Modifier::ITALIC),
-                    )
-                } else if matches!(trimmed, "---" | "***" | "___") {
-                    ("────────────────────────".to_owned(), Style::default().fg(Color::DarkGray))
-                } else {
-                    (raw_line.to_owned(), Style::default().fg(Color::White))
-                };
+                let (content, style) =
+                    if heading_level > 0 && trimmed.as_bytes().get(heading_level) == Some(&b' ') {
+                        (
+                            trimmed[heading_level..].trim_start().to_owned(),
+                            Style::default()
+                                .fg(Color::LightCyan)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                    } else if let Some(quote) = trimmed.strip_prefix("> ") {
+                        (
+                            format!("│ {quote}"),
+                            Style::default()
+                                .fg(Color::LightYellow)
+                                .add_modifier(Modifier::ITALIC),
+                        )
+                    } else if matches!(trimmed, "---" | "***" | "___") {
+                        (
+                            "────────────────────────".to_owned(),
+                            Style::default().fg(Color::DarkGray),
+                        )
+                    } else {
+                        (raw_line.to_owned(), Style::default().fg(Color::White))
+                    };
                 lines.push(Line::from(vec![
                     Span::styled("┃ ", Style::default().fg(rail_color)),
                     Span::styled(content, style),
@@ -198,7 +203,7 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
     let (title, lines) = match app.panel {
         crate::model::UiPanel::History => {
             let mut lines = vec![Line::from(
-                "↑/↓ select · Enter switch · n new session · Esc close",
+                "↑/↓ select · Enter switch · n new session · r rename · Esc close",
             )];
             if app.creating_session {
                 lines.push(Line::from(format!(
@@ -210,6 +215,12 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
                     app.workspace_input.text()
                 )));
                 lines.push(Line::from("Enter create · Esc cancel"));
+            } else if app.renaming_session.is_some() {
+                lines.push(Line::from(format!(
+                    "Rename session: {}",
+                    app.panel_input.text()
+                )));
+                lines.push(Line::from("Enter save · Esc cancel"));
             } else if app.state.sessions.is_empty() {
                 lines.push(Line::from("No sessions. Press n to create one."));
             } else {
@@ -610,7 +621,10 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                 result,
             } => push_transcript_note(
                 &mut lines,
-                &format!("Task {task_id} {} · {result}", if *ok { "done" } else { "failed" }),
+                &format!(
+                    "Task {task_id} {} · {result}",
+                    if *ok { "done" } else { "failed" }
+                ),
                 if *ok { Color::Green } else { Color::Red },
             ),
             crate::model::TranscriptItem::Approval {
@@ -662,14 +676,12 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                             Color::DarkGray,
                         );
                     }
-                    crate::model::TranscriptItem::ToolCall {
-                        tool,
-                        call,
-                        ..
-                    } => lines.push(Line::from(Span::styled(
-                        format!("┃ {tool} · {call}"),
-                        Style::default().fg(Color::DarkGray),
-                    ))),
+                    crate::model::TranscriptItem::ToolCall { tool, call, .. } => {
+                        lines.push(Line::from(Span::styled(
+                            format!("┃ {tool} · {call}"),
+                            Style::default().fg(Color::DarkGray),
+                        )))
+                    }
                     crate::model::TranscriptItem::ToolOutput { output, .. } => {
                         push_transcript_note(&mut lines, output, Color::DarkGray);
                     }
@@ -728,7 +740,10 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
         bottom_offset.saturating_sub(app.transcript_scroll)
     };
     let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-    frame.render_widget(paragraph.scroll((offset.min(u16::MAX as usize) as u16, 0)), area);
+    frame.render_widget(
+        paragraph.scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        area,
+    );
 }
 
 fn wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
@@ -743,7 +758,11 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     let title = if let Some(approval) = app.state.pending_approval() {
         format!(
             "Approval{} · {} / {} · Tab focus · y allow · a always · n deny",
-            if app.approval_focused { " [focused]" } else { "" },
+            if app.approval_focused {
+                " [focused]"
+            } else {
+                ""
+            },
             approval.tool,
             approval.approval_id
         )

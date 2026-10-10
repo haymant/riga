@@ -39,6 +39,19 @@ describe("RigaHttpClient", () => {
     expect(fetchMock.mock.calls[2][1]).toMatchObject({ method: "POST" });
   });
 
+  it("loads session history and renames a session through the shared REST API", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(
+      JSON.stringify({ id: "session/a", title: "Renamed", workspace: ".", created_at: "now", updated_at: "now" }),
+      { status: 200 },
+    ));
+    const client = new RigaHttpClient("http://riga.test");
+    await client.sessionHistory("session/a");
+    await client.renameSession("session/a", "Renamed");
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("http://riga.test/sessions/session%2Fa/history");
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe("http://riga.test/sessions/session%2Fa");
+    expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ method: "PATCH", body: JSON.stringify({ title: "Renamed" }) });
+  });
+
   it("surfaces non-2xx HTTP responses", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("nope", { status: 503 }));
     await expect(new RigaHttpClient("http://riga.test").health()).rejects.toThrow("RIGA request failed with 503");
@@ -87,6 +100,8 @@ describe("RigaHttpTransport", () => {
     await transport.catalog();
     await transport.listSessions();
     await transport.createSession({ title: "Test", workspace: "/tmp" });
+    await transport.sessionHistory("session");
+    await transport.renameSession("session", "Renamed");
     await transport.configureProvider("https://model.test/v1", "key", "model", "low");
     await transport.startRun("run", "session", "hello");
     await transport.resumeRun("run", 1);

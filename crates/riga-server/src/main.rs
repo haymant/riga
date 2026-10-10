@@ -11,7 +11,8 @@ async fn main() {
         .await
         .expect("bind RIGA server address");
     println!("RIGA server listening on {address}");
-    axum::serve(listener, router(ServerState::default()))
+    let state = ServerState::load().await.expect("load RIGA session store");
+    axum::serve(listener, router(state))
         .await
         .expect("serve RIGA HTTP/SSE transport");
 }

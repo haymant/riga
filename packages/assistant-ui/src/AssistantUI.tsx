@@ -1,6 +1,6 @@
 import { Component, useEffect, useMemo, useRef, useState, type ReactNode, type SetStateAction } from "react";
 import { createHttpTransport, formatBytes, reduceDownloadState } from "./http";
-import type { ActiveRun, DownloadState, LocalModelOverview, RigaEventEnvelope, RigaTransport, RigaTransportListeners } from "./protocol";
+import type { ActiveRun, ConversationTurn, DownloadState, LocalModelOverview, RigaEventEnvelope, RigaTransport, RigaTransportListeners, Session as ProtocolSession } from "./protocol";
 import {
   Bot,
   Check,
@@ -79,7 +79,7 @@ function newId(): string {
 
 
 type Role = "user" | "assistant" | "system";
-type Session = { id: string; title: string; meta: string; active?: boolean };
+type Session = ProtocolSession & { meta: string; active?: boolean };
 type TranscriptItem =
   | { id: string; role: Role; text: string; time: string }
   | { id: string; role: "reasoning"; text: string; time: string }
@@ -106,37 +106,22 @@ type KnowledgeView = { id: string; fact: string; source_run_id: string; confiden
 type GraphNodeView = { id: string; profile: string; description: string; prompt: string; depends_on: string[]; state: AgentTaskView["state"]; progress?: number; blockedBy?: string[] };
 type PendingApproval = { approvalId: string; tool: string; summary: string };
 
-const initialSessions: Session[] = [
-  { id: "riga", title: "RIGA desktop shell", meta: "Today · 14 messages", active: true },
-  { id: "transport", title: "SSE transport contract", meta: "Yesterday · 8 messages" },
-  { id: "recovery", title: "Recovery test plan", meta: "Mon · 21 messages" },
-  { id: "ui", title: "Assistant surface audit", meta: "Sun · 6 messages" },
-];
+const NEW_SESSION_TITLE = "New session";
 
-const initialTranscript: TranscriptItem[] = [
-  { id: "m1", role: "user", text: "Wire the desktop shell to the durable session model and show the first approval step.", time: "10:42" },
-  { id: "m2", role: "assistant", text: "I’ll connect the shell to the session boundary first, then pause before any workspace mutation so you can review the exact action.", time: "10:42" },
-  { id: "t1", role: "tool", name: "session.inspect", command: "riga session inspect --id riga", status: "done", output: "Session riga · 1 active run · journal healthy", time: "10:43" },
-  { id: "m3", role: "assistant", text: "The session is healthy. I’m ready to create the transport adapter, but this changes the workspace boundary and needs your approval.", time: "10:43" },
-];
+function transcriptFromHistory(turns: ConversationTurn[]): TranscriptItem[] {
+  return turns.map((turn, index): TranscriptItem => {
+    const role: Role | "reasoning" = turn.role === "assistant" ? "assistant" : turn.role === "reasoning" ? "reasoning" : "user";
+    return { id: `history-${index}`, role, text: turn.content, time: "" };
+  });
+}
 
-const sessionHistories: Record<string, TranscriptItem[]> = {
-  riga: initialTranscript,
-  transport: [
-    { id: "transport-1", role: "user", text: "Compare SSE and WebSocket transport for the desktop shell.", time: "Yesterday" },
-    { id: "transport-2", role: "assistant", text: "WebSocket is the active bidirectional control channel; SSE remains useful for one-way event delivery and reconnect replay.", time: "Yesterday" },
-    { id: "transport-tool", role: "tool", name: "transport.inspect", command: "riga transport inspect --protocol websocket", status: "done", output: "WebSocket ready · protocol v1 · reconnect-safe", time: "Yesterday" },
-  ],
-  recovery: [
-    { id: "recovery-1", role: "user", text: "Add corruption and out-of-order journal recovery tests.", time: "Mon" },
-    { id: "recovery-2", role: "assistant", text: "The persistence boundary now fails closed on corrupted records and rejects out-of-order event sequences.", time: "Mon" },
-    { id: "recovery-tool", role: "tool", name: "cargo.test", command: "cargo test -p riga-kernel persistence", status: "done", output: "Recovery tests passed", time: "Mon" },
-  ],
-  ui: [
-    { id: "ui-1", role: "user", text: "Audit the assistant surface for responsive behavior.", time: "Sun" },
-    { id: "ui-2", role: "assistant", text: "The desktop workspace uses a compact transcript layout, mobile navigation, and explicit provider settings.", time: "Sun" },
-  ],
-};
+function sessionTitleFromResponse(response: string): string {
+  const firstLine = response.split(/\r?\n/u).map((line) => line.trim()).find(Boolean) ?? "";
+  const cleaned = firstLine.replace(/^\s*[#>*-]+\s*/u, "").replace(/[`*_]/gu, "").trim();
+  const firstSentence = cleaned.match(/^.{1,160}?[.!?](?:\s|$)/u)?.[0]?.trim() ?? cleaned;
+  const characters = Array.from(firstSentence);
+  return characters.length > 80 ? `${characters.slice(0, 79).join("")}…` : firstSentence.slice(0, 80);
+}
 
 function loadLocal<T>(key: string, fallback: T): T {
   try {
@@ -167,8 +152,10 @@ function AssistantUIInner({
   transport: suppliedTransport,
   transportFactory,
 }: AssistantUIProps = {}) {
-  const [sessions, setSessions] = useState<Session[]>(() => loadLocal("riga.sessions.v1", initialSessions));
-  const [sessionTranscripts, setSessionTranscripts] = useState<Record<string, TranscriptItem[]>>(() => loadLocal("riga.transcripts.v1", sessionHistories));
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [sessionTranscripts, setSessionTranscripts] = useState<Record<string, TranscriptItem[]>>({});
+  const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
   const [draft, setDraft] = useState("");
   const [composerHistory, setComposerHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
@@ -211,7 +198,7 @@ function AssistantUIInner({
   const [focusNode, setFocusNode] = useState<string | null>(null);
   const [evidence, setEvidence] = useState<EvidenceView[]>([]);
   const [knowledge, setKnowledge] = useState<KnowledgeView[]>([]);
-  const [runDeckCollapsed, setRunDeckCollapsed] = useState(() => loadLocal(`riga.run-deck.${initialSessions.find((session) => session.active)?.id ?? "riga"}.collapsed`, true));
+  const [runDeckCollapsed, setRunDeckCollapsed] = useState(() => loadLocal("riga.run-deck.default.collapsed", true));
   const [theme, setTheme] = useState<"dark" | "light">(() => loadLocal("riga.theme.v1", "dark"));
   const [fullWidthEnabled, setFullWidthEnabled] = useState(initialFullWidth);
   const [transportStatus, setTransportStatus] = useState<"connecting" | "connected" | "closed" | "error">("connecting");
@@ -228,6 +215,7 @@ function AssistantUIInner({
   const [mcpServers, setMcpServers] = useState<McpServerSummary[]>([]);
   const transportRef = useRef<RigaTransport | null>(null);
   const activeRunIdRef = useRef<string | null>(null);
+  const firstReplyRunIdsRef = useRef(new Map<string, string>());
   const catalogRef = useRef<HTMLDivElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
@@ -235,10 +223,19 @@ function AssistantUIInner({
   // Streamed text waiting to be painted. A model emits a token at a time and each
   // one would otherwise force a full markdown re-parse, so the deltas are
   // coalesced into a single animation frame.
-  const pendingTextRef = useRef<{ runId: string; text: string } | null>(null);
+  const pendingTextRef = useRef<{ runId: string; sessionId: string; text: string } | null>(null);
   const textFrameRef = useRef<number | null>(null);
 
-  const activeSession = useMemo(() => sessions.find((session) => session.active) ?? sessions[0], [sessions]);
+  const activeSession = useMemo<Session>(() => sessions.find((session) => session.active) ?? sessions[0] ?? {
+    id: "",
+    title: transportStatus === "connected" ? "Loading sessions…" : "Connecting…",
+    workspace: ".",
+    created_at: "",
+    updated_at: "",
+    meta: "",
+  }, [sessions, transportStatus]);
+  const activeSessionIdRef = useRef(activeSession.id);
+  activeSessionIdRef.current = activeSession.id;
   const transcript = sessionTranscripts[activeSession.id] ?? [];
   const taskTools = useMemo(() => {
     const map: Record<string, Extract<TranscriptItem, { role: "tool" }>[]> = {};
@@ -247,11 +244,12 @@ function AssistantUIInner({
     }
     return map;
   }, [transcript]);
-  const setTranscript = (updater: SetStateAction<TranscriptItem[]>) => {
+  const setTranscript = (updater: SetStateAction<TranscriptItem[]>, sessionId = activeSessionIdRef.current) => {
+    if (!sessionId) return;
     setSessionTranscripts((current) => {
-      const previous = current[activeSession.id] ?? [];
+      const previous = current[sessionId] ?? [];
       const next = typeof updater === "function" ? updater(previous) : updater;
-      return { ...current, [activeSession.id]: next };
+      return { ...current, [sessionId]: next };
     });
   };
 
@@ -285,21 +283,13 @@ function AssistantUIInner({
         return next;
       }
       return [...current, { id, role: "assistant", text: pending.text, time: "now" }];
-    });
+    }, pending.sessionId);
   };
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem("riga.theme.v1", theme);
   }, [theme]);
-
-  useEffect(() => {
-    window.localStorage.setItem("riga.sessions.v1", JSON.stringify(sessions));
-  }, [sessions]);
-
-  useEffect(() => {
-    window.localStorage.setItem("riga.transcripts.v1", JSON.stringify(sessionTranscripts));
-  }, [sessionTranscripts]);
 
   useEffect(() => {
     const key = `riga.run-deck.${activeSession.id}`;
@@ -369,7 +359,7 @@ function AssistantUIInner({
         void transportRef.current?.listActiveRuns().then((runs) => {
           setActiveRuns(runs);
           setRunIds((current) => Array.from(new Set([...current, ...runs.map((run) => run.run_id)])));
-          const currentRun = runs.find((run) => run.session_id === activeSession.id);
+          const currentRun = runs.find((run) => run.session_id === activeSessionIdRef.current);
           if (currentRun && activeRunIdRef.current !== currentRun.run_id) {
             activeRunIdRef.current = currentRun.run_id;
             setSelectedRunId(currentRun.run_id);
@@ -407,21 +397,21 @@ function AssistantUIInner({
           const call = (event as { ToolCallStarted: { call: { call_id?: string; task_id?: string; name?: string; arguments?: unknown } } }).ToolCallStarted.call;
           // A tool call tagged with a task id belongs to a subagent, so the UI
           // nests it inside that task's card rather than the main timeline.
-          setTranscript((current) => [...current, { id: envelope.event_id, role: "tool", callId: call.call_id, taskId: typeof call.task_id === "string" ? call.task_id : undefined, name: call.name ?? "tool", command: typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments ?? {}), status: "running", output: "Waiting for result…", time: "now" }]);
+          setTranscript((current) => [...current, { id: envelope.event_id, role: "tool", callId: call.call_id, taskId: typeof call.task_id === "string" ? call.task_id : undefined, name: call.name ?? "tool", command: typeof call.arguments === "string" ? call.arguments : JSON.stringify(call.arguments ?? {}), status: "running", output: "Waiting for result…", time: "now" }], envelope.session_id);
         } else if (typeof event === "object" && event !== null && "ToolOutputDelta" in event) {
           const output = (event as { ToolOutputDelta: { call_id?: string; delta?: string } }).ToolOutputDelta;
           setTranscript((current) => current.map((item) => item.role === "tool" && item.callId === output.call_id
             ? { ...item, output: `${item.output === "Waiting for result…" ? "" : item.output}${output.delta ?? ""}` }
-            : item));
+            : item), envelope.session_id);
         } else if (typeof event === "object" && event !== null && "ToolResult" in event) {
           const result = (event as { ToolResult: { result: { call_id?: string; name?: string; output?: string; ok?: boolean } } }).ToolResult.result;
-          setTranscript((current) => current.map((item) => item.role === "tool" && item.callId === result.call_id ? { ...item, status: result.ok ? "done" : "error", output: result.output ?? "" } : item));
+          setTranscript((current) => current.map((item) => item.role === "tool" && item.callId === result.call_id ? { ...item, status: result.ok ? "done" : "error", output: result.output ?? "" } : item), envelope.session_id);
         } else if (typeof event === "object" && event !== null && "TextDelta" in event) {
           const delta = (event as { TextDelta: { delta: string } }).TextDelta.delta;
           const runId = envelope.run_id;
           const pending = pendingTextRef.current;
           if (pending && pending.runId === runId) pending.text += delta;
-          else pendingTextRef.current = { runId, text: delta };
+          else pendingTextRef.current = { runId, sessionId: envelope.session_id, text: delta };
           if (textFrameRef.current === null) {
             textFrameRef.current = window.requestAnimationFrame(flushStreamedText);
           }
@@ -440,7 +430,7 @@ function AssistantUIInner({
               return next;
             }
             return [...current, { id, role: "reasoning", text: delta, time: "now" }];
-          });
+          }, envelope.session_id);
         } else if (typeof event === "object" && event !== null && "RunCompleted" in event) {
           // Flush before marking the run done, otherwise the tail of the reply
           // would sit in the buffer until the next frame after the spinner stops.
@@ -449,6 +439,20 @@ function AssistantUIInner({
           // it so any post-hoc note (a verification or truncation marker) shows.
           const finalOutput = (event as { RunCompleted: { output: string } }).RunCompleted.output;
           const finalId = `stream-${envelope.run_id}`;
+          const autoSessionId = firstReplyRunIdsRef.current.get(envelope.run_id);
+          firstReplyRunIdsRef.current.delete(envelope.run_id);
+          if (autoSessionId && finalOutput.trim()) {
+            const title = sessionTitleFromResponse(finalOutput);
+            if (title) {
+              void transportRef.current?.renameSession(autoSessionId, title).then((updated) => {
+                setSessions((current) => current.map((session) => session.id === autoSessionId
+                  ? { ...updated, meta: session.meta, active: session.active }
+                  : session));
+              }).catch((error: unknown) => {
+                setToast(error instanceof Error ? error.message : "Could not name this session");
+              });
+            }
+          }
           setTranscript((current) => {
             const at = current.findIndex((item) => item.id === finalId);
             // No streamed message means the token frames never reached this
@@ -464,16 +468,17 @@ function AssistantUIInner({
             const next = [...current];
             next[at] = { ...item, text: finalOutput };
             return next;
-          });
+          }, envelope.session_id);
           activeRunIdRef.current = null;
           setIsRunning(false);
           setActiveRuns((current) => current.filter((run) => run.run_id !== envelope.run_id));
         } else if (typeof event === "object" && event !== null && "RunFailed" in event) {
           flushStreamedText();
+          firstReplyRunIdsRef.current.delete(envelope.run_id);
           activeRunIdRef.current = null;
           setIsRunning(false);
           setActiveRuns((current) => current.filter((run) => run.run_id !== envelope.run_id));
-          setTranscript((current) => [...current, { id: envelope.event_id, role: "system", text: `Agent run failed: ${(event as { RunFailed: { message: string } }).RunFailed.message}`, time: "now" }]);
+          setTranscript((current) => [...current, { id: envelope.event_id, role: "system", text: `Agent run failed: ${(event as { RunFailed: { message: string } }).RunFailed.message}`, time: "now" }], envelope.session_id);
         } else if (typeof event === "object" && event !== null && "RunStarted" in event) {
           if (!runIds.includes(envelope.run_id)) setRunIds((current) => current.includes(envelope.run_id) ? current : [...current, envelope.run_id]);
           setSelectedRunId(envelope.run_id);
@@ -545,6 +550,46 @@ function AssistantUIInner({
     return () => client.close();
   }, [serverUrl, suppliedTransport, transportFactory]);
 
+  useEffect(() => {
+    if (transportStatus !== "connected") return;
+    const client = transportRef.current;
+    if (!client) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        let backendSessions = await client.listSessions();
+        if (backendSessions.length === 0) {
+          backendSessions = [await client.createSession({ title: NEW_SESSION_TITLE, workspace: "." })];
+        }
+        const preferred = backendSessions.find((session) => session.id === activeSessionIdRef.current) ?? backendSessions[0];
+        if (!preferred) return;
+        const turns = await client.sessionHistory(preferred.id);
+        if (cancelled) return;
+        setSessions(backendSessions.map((session) => ({
+          ...session,
+          meta: session.workspace,
+          active: session.id === preferred.id,
+        })));
+        setSessionTranscripts((current) => ({ ...current, [preferred.id]: transcriptFromHistory(turns) }));
+
+        const runs = await client.listActiveRuns();
+        if (cancelled) return;
+        setActiveRuns(runs);
+        setRunIds((current) => Array.from(new Set([...current, ...runs.map((run) => run.run_id)])));
+        const currentRun = runs.find((run) => run.session_id === preferred.id);
+        if (currentRun && activeRunIdRef.current !== currentRun.run_id) {
+          activeRunIdRef.current = currentRun.run_id;
+          setSelectedRunId(currentRun.run_id);
+          setIsRunning(true);
+          void client.resumeRun(currentRun.run_id, 0);
+        }
+      } catch (error) {
+        if (!cancelled) setToast(error instanceof Error ? error.message : "Could not load session history");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [transportStatus]);
+
   // A phone that was locked, a tab that was backgrounded, or a network that just
   // came back should reconnect at once rather than wait out a backoff timer that
   // may have been frozen while the page was suspended.
@@ -599,23 +644,69 @@ function AssistantUIInner({
     }
   }
 
-  function selectSession(id: string) {
+  async function selectSession(id: string) {
     setSessions((current) => current.map((session) => ({ ...session, active: session.id === id })));
     setHistoryOpen(false);
+    try {
+      const history = await transportRef.current?.sessionHistory(id);
+      if (history) setSessionTranscripts((current) => ({ ...current, [id]: transcriptFromHistory(history) }));
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Could not load this session");
+    }
   }
 
-  function createSession() {
-    const next = { id: `session-${sessions.length + 1}`, title: "New coding session", meta: "Just now · 0 messages", active: true };
-    setSessions((current) => [next, ...current.map((session) => ({ ...session, active: false }))]);
-    setSessionTranscripts((current) => ({ ...current, [next.id]: [] }));
-    setPendingApproval(null);
-    setHistoryOpen(false);
-    setToast("New session created");
+  async function createSession() {
+    const client = transportRef.current;
+    if (!client || transportStatus !== "connected") {
+      setToast("RIGA is not connected yet.");
+      return;
+    }
+    try {
+      const next = await client.createSession({ title: NEW_SESSION_TITLE, workspace: "." });
+      setSessions((current) => [{ ...next, meta: next.workspace, active: true }, ...current.map((session) => ({ ...session, active: false }))]);
+      setSessionTranscripts((current) => ({ ...current, [next.id]: [] }));
+      setPendingApproval(null);
+      setHistoryOpen(false);
+      setToast("New session created");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Could not create a session");
+    }
+  }
+
+  function beginSessionRename(session: Session) {
+    setEditingSessionId(session.id);
+    setRenameDraft(session.title);
+    setHistoryOpen(true);
+  }
+
+  async function saveSessionRename(sessionId: string) {
+    const title = renameDraft.trim();
+    if (!title) {
+      setToast("Session name cannot be empty.");
+      return;
+    }
+    try {
+      const updated = await transportRef.current?.renameSession(sessionId, title);
+      if (!updated) throw new Error("RIGA is not connected.");
+      setSessions((current) => current.map((session) => session.id === sessionId
+        ? { ...updated, meta: session.meta, active: session.active }
+        : session));
+      setEditingSessionId(null);
+      setToast("Session name updated");
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "Could not rename this session");
+    }
   }
 
   function sendMessage() {
     const text = draft.trim();
     if (!text || isRunning) return;
+    if (!activeSession.id) {
+      setToast("Wait for the session list to finish loading.");
+      return;
+    }
+    const firstReply = activeSession.title === NEW_SESSION_TITLE
+      && (sessionTranscripts[activeSession.id] ?? []).length === 0;
     const attachmentContext = attachments.length > 0
       ? `\n\nAttached files are available to read from the workspace: ${attachments.map((attachment) => attachment.path).join(", ")}`
       : "";
@@ -630,8 +721,10 @@ function AssistantUIInner({
     setPendingApproval(null);
     if (transportRef.current && transportStatus === "connected") {
       const runId = newId();
+      if (firstReply) firstReplyRunIdsRef.current.set(runId, activeSession.id);
       activeRunIdRef.current = runId;
       void transportRef.current.startRun(runId, activeSession.id, prompt).catch(() => {
+        firstReplyRunIdsRef.current.delete(runId);
         activeRunIdRef.current = null;
         setTransportStatus("error");
         setIsRunning(false);
@@ -796,13 +889,13 @@ function AssistantUIInner({
         </header>
         <section className={`content-column${fullWidthEnabled ? " full-width" : ""}`}>
           <header className="chat-header">
-            <div className="chat-session-label"><div className="chat-session-icon"><MessageSquare size={14} /></div><div><span>Session</span><strong>{activeSession.title}</strong></div></div>
+            <div className="chat-session-label"><div className="chat-session-icon"><MessageSquare size={14} /></div><div><span>Session</span><strong>{activeSession.title}</strong></div><button className="icon-button session-rename-trigger" aria-label={`Rename session ${activeSession.title}`} title="Rename session" disabled={!activeSession.id} onClick={() => beginSessionRename(activeSession)}><Pencil size={13} /></button></div>
             <div className="chat-header-actions">
               {showSessionHistoryButton && <button className={`icon-button chat-header-button ${historyOpen ? "selected" : ""}`} aria-label="Open chat history" title="Open chat history" onClick={() => { setHistoryOpen((value) => !value); setSettingsOpen(false); }}><Menu size={16} /></button>}
               <button className={`icon-button chat-header-button ${settingsOpen ? "selected" : ""}`} aria-label="Open settings" title="Open settings" onClick={() => { setSettingsOpen((value) => !value); setHistoryOpen(false); }}><Settings2 size={16} /></button>
               <button className="icon-button chat-header-button" aria-label="New chat" title="New chat" onClick={createSession}><Plus size={16} /></button>
             </div>
-            {historyOpen && <div className="chat-popover history-popover"><div className="chat-popover-header"><strong>Chat history</strong><button className="outline-button" onClick={createSession}><Plus size={13} /> New chat</button></div><nav className="compact-session-list" aria-label="Chat history">{sessions.map((session) => <button key={session.id} className={`compact-session-item ${session.active ? "active" : ""}`} onClick={() => selectSession(session.id)}><MessageSquare size={14} /><span><strong>{session.title}</strong><small>{session.meta}</small></span></button>)}</nav></div>}
+            {historyOpen && <div className="chat-popover history-popover"><div className="chat-popover-header"><strong>Chat history</strong><button className="outline-button" onClick={() => void createSession()}><Plus size={13} /> New chat</button></div><nav className="compact-session-list" aria-label="Chat history">{sessions.map((session) => editingSessionId === session.id ? <div className="compact-session-edit" key={session.id}><input aria-label="Session name" value={renameDraft} autoFocus onChange={(event) => setRenameDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void saveSessionRename(session.id); } else if (event.key === "Escape") setEditingSessionId(null); }} /><button className="approve-button" onClick={() => void saveSessionRename(session.id)}>Save</button><button className="outline-button" onClick={() => setEditingSessionId(null)}>Cancel</button></div> : <div className={`compact-session-row ${session.active ? "active" : ""}`} key={session.id}><button className={`compact-session-item ${session.active ? "active" : ""}`} onClick={() => void selectSession(session.id)}><MessageSquare size={14} /><span><strong>{session.title}</strong><small>{session.meta}</small></span></button><button className="icon-button compact-session-rename" aria-label={`Rename ${session.title}`} title="Rename session" onClick={() => beginSessionRename(session)}><Pencil size={12} /></button></div>)}</nav></div>}
             {settingsOpen && <section className="chat-popover settings-popover"><div className="settings-panel-header"><div><p className="eyebrow">RUNTIME / PROVIDER</p><h2>Connect your model.</h2><p>Endpoint and model restore after reload. The API key is sent over WebSocket and retained only in the server's encrypted store.</p></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><div className="provider-tabs"><button className={providerMode === "remote" ? "selected" : ""} onClick={() => setProviderMode("remote")}>OpenAI-compatible / OpenCode Go</button><button className={providerMode === "local" ? "selected" : ""} onClick={() => setProviderMode("local")}>Local GGUF model</button></div>{providerMode === "remote" ? <div className="provider-form"><label>API endpoint<input value={providerEndpoint} onChange={(event) => setProviderEndpoint(event.target.value)} placeholder="https://api.example.com/v1" /></label><label>API key <span>encrypted at rest</span><input type="password" value={providerApiKey} onChange={(event) => setProviderApiKey(event.target.value)} placeholder="sk-…" autoComplete="off" /></label><label>Model<input value={providerModel} onChange={(event) => setProviderModel(event.target.value)} placeholder="opencode-go / gpt-4o-mini" /></label><label>API<select value={providerApi} onChange={(event) => setProviderApi(event.target.value as "chat" | "responses")}><option value="chat">Chat completions (compatible)</option><option value="responses">Responses API (OpenAI)</option></select></label><label>Subagent model <span>optional</span><input value={subagentModel} onChange={(event) => setSubagentModel(event.target.value)} placeholder="cheap model for explore/plan" /></label><label>Reasoning effort<select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label><button className="approve-button settings-save" onClick={() => void saveProvider()}><Check size={15} /> Save settings</button></div> : <div className="local-model-panel"><div className="local-model-head"><div className="tool-symbol"><Bot size={17} /></div><div><strong>Local GGUF models</strong><p>Download a curated GGUF and run it in this process through llama.cpp. Runs on {localModels?.accelerator ?? "the local CPU"}{localModels?.accelerator?.includes("CPU") ? " — build with `--features cuda` for GPU offload." : "."}</p></div></div>{modelError && <p className="model-error">{modelError}</p>}<div className="model-section"><div className="model-section-title"><span>Downloaded</span><button className="outline-button" onClick={() => void refreshLocalModels()} disabled={modelBusy !== null}>Refresh</button></div>{!localModels && <p className="model-empty">Loading the model manager…</p>}{localModels?.installed.length === 0 && <p className="model-empty">No models yet. Download one below; it is verified against a pinned SHA-256 before use.</p>}{localModels?.installed.map((model) => { const state = downloads[model.id]; return <div className="model-row" key={model.path}><div className="model-row-main"><strong>{model.name}</strong><span>{formatBytes(model.size_bytes)} · {model.curated ? model.recommended_context ? `${model.recommended_context >= 1024 ? `${Math.round(model.recommended_context / 1024)}k` : model.recommended_context} ctx` : "curated GGUF" : "local GGUF"}</span></div><div className="model-row-actions">{state?.phase === "downloading" && <button className="outline-button" onClick={() => void runModelAction("cancel", async () => { await transportRef.current?.cancelDownload(model.id); })} disabled={modelBusy !== null}>{state.percent.toFixed(0)}% · Cancel</button>}{localModels.loaded === model.file_name ? <span className="model-loaded">Loaded</span> : <button className="approve-button" onClick={() => void runModelAction("load", async () => { await transportRef.current?.loadModel(model.path); })} disabled={modelBusy !== null}>{modelBusy === "load" ? "Loading…" : "Load"}</button>}</div>{state?.phase === "downloading" && <div className="model-progress"><span style={{ width: `${Math.max(2, state.percent)}%` }} /></div>}{state?.phase === "failed" && <p className="model-error">{state.message}</p>}</div>; })}{localModels && <div className="model-section-title"><span>Curated catalog</span></div>}{localModels?.catalog.map((model) => { const state = downloads[model.id]; const already = localModels.installed.some((installed) => installed.id === model.id); return <div className="model-row" key={model.id}><div className="model-row-main"><strong>{model.name}</strong><span>{formatBytes(model.size_bytes)} · {model.quant} · {Math.round(model.recommended_context / 1024)}k ctx · <a href={model.license_url} target="_blank" rel="noreferrer">license</a></span></div><div className="model-row-actions">{already ? <span className="model-installed-tag">Installed</span> : state?.phase === "downloading" ? <button className="outline-button" onClick={() => void runModelAction("cancel", async () => { await transportRef.current?.cancelDownload(model.id); })} disabled={modelBusy !== null}>{state.percent.toFixed(0)}% · Cancel</button> : state?.phase === "finished" ? <span className="model-installed-tag">Ready</span> : <button className="approve-button" onClick={() => void runModelAction("download", async () => { await transportRef.current?.downloadModel(model.id); })} disabled={modelBusy !== null}>{modelBusy === "download" ? "Starting…" : "Download"}</button>}</div>{state?.phase === "downloading" && <div className="model-progress"><span style={{ width: `${Math.max(2, state.percent)}%` }} /></div>}{state?.phase === "failed" && <p className="model-error">{state.message}</p>}</div>; })}</div><p className="model-hint">Select the loaded Local model from the composer to use it for the next run.</p></div>}</section>}
           </header>
           <div ref={transcriptRef} className="transcript" aria-live="polite">

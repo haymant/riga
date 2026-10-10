@@ -23,6 +23,12 @@ export class RigaHttpClient {
   async createSession(request: CreateSessionRequest): Promise<Session> {
     return this.request("/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
   }
+  async sessionHistory(sessionId: string): Promise<import("../protocol").ConversationTurn[]> {
+    return this.request(`/sessions/${encodeURIComponent(sessionId)}/history`);
+  }
+  async renameSession(sessionId: string, title: string): Promise<Session> {
+    return this.request(`/sessions/${encodeURIComponent(sessionId)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ title }) });
+  }
   async streamRunEvents(runId: string, onEvent: (event: RigaEventEnvelope) => void): Promise<void> {
     const response = await fetch(`${this.baseUrl}/runs/${encodeURIComponent(runId)}/events`, { headers: { accept: "text/event-stream" } });
     if (!response.ok || !response.body) throw new Error(`SSE request failed with ${response.status}`);
@@ -69,6 +75,8 @@ export class RigaHttpTransport implements RigaTransport {
   catalog(): Promise<Catalog> { return this.request("/catalog"); }
   listSessions(): Promise<Session[]> { return this.resources.listSessions(); }
   createSession(request: CreateSessionRequest): Promise<Session> { return this.resources.createSession(request); }
+  sessionHistory(sessionId: string): Promise<import("../protocol").ConversationTurn[]> { return this.resources.sessionHistory(sessionId); }
+  renameSession(sessionId: string, title: string): Promise<Session> { return this.resources.renameSession(sessionId, title); }
   configureProvider(...args: Parameters<RigaWebSocketClient["configureProvider"]>): Promise<void> { return this.socket.configureProvider(...args); }
   startRun(...args: Parameters<RigaWebSocketClient["startRun"]>): Promise<void> { return this.socket.startRun(...args); }
   resumeRun(...args: Parameters<RigaWebSocketClient["resumeRun"]>): Promise<void> { return this.socket.resumeRun(...args); }

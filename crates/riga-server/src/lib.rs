@@ -16,7 +16,7 @@ use axum::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use riga_kernel::{
     events::{RigaEvent, RigaEventEnvelope},
@@ -128,9 +128,10 @@ impl Default for ServerState {
                     .and_then(|text| serde_json::from_str(&text).ok())
             })
             .unwrap_or_default();
+        let next_id = next_session_number(&sessions);
         Self {
             sessions: Arc::new(RwLock::new(sessions)),
-            next_id: Arc::new(AtomicU64::new(1)),
+            next_id: Arc::new(AtomicU64::new(next_id)),
             workspace_root,
             secure_store,
             mcp_registry: Arc::new(RwLock::new(mcp_registry)),
@@ -141,6 +142,48 @@ impl Default for ServerState {
             runs: ws::RunRegistry::default(),
         }
     }
+}
+
+impl ServerState {
+    /// Load configured sessions and transcript history before serving requests.
+    /// Supports encrypted files, plain per-user JSON files, and DATABASE_URL.
+    pub async fn load() -> Result<Self, String> {
+        let state = Self::default();
+        let database_configured = std::env::var("DATABASE_URL")
+            .ok()
+            .is_some_and(|url| !url.trim().is_empty());
+
+        if let Some(sessions) = secure_store::load_json::<Vec<Session>>("sessions").await? {
+            *state.sessions.write().await = sessions;
+        } else if database_configured {
+            state.sessions.write().await.clear();
+        }
+        let sessions = state.sessions.read().await;
+        state
+            .next_id
+            .store(next_session_number(&sessions), Ordering::Relaxed);
+        drop(sessions);
+
+        if let Some(transcripts) = secure_store::load_json::<
+            std::collections::HashMap<String, Vec<ws::ConversationTurn>>,
+        >("transcripts")
+        .await?
+        {
+            *state.transcripts.write().await = transcripts;
+        } else if database_configured {
+            state.transcripts.write().await.clear();
+        }
+        Ok(state)
+    }
+}
+
+fn next_session_number(sessions: &[Session]) -> u64 {
+    sessions
+        .iter()
+        .filter_map(|session| session.id.strip_prefix("session-")?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 fn workspace_from_env() -> String {
@@ -175,6 +218,8 @@ pub fn router(state: ServerState) -> Router {
         .route("/mcp/health", post(mcp_health_http))
         .route("/attachments", post(upload_attachment))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/{session_id}", patch(rename_session))
+        .route("/sessions/{session_id}/history", get(session_history))
         .route("/runs/{run_id}/events", get(stream_events))
         .route("/ws", get(ws_upgrade))
         .route(
@@ -636,35 +681,69 @@ async fn upload_attachment(
         .into_response()
 }
 
-async fn list_sessions(State(state): State<ServerState>) -> Json<Vec<Session>> {
-    Json(state.sessions.read().await.clone())
+async fn list_sessions(State(state): State<ServerState>) -> impl IntoResponse {
+    match ipc::IpcService::new(state).list_sessions().await {
+        Ok(sessions) => Json(sessions).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+    }
 }
 
 async fn create_session(
     State(state): State<ServerState>,
     Json(request): Json<CreateSessionRequest>,
 ) -> impl IntoResponse {
-    if request.title.trim().is_empty() || request.workspace.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "title and workspace are required" })),
-        )
-            .into_response();
+    match ipc::IpcService::new(state).create_session(request).await {
+        Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
+        Err(error) => {
+            let status = if error == "title and workspace are required" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({ "error": error }))).into_response()
+        }
     }
-    let id = format!("session-{}", state.next_id.fetch_add(1, Ordering::Relaxed));
-    let session = Session {
-        id,
-        title: request.title,
-        workspace: request.workspace,
-        created_at: "now".into(),
-        updated_at: "now".into(),
-    };
-    state.sessions.write().await.push(session.clone());
-    if let Some(store) = &state.secure_store {
-        let sessions = state.sessions.read().await.clone();
-        let _ = store.save("sessions", &sessions);
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameSessionRequest {
+    title: String,
+}
+
+async fn rename_session(
+    State(state): State<ServerState>,
+    Path(session_id): Path<String>,
+    Json(request): Json<RenameSessionRequest>,
+) -> impl IntoResponse {
+    match ipc::IpcService::new(state)
+        .rename_session(&session_id, request.title)
+        .await
+    {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => {
+            let status = if error.contains("title") || error == "session not found" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({ "error": error }))).into_response()
+        }
     }
-    (StatusCode::CREATED, Json(session)).into_response()
+}
+
+async fn session_history(
+    State(state): State<ServerState>,
+    Path(session_id): Path<String>,
+) -> Json<Vec<ws::ConversationTurn>> {
+    Json(
+        ipc::IpcService::new(state)
+            .session_history(&session_id)
+            .await,
+    )
 }
 
 async fn stream_events(
@@ -735,6 +814,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 201);
         let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert!(std::str::from_utf8(&body).unwrap().contains("session-1"));
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(created["id"].as_str().unwrap().starts_with("session-"));
+        assert_eq!(created["title"], "Test");
     }
 }

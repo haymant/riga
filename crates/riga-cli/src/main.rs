@@ -40,15 +40,15 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let args = Args::parse();
-    let transport = IpcTransport::new(ServerState::default());
+    let transport = IpcTransport::new(ServerState::load().await?);
 
     if args.tui {
-        let mut sessions = transport.list_sessions().await;
+        let mut sessions = transport.list_sessions().await?;
         if sessions.is_empty() {
             sessions.push(
                 transport
                     .create_session(CreateSessionRequest {
-                        title: "Default chat".into(),
+                        title: "New session".into(),
                         workspace: ".".into(),
                     })
                     .await?,
@@ -121,7 +121,7 @@ async fn main() -> Result<(), String> {
     if args.list_sessions {
         println!(
             "{}",
-            serde_json::to_string_pretty(&transport.list_sessions().await)
+            serde_json::to_string_pretty(&transport.list_sessions().await?)
                 .map_err(|error| error.to_string())?
         );
     }

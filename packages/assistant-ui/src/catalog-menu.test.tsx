@@ -27,6 +27,8 @@ function createTransport() {
     catalog: async () => catalogWithSkills,
     listSessions: async () => [],
     createSession: async (request) => ({ id: "session-1", title: request.title, workspace: request.workspace, created_at: "now", updated_at: "now" }),
+    sessionHistory: async () => [],
+    renameSession: async (sessionId, title) => ({ id: sessionId, title, workspace: ".", created_at: "now", updated_at: "now" }),
     configureProvider: async () => undefined,
     startRun: async () => undefined,
     resumeRun: async () => undefined,

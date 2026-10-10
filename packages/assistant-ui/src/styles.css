@@ -106,9 +106,17 @@ button { cursor: pointer; }
 .chat-popover-header strong { color: var(--text); font-size: 12px; }
 .chat-popover-header .outline-button { padding: 6px 8px; font-size: 10px; }
 .compact-session-list { display: grid; gap: 3px; max-height: min(42dvh, 300px); overflow-y: auto; }
+.compact-session-row { display: flex; align-items: center; gap: 4px; border: 1px solid transparent; border-radius: 8px; }
+.compact-session-row.active { background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 22%, var(--border)); }
 .compact-session-item { width: 100%; display: flex; align-items: flex-start; gap: 9px; padding: 9px; text-align: left; color: var(--text-muted); background: transparent; border: 1px solid transparent; border-radius: 8px; }
+.compact-session-row .compact-session-item { flex: 1; min-width: 0; }
 .compact-session-item:hover { color: var(--text); background: var(--surface-raised); }
 .compact-session-item.active { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 22%, var(--border)); }
+.compact-session-rename { width: 28px; height: 28px; flex: 0 0 auto; color: var(--text-muted); }
+.compact-session-edit { display: flex; align-items: center; gap: 6px; padding: 6px; }
+.compact-session-edit input { flex: 1; min-width: 0; height: 32px; padding: 0 9px; color: var(--text); background: var(--surface-raised); border: 1px solid var(--border); border-radius: 7px; }
+.compact-session-edit .approve-button, .compact-session-edit .outline-button { padding: 7px 9px; font-size: 10px; }
+.session-rename-trigger { width: 25px; height: 25px; flex: 0 0 auto; color: var(--text-muted); }
 .compact-session-item span { min-width: 0; }
 .compact-session-item strong, .compact-session-item small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .compact-session-item strong { color: var(--text); font-size: 11px; }

@@ -30,6 +30,10 @@ pub enum UiCommand {
         title: String,
         workspace: String,
     },
+    RenameSession {
+        session_id: String,
+        title: String,
+    },
     SaveProvider {
         config: riga_server::ws::ProviderConfig,
     },
@@ -72,6 +76,7 @@ pub struct UiState {
     pub panel_input: TextBuffer,
     pub workspace_input: TextBuffer,
     pub creating_session: bool,
+    pub renaming_session: Option<String>,
     pub session_field: usize,
     pub provider: ProviderForm,
     pub provider_field: usize,
@@ -488,10 +493,22 @@ impl UiState {
         if key.code == KeyCode::Esc {
             self.panel = UiPanel::Transcript;
             self.creating_session = false;
+            self.renaming_session = None;
             return None;
         }
         match self.panel {
             UiPanel::History => {
+                if let Some(session_id) = self.renaming_session.clone() {
+                    if key.code == KeyCode::Enter && !self.panel_input.is_empty() {
+                        self.renaming_session = None;
+                        return Some(UiCommand::RenameSession {
+                            session_id,
+                            title: self.panel_input.text().into(),
+                        });
+                    }
+                    let _ = self.panel_input.handle_key(key);
+                    return None;
+                }
                 if self.creating_session {
                     match key.code {
                         KeyCode::Enter
@@ -528,6 +545,15 @@ impl UiState {
                         self.workspace_input.clear();
                         self.workspace_input.insert('.');
                         self.session_field = 0;
+                    }
+                    KeyCode::Char('r') => {
+                        if let Some(session) = self.state.sessions.get(self.panel_cursor) {
+                            self.renaming_session = Some(session.id.clone());
+                            self.panel_input.clear();
+                            for character in session.title.chars() {
+                                self.panel_input.insert(character);
+                            }
+                        }
                     }
                     KeyCode::Enter => {
                         if let Some(session) = self.state.sessions.get(self.panel_cursor) {
@@ -794,6 +820,33 @@ impl UiState {
     }
 }
 
+fn session_title_from_response(response: &str) -> Option<String> {
+    let line = response
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let cleaned = line
+        .trim_start_matches(|character: char| "#>*- ".contains(character))
+        .trim()
+        .trim_matches('`');
+    if cleaned.is_empty() {
+        return None;
+    }
+    let end = cleaned
+        .find(|character: char| matches!(character, '.' | '!' | '?'))
+        .map(|index| index + 1)
+        .unwrap_or(cleaned.len());
+    let title = cleaned[..end].trim().trim_matches('"').trim();
+    if title.is_empty() {
+        return None;
+    }
+    if title.chars().count() > 80 {
+        Some(format!("{}…", title.chars().take(79).collect::<String>()))
+    } else {
+        Some(title.to_owned())
+    }
+}
+
 pub async fn run_with_transport<T: RigaTransport>(
     mut app: UiState,
     transport: T,
@@ -900,8 +953,41 @@ pub async fn run_with_transport<T: RigaTransport>(
                     });
                     if let Some(run_id) = terminal_run {
                         app.busy = None;
+                        let first_reply = app.state.run(&run_id).and_then(|run| {
+                            let is_untitled = app
+                                .state
+                                .sessions
+                                .iter()
+                                .find(|session| session.id == run.session_id)
+                                .is_some_and(|session| session.title == "New session");
+                            (run.status == crate::model::RunStatus::Completed
+                                && is_untitled
+                                && app.state.session_history.is_empty())
+                            .then(|| (run.session_id.clone(), run.output.clone()))
+                        });
+                        if let Some((session_id, response)) = first_reply
+                            && let Some(title) = session_title_from_response(&response)
+                        {
+                            match transport.rename_session(session_id.clone(), title).await {
+                                Ok(session) => {
+                                    if let Some(existing) = app
+                                        .state
+                                        .sessions
+                                        .iter_mut()
+                                        .find(|existing| existing.id == session_id)
+                                    {
+                                        *existing = session;
+                                    }
+                                }
+                                Err(error) => {
+                                    app.notice = Some(format!("Could not name session: {error}"))
+                                }
+                            }
+                        }
                         app.archive_active_run();
-                        app.state.active_runs.retain(|active| active.run_id != run_id);
+                        app.state
+                            .active_runs
+                            .retain(|active| active.run_id != run_id);
                         app.state.select_run(None);
                         app.current_prompt = None;
                         events = None;
@@ -944,10 +1030,7 @@ pub async fn run_with_transport<T: RigaTransport>(
         if event::poll(Duration::from_millis(60)).map_err(|error| error.to_string())? {
             match event::read().map_err(|error| error.to_string())? {
                 Event::Mouse(mouse) => {
-                    let height = terminal
-                        .size()
-                        .map_err(|error| error.to_string())?
-                        .height;
+                    let height = terminal.size().map_err(|error| error.to_string())?.height;
                     app.handle_mouse(mouse, height);
                 }
                 Event::Key(key) => {
@@ -955,154 +1038,183 @@ pub async fn run_with_transport<T: RigaTransport>(
                         continue;
                     };
                     match command {
-                UiCommand::StartRun { session_id, prompt } => {
-                    if app.busy.as_deref() == Some("Stopping...") {
-                        app.notice = Some("The previous run is still stopping; please wait a moment.".into());
-                        continue;
-                    }
-                    app.archive_active_run();
-                    app.current_prompt = Some(prompt.clone());
-                    let run_id = format!(
-                        "cli-{}",
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_nanos()
-                    );
-                    app.busy = Some("Starting...".into());
-                    let tx = completion_tx.clone();
-                    let transport = transport.clone();
-                    tokio::spawn(async move {
-                        let result = transport
-                            .start_run(run_id.clone(), session_id.clone(), prompt)
-                            .await;
-                        let _ = tx.send(BackgroundResult::StartRun {
-                            run_id,
-                            session_id,
-                            result,
-                        });
-                    });
-                }
-                UiCommand::Approve {
-                    approval_id,
-                    always,
-                } => {
-                    let _ = transport
-                        .respond_to_approval(approval_id.clone(), true, always)
-                        .await;
-                    app.approval_command_finished(&approval_id);
-                }
-                UiCommand::Deny { approval_id } => {
-                    let _ = transport
-                        .respond_to_approval(approval_id.clone(), false, false)
-                        .await;
-                    app.approval_command_finished(&approval_id);
-                }
-                UiCommand::CancelRun { run_id } => {
-                    if transport.cancel_run(run_id).await {
-                        app.busy = Some("Stopping...".into());
-                    } else {
-                        app.busy = None;
-                        app.notice = Some("The run could not be cancelled.".into());
-                    }
-                }
-                UiCommand::SelectSession { session_id } => {
-                    app.set_session_history(transport.session_history(session_id.clone()).await);
-                    app.state.selected_session = Some(session_id);
-                    app.state.active_run = None;
-                    app.current_prompt = None;
-                }
-                UiCommand::CreateSession { title, workspace } => {
-                    let session = transport
-                        .create_session(riga_server::CreateSessionRequest { title, workspace })
-                        .await?;
-                    app.state.selected_session = Some(session.id.clone());
-                    app.state.sessions.push(session);
-                }
-                UiCommand::SaveProvider { config } => {
-                    match transport.configure_provider(config).await {
-                        Ok(_) => {
-                            app.provider.error = None;
-                            app.panel = UiPanel::Transcript;
+                        UiCommand::StartRun { session_id, prompt } => {
+                            if app.busy.as_deref() == Some("Stopping...") {
+                                app.notice = Some(
+                                    "The previous run is still stopping; please wait a moment."
+                                        .into(),
+                                );
+                                continue;
+                            }
+                            app.archive_active_run();
+                            app.current_prompt = Some(prompt.clone());
+                            let run_id = format!(
+                                "cli-{}",
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_nanos()
+                            );
+                            app.busy = Some("Starting...".into());
+                            let tx = completion_tx.clone();
+                            let transport = transport.clone();
+                            tokio::spawn(async move {
+                                let result = transport
+                                    .start_run(run_id.clone(), session_id.clone(), prompt)
+                                    .await;
+                                let _ = tx.send(BackgroundResult::StartRun {
+                                    run_id,
+                                    session_id,
+                                    result,
+                                });
+                            });
                         }
-                        Err(error) => app.provider.error = Some(error),
-                    }
-                }
-                UiCommand::InsertCatalog { text } => {
-                    for character in text.chars() {
-                        app.draft.insert(character);
-                    }
-                }
-                UiCommand::ResumeRun { run_id, session_id } => {
-                    match transport.subscribe_run(run_id.clone(), 0).await {
-                        Ok(receiver) => {
-                            app.notice = None;
+                        UiCommand::Approve {
+                            approval_id,
+                            always,
+                        } => {
+                            let _ = transport
+                                .respond_to_approval(approval_id.clone(), true, always)
+                                .await;
+                            app.approval_command_finished(&approval_id);
+                        }
+                        UiCommand::Deny { approval_id } => {
+                            let _ = transport
+                                .respond_to_approval(approval_id.clone(), false, false)
+                                .await;
+                            app.approval_command_finished(&approval_id);
+                        }
+                        UiCommand::CancelRun { run_id } => {
+                            if transport.cancel_run(run_id).await {
+                                app.busy = Some("Stopping...".into());
+                            } else {
+                                app.busy = None;
+                                app.notice = Some("The run could not be cancelled.".into());
+                            }
+                        }
+                        UiCommand::SelectSession { session_id } => {
+                            app.set_session_history(
+                                transport.session_history(session_id.clone()).await,
+                            );
                             app.state.selected_session = Some(session_id);
-                            app.state.select_run(Some(run_id));
-                            events = Some(receiver);
+                            app.state.active_run = None;
+                            app.current_prompt = None;
                         }
-                        Err(error) => app.notice = Some(format!("Unable to resume run: {error}")),
-                    }
-                }
-                UiCommand::LocalModelAction {
-                    action,
-                    model_id,
-                    path,
-                } => {
-                    app.busy = Some(match action.as_str() {
-                        "load" => "Loading local model...".into(),
-                        "download" => "Starting download...".into(),
-                        "unload" => "Unloading local model...".into(),
-                        _ => "Working...".into(),
-                    });
-                    if action == "download" {
-                        app.local_model_status =
-                            model_id.clone().map(|id| format!("{id}: download started"));
-                        app.local_model_progress = Some(0.0);
-                    }
-                    let tx = completion_tx.clone();
-                    let transport = transport.clone();
-                    tokio::spawn(async move {
-                        let result = transport
-                            .local_model_action(action.clone(), model_id.clone(), path)
-                            .await;
-                        let _ = tx.send(BackgroundResult::LocalModel {
+                        UiCommand::CreateSession { title, workspace } => {
+                            let session = transport
+                                .create_session(riga_server::CreateSessionRequest {
+                                    title,
+                                    workspace,
+                                })
+                                .await?;
+                            app.state.selected_session = Some(session.id.clone());
+                            app.state.sessions.push(session);
+                        }
+                        UiCommand::RenameSession { session_id, title } => {
+                            match transport.rename_session(session_id.clone(), title).await {
+                                Ok(session) => {
+                                    if let Some(existing) = app
+                                        .state
+                                        .sessions
+                                        .iter_mut()
+                                        .find(|existing| existing.id == session_id)
+                                    {
+                                        *existing = session;
+                                    }
+                                    app.notice = Some("Session name updated.".into());
+                                }
+                                Err(error) => {
+                                    app.notice = Some(format!("Could not rename session: {error}"))
+                                }
+                            }
+                        }
+                        UiCommand::SaveProvider { config } => {
+                            match transport.configure_provider(config).await {
+                                Ok(_) => {
+                                    app.provider.error = None;
+                                    app.panel = UiPanel::Transcript;
+                                }
+                                Err(error) => app.provider.error = Some(error),
+                            }
+                        }
+                        UiCommand::InsertCatalog { text } => {
+                            for character in text.chars() {
+                                app.draft.insert(character);
+                            }
+                        }
+                        UiCommand::ResumeRun { run_id, session_id } => {
+                            match transport.subscribe_run(run_id.clone(), 0).await {
+                                Ok(receiver) => {
+                                    app.notice = None;
+                                    app.state.selected_session = Some(session_id);
+                                    app.state.select_run(Some(run_id));
+                                    events = Some(receiver);
+                                }
+                                Err(error) => {
+                                    app.notice = Some(format!("Unable to resume run: {error}"))
+                                }
+                            }
+                        }
+                        UiCommand::LocalModelAction {
                             action,
                             model_id,
-                            result,
-                        });
-                    });
-                }
-                UiCommand::UploadAttachment { path } => {
-                    let file_name = std::path::Path::new(&path)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("attachment")
-                        .to_owned();
-                    match tokio::fs::read(&path).await {
-                        Ok(bytes) => match transport
-                            .upload_attachment(riga_server::ipc::IpcAttachment {
-                                name: file_name,
-                                bytes,
-                                session_id: app.state.selected_session.clone(),
-                            })
-                            .await
-                        {
-                            Ok(attachment) => {
-                                for character in
-                                    format!("\n[attachment: {}]", attachment.path).chars()
-                                {
-                                    app.draft.insert(character);
-                                }
-                                app.local_model_error = None;
+                            path,
+                        } => {
+                            app.busy = Some(match action.as_str() {
+                                "load" => "Loading local model...".into(),
+                                "download" => "Starting download...".into(),
+                                "unload" => "Unloading local model...".into(),
+                                _ => "Working...".into(),
+                            });
+                            if action == "download" {
+                                app.local_model_status =
+                                    model_id.clone().map(|id| format!("{id}: download started"));
+                                app.local_model_progress = Some(0.0);
                             }
-                            Err(error) => app.local_model_error = Some(error),
-                        },
-                        Err(error) => {
-                            app.local_model_error = Some(format!("attachment read failed: {error}"))
+                            let tx = completion_tx.clone();
+                            let transport = transport.clone();
+                            tokio::spawn(async move {
+                                let result = transport
+                                    .local_model_action(action.clone(), model_id.clone(), path)
+                                    .await;
+                                let _ = tx.send(BackgroundResult::LocalModel {
+                                    action,
+                                    model_id,
+                                    result,
+                                });
+                            });
                         }
-                    }
-                }
+                        UiCommand::UploadAttachment { path } => {
+                            let file_name = std::path::Path::new(&path)
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("attachment")
+                                .to_owned();
+                            match tokio::fs::read(&path).await {
+                                Ok(bytes) => match transport
+                                    .upload_attachment(riga_server::ipc::IpcAttachment {
+                                        name: file_name,
+                                        bytes,
+                                        session_id: app.state.selected_session.clone(),
+                                    })
+                                    .await
+                                {
+                                    Ok(attachment) => {
+                                        for character in
+                                            format!("\n[attachment: {}]", attachment.path).chars()
+                                        {
+                                            app.draft.insert(character);
+                                        }
+                                        app.local_model_error = None;
+                                    }
+                                    Err(error) => app.local_model_error = Some(error),
+                                },
+                                Err(error) => {
+                                    app.local_model_error =
+                                        Some(format!("attachment read failed: {error}"))
+                                }
+                            }
+                        }
                         UiCommand::Quit => break,
                     }
                 }
@@ -1178,9 +1290,10 @@ mod tests {
     #[test]
     fn tab_focuses_pending_approval_without_submitting_it() {
         let mut app = approval_app();
-        assert!(app
-            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .is_none());
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+                .is_none()
+        );
         assert!(app.approval_focused);
         assert_eq!(
             app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
@@ -1223,6 +1336,49 @@ mod tests {
             })
         );
         assert_eq!(app.draft.text(), "x");
+    }
+
+    #[test]
+    fn history_panel_can_rename_a_session() {
+        let mut app = UiState::default();
+        app.state.sessions.push(riga_kernel::state::Session {
+            id: "session-1".into(),
+            title: "Old".into(),
+            workspace: ".".into(),
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        for _ in 0..3 {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for character in "Renamed".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(UiCommand::RenameSession {
+                session_id: "session-1".into(),
+                title: "Renamed".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn first_response_title_uses_a_concise_sentence_and_respects_limit() {
+        assert_eq!(
+            session_title_from_response("## Build complete. More detail follows."),
+            Some("Build complete.".into())
+        );
+        assert_eq!(session_title_from_response("   \n"), None);
+        assert!(
+            session_title_from_response(&"a".repeat(120))
+                .unwrap()
+                .chars()
+                .count()
+                <= 80
+        );
     }
 
     #[test]

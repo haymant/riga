@@ -59,7 +59,7 @@ async fn riga_catalog(service: State<'_, IpcService>) -> Result<serde_json::Valu
 async fn riga_list_sessions(
     service: State<'_, IpcService>,
 ) -> Result<Vec<riga_kernel::state::Session>, String> {
-    Ok(service.list_sessions().await)
+    service.list_sessions().await
 }
 
 #[tauri::command]
@@ -75,6 +75,23 @@ async fn riga_create_session(
     request: CreateSessionRequest,
 ) -> Result<riga_kernel::state::Session, String> {
     service.create_session(request).await
+}
+
+#[tauri::command]
+async fn riga_session_history(
+    service: State<'_, IpcService>,
+    session_id: String,
+) -> Result<Vec<riga_server::ws::ConversationTurn>, String> {
+    Ok(service.session_history(&session_id).await)
+}
+
+#[tauri::command]
+async fn riga_rename_session(
+    service: State<'_, IpcService>,
+    session_id: String,
+    title: String,
+) -> Result<riga_kernel::state::Session, String> {
+    service.rename_session(&session_id, title).await
 }
 
 #[tauri::command]
@@ -253,6 +270,8 @@ pub fn run() {
             riga_catalog,
             riga_list_sessions,
             riga_create_session,
+            riga_session_history,
+            riga_rename_session,
             riga_list_active_runs,
             riga_list_mcp_registry,
             riga_save_mcp_registry,

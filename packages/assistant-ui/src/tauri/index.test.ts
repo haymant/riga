@@ -75,6 +75,8 @@ describe("RigaTauriTransport", () => {
     await transport.catalog();
     await transport.listSessions();
     await transport.createSession({ title: "Test", workspace: "/tmp" });
+    await transport.sessionHistory("session-1");
+    await transport.renameSession("session-1", "Renamed");
     await transport.listMcpRegistry();
     await transport.saveMcpRegistry({ name: "health", transport: "stdio", command: "health-mcp" });
     await transport.cancelDownload("model-1");
@@ -84,6 +86,8 @@ describe("RigaTauriTransport", () => {
     const file = new File([new Uint8Array([1, 2, 3])], "note.txt");
     await transport.uploadAttachment(file, "session-1");
     expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.localModelAction && (call.args?.request as { action?: string } | undefined)?.action === "download")?.args).toEqual({ request: { action: "download", model_id: "model-1" } });
+    expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.sessionHistory)?.args).toEqual({ sessionId: "session-1" });
+    expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.renameSession)?.args).toEqual({ sessionId: "session-1", title: "Renamed" });
     expect(calls.find((call) => call.command === RIGA_IPC_COMMANDS.uploadAttachment)?.args).toEqual({ attachment: { name: "note.txt", bytes: [1, 2, 3], session_id: "session-1" } });
   });
 

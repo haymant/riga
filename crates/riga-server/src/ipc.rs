@@ -81,11 +81,44 @@ impl IpcService {
         result
     }
 
-    pub async fn list_sessions(&self) -> Vec<Session> {
-        self.state.sessions.read().await.clone()
+    async fn ensure_sessions_loaded(&self) -> Result<(), String> {
+        let database_configured = std::env::var("DATABASE_URL")
+            .ok()
+            .is_some_and(|url| !url.trim().is_empty());
+        if let Some(sessions) = secure_store::load_json::<Vec<Session>>("sessions").await? {
+            self.state
+                .next_id
+                .store(next_session_number(&sessions), Ordering::Relaxed);
+            *self.state.sessions.write().await = sessions;
+        } else if database_configured {
+            self.state.sessions.write().await.clear();
+        }
+        Ok(())
+    }
+
+    async fn ensure_transcripts_loaded(&self) -> Result<(), String> {
+        let database_configured = std::env::var("DATABASE_URL")
+            .ok()
+            .is_some_and(|url| !url.trim().is_empty());
+        if let Some(transcripts) = secure_store::load_json::<
+            std::collections::HashMap<String, Vec<ws::ConversationTurn>>,
+        >("transcripts")
+        .await?
+        {
+            *self.state.transcripts.write().await = transcripts;
+        } else if database_configured {
+            self.state.transcripts.write().await.clear();
+        }
+        Ok(())
+    }
+
+    pub async fn list_sessions(&self) -> Result<Vec<Session>, String> {
+        self.ensure_sessions_loaded().await?;
+        Ok(self.state.sessions.read().await.clone())
     }
 
     pub async fn session_history(&self, session_id: &str) -> Vec<ws::ConversationTurn> {
+        let _ = self.ensure_transcripts_loaded().await;
         let live_history = {
             let transcripts = self.state.transcripts.read().await;
             transcripts.get(session_id).cloned()
@@ -95,10 +128,9 @@ impl IpcService {
                 return history;
             }
         }
-        let persisted = crate::secure_store::load_json::<std::collections::HashMap<
-            String,
-            Vec<ws::ConversationTurn>,
-        >>("transcripts")
+        let persisted = crate::secure_store::load_json::<
+            std::collections::HashMap<String, Vec<ws::ConversationTurn>>,
+        >("transcripts")
         .await
         .ok()
         .flatten()
@@ -130,6 +162,7 @@ impl IpcService {
         if request.title.trim().is_empty() || request.workspace.trim().is_empty() {
             return Err("title and workspace are required".into());
         }
+        self.ensure_sessions_loaded().await?;
         let session = Session {
             id: format!(
                 "session-{}",
@@ -140,13 +173,30 @@ impl IpcService {
             created_at: "now".into(),
             updated_at: "now".into(),
         };
-        self.state.sessions.write().await.push(session.clone());
-        if let Some(store) = &self.state.secure_store {
-            let sessions = self.state.sessions.read().await.clone();
-            store
-                .save("sessions", &sessions)
-                .map_err(|error| error.to_string())?;
+        let mut sessions = self.state.sessions.write().await;
+        let mut updated = sessions.clone();
+        updated.push(session.clone());
+        secure_store::save_json("sessions", &updated).await?;
+        *sessions = updated;
+        Ok(session)
+    }
+
+    pub async fn rename_session(&self, session_id: &str, title: String) -> Result<Session, String> {
+        let title = title.trim();
+        if title.is_empty() || title.chars().count() > 80 {
+            return Err("title must contain between 1 and 80 characters".into());
         }
+        self.ensure_sessions_loaded().await?;
+        let mut sessions = self.state.sessions.write().await;
+        let Some(index) = sessions.iter().position(|session| session.id == session_id) else {
+            return Err("session not found".into());
+        };
+        let mut updated = sessions.clone();
+        updated[index].title = title.to_owned();
+        updated[index].updated_at = "now".into();
+        let session = updated[index].clone();
+        secure_store::save_json("sessions", &updated).await?;
+        *sessions = updated;
         Ok(session)
     }
 
@@ -263,6 +313,7 @@ impl IpcService {
         session_id: String,
         prompt: String,
     ) -> Result<broadcast::Receiver<RigaEventEnvelope>, String> {
+        self.ensure_transcripts_loaded().await?;
         ws::start_ipc_run(
             self.state.workspace_root.clone(),
             self.state.mcp_runtime.clone(),
@@ -453,6 +504,15 @@ fn sanitize_run_id(run_id: &str) -> String {
         .collect()
 }
 
+fn next_session_number(sessions: &[Session]) -> u64 {
+    sessions
+        .iter()
+        .filter_map(|session| session.id.strip_prefix("session-")?.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+}
+
 fn journal_history(session_id: &str) -> Vec<ws::ConversationTurn> {
     let runs_dir = secure_store::data_root().join("runs");
     let Ok(entries) = std::fs::read_dir(runs_dir) else {
@@ -506,7 +566,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(service.list_sessions().await.last().unwrap().id, session.id);
+        assert_eq!(
+            service.list_sessions().await.unwrap().last().unwrap().id,
+            session.id
+        );
     }
 
     #[tokio::test]

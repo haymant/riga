@@ -12,6 +12,7 @@ import type {
   RigaTransport,
   RigaTransportListeners,
   Session,
+  ConversationTurn,
 } from "../protocol";
 
 export const RIGA_TAURI_TRANSPORT_VERSION = "0.1.0" as const;
@@ -23,6 +24,8 @@ export const RIGA_IPC_COMMANDS = {
   catalog: "riga_catalog",
   listSessions: "riga_list_sessions",
   createSession: "riga_create_session",
+  sessionHistory: "riga_session_history",
+  renameSession: "riga_rename_session",
   listActiveRuns: "riga_list_active_runs",
   configureProvider: "riga_configure_provider",
   startRun: "riga_start_run",
@@ -96,6 +99,8 @@ export class RigaTauriTransport implements RigaTransport {
   catalog(): Promise<Catalog> { return this.call(RIGA_IPC_COMMANDS.catalog); }
   listSessions(): Promise<Session[]> { return this.call(RIGA_IPC_COMMANDS.listSessions); }
   createSession(request: CreateSessionRequest): Promise<Session> { return this.call(RIGA_IPC_COMMANDS.createSession, { request }); }
+  sessionHistory(sessionId: string): Promise<ConversationTurn[]> { return this.call(RIGA_IPC_COMMANDS.sessionHistory, { sessionId }); }
+  renameSession(sessionId: string, title: string): Promise<Session> { return this.call(RIGA_IPC_COMMANDS.renameSession, { sessionId, title }); }
   // Tauri maps camelCase JS keys to the command's snake_case parameters, so the
   // flat command args are camelCase. A parameter that is itself a struct is
   // passed under its own key (`request` / `attachment`) and keeps serde's

@@ -40,6 +40,8 @@ const REQUEST_METHODS = [
   "catalog",
   "listSessions",
   "createSession",
+  "sessionHistory",
+  "renameSession",
   "configureProvider",
   "startRun",
   "resumeRun",
@@ -65,6 +67,8 @@ function callRequest(transport: RigaTransport, method: RequestMethod): Promise<u
     case "catalog": return transport.catalog();
     case "listSessions": return transport.listSessions();
     case "createSession": return transport.createSession({ title: "t", workspace: "/w" });
+    case "sessionHistory": return transport.sessionHistory("session");
+    case "renameSession": return transport.renameSession("session", "Renamed");
     case "configureProvider": return transport.configureProvider("https://model.test/v1", "key", "model", "low");
     case "startRun": return transport.startRun("run", "session", "hello");
     case "resumeRun": return transport.resumeRun("run", 1);
