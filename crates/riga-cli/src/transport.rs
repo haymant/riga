@@ -17,6 +17,21 @@ pub type TransportFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// without changing projection or rendering code.
 #[allow(dead_code)]
 pub trait RigaTransport: Clone + Send + Sync + 'static {
+    fn subscribe_local_models(&self) -> broadcast::Receiver<LocalModelEvent>;
+    fn local_models(&self) -> TransportFuture<LocalModelOverview>;
+
+    fn local_model_action(
+        &self,
+        action: String,
+        model_id: Option<String>,
+        path: Option<String>,
+    ) -> TransportFuture<Result<(), String>>;
+
+    fn upload_attachment(
+        &self,
+        attachment: IpcAttachment,
+    ) -> TransportFuture<Result<Attachment, String>>;
+
     fn create_session(
         &self,
         request: CreateSessionRequest,
@@ -157,6 +172,37 @@ impl IpcTransport {
 }
 
 impl RigaTransport for IpcTransport {
+    fn subscribe_local_models(&self) -> broadcast::Receiver<LocalModelEvent> {
+        self.subscribe_local_models()
+    }
+
+    fn local_models(&self) -> TransportFuture<LocalModelOverview> {
+        let transport = self.clone();
+        Box::pin(async move { transport.local_models().await })
+    }
+
+    fn local_model_action(
+        &self,
+        action: String,
+        model_id: Option<String>,
+        path: Option<String>,
+    ) -> TransportFuture<Result<(), String>> {
+        let transport = self.clone();
+        Box::pin(async move {
+            transport
+                .local_model_action(action.as_str(), model_id.as_deref(), path.as_deref())
+                .await
+        })
+    }
+
+    fn upload_attachment(
+        &self,
+        attachment: IpcAttachment,
+    ) -> TransportFuture<Result<Attachment, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.upload_attachment(attachment).await })
+    }
+
     fn create_session(
         &self,
         request: CreateSessionRequest,

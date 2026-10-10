@@ -40,6 +40,14 @@ pub enum UiCommand {
         run_id: String,
         session_id: String,
     },
+    LocalModelAction {
+        action: String,
+        model_id: Option<String>,
+        path: Option<String>,
+    },
+    UploadAttachment {
+        path: String,
+    },
     Quit,
 }
 
@@ -66,6 +74,10 @@ pub struct UiState {
     pub catalog: Vec<CatalogEntry>,
     pub catalog_query: TextBuffer,
     pub deck_lens: DeckLens,
+    pub local_models: Option<riga_server::LocalModelOverview>,
+    pub local_model_error: Option<String>,
+    pub local_model_status: Option<String>,
+    pub local_attachment_input: bool,
 }
 
 impl UiState {
@@ -124,6 +136,12 @@ impl UiState {
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.panel = UiPanel::RunDeck;
                 self.panel_cursor = 0;
+                return None;
+            }
+            KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.panel = UiPanel::LocalModels;
+                self.panel_cursor = 0;
+                self.local_attachment_input = false;
                 return None;
             }
             KeyCode::Char('?') => {
@@ -354,6 +372,71 @@ impl UiState {
                 }
                 _ => {}
             },
+            UiPanel::LocalModels => {
+                if self.local_attachment_input {
+                    match key.code {
+                        KeyCode::Enter if !self.panel_input.is_empty() => {
+                            self.local_attachment_input = false;
+                            return Some(UiCommand::UploadAttachment {
+                                path: self.panel_input.text().into(),
+                            });
+                        }
+                        _ => {
+                            let _ = self.panel_input.handle_key(key);
+                        }
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Up => self.panel_cursor = self.panel_cursor.saturating_sub(1),
+                        KeyCode::Down => self.panel_cursor = self.panel_cursor.saturating_add(1),
+                        KeyCode::Char('a') => {
+                            self.local_attachment_input = true;
+                            self.panel_input.clear();
+                        }
+                        KeyCode::Char('u') => {
+                            return Some(UiCommand::LocalModelAction {
+                                action: "unload".into(),
+                                model_id: None,
+                                path: None,
+                            });
+                        }
+                        KeyCode::Char('x') => {
+                            if let Some(overview) = &self.local_models {
+                                let index =
+                                    self.panel_cursor.saturating_sub(overview.installed.len());
+                                if let Some(model) = overview.catalog.get(index) {
+                                    return Some(UiCommand::LocalModelAction {
+                                        action: "cancel".into(),
+                                        model_id: Some(model.id.clone()),
+                                        path: None,
+                                    });
+                                }
+                            }
+                        }
+                        KeyCode::Char('d') | KeyCode::Enter => {
+                            if let Some(overview) = &self.local_models {
+                                if let Some(model) = overview.installed.get(self.panel_cursor) {
+                                    return Some(UiCommand::LocalModelAction {
+                                        action: "load".into(),
+                                        model_id: Some(model.id.clone()),
+                                        path: Some(model.path.clone()),
+                                    });
+                                }
+                                let index =
+                                    self.panel_cursor.saturating_sub(overview.installed.len());
+                                if let Some(model) = overview.catalog.get(index) {
+                                    return Some(UiCommand::LocalModelAction {
+                                        action: "download".into(),
+                                        model_id: Some(model.id.clone()),
+                                        path: None,
+                                    });
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             UiPanel::Help | UiPanel::Transcript => {}
         }
         None
@@ -439,7 +522,26 @@ pub async fn run_with_transport<T: RigaTransport>(
 ) -> Result<(), String> {
     let mut terminal = crate::terminal::TerminalGuard::enter()?;
     let mut events: Option<broadcast::Receiver<riga_kernel::events::RigaEventEnvelope>> = None;
+    let mut local_events = transport.subscribe_local_models();
     loop {
+        while let Ok(event) = local_events.try_recv() {
+            match event {
+                riga_server::local_model::LocalModelEvent::DownloadProgress(progress) => {
+                    app.local_model_status =
+                        Some(format!("{}: {:.1}%", progress.model_id, progress.percent));
+                }
+                riga_server::local_model::LocalModelEvent::DownloadFinished {
+                    model_id, ..
+                } => {
+                    app.local_model_status = Some(format!("{model_id}: downloaded"));
+                    app.local_models = Some(transport.local_models().await);
+                }
+                riga_server::local_model::LocalModelEvent::DownloadFailed { model_id, message } => {
+                    app.local_model_status = Some(format!("{model_id}: failed — {message}"));
+                }
+                riga_server::local_model::LocalModelEvent::Token { .. } => {}
+            }
+        }
         while let Some(receiver) = events.as_mut() {
             match receiver.try_recv() {
                 Ok(envelope) => app.apply_event(envelope),
@@ -535,6 +637,66 @@ pub async fn run_with_transport<T: RigaTransport>(
                     app.state.selected_session = Some(session_id);
                     app.state.select_run(Some(run_id));
                     events = Some(receiver);
+                }
+                UiCommand::LocalModelAction {
+                    action,
+                    model_id,
+                    path,
+                } => {
+                    match transport
+                        .local_model_action(action.clone(), model_id.clone(), path.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            app.local_models = Some(transport.local_models().await);
+                            app.local_model_error = None;
+                            if action == "load" {
+                                if let Some(id) = model_id {
+                                    app.provider.kind = riga_server::ws::ProviderKind::Local;
+                                    app.provider.model = id;
+                                    if let Err(error) =
+                                        transport.configure_provider(app.provider.to_config()).await
+                                    {
+                                        app.local_model_error = Some(error);
+                                    }
+                                }
+                            } else if action == "download" {
+                                app.local_model_status =
+                                    model_id.map(|id| format!("{id}: download started"));
+                            }
+                        }
+                        Err(error) => app.local_model_error = Some(error),
+                    }
+                }
+                UiCommand::UploadAttachment { path } => {
+                    let file_name = std::path::Path::new(&path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("attachment")
+                        .to_owned();
+                    match tokio::fs::read(&path).await {
+                        Ok(bytes) => match transport
+                            .upload_attachment(riga_server::ipc::IpcAttachment {
+                                name: file_name,
+                                bytes,
+                                session_id: app.state.selected_session.clone(),
+                            })
+                            .await
+                        {
+                            Ok(attachment) => {
+                                for character in
+                                    format!("\n[attachment: {}]", attachment.path).chars()
+                                {
+                                    app.draft.insert(character);
+                                }
+                                app.local_model_error = None;
+                            }
+                            Err(error) => app.local_model_error = Some(error),
+                        },
+                        Err(error) => {
+                            app.local_model_error = Some(format!("attachment read failed: {error}"))
+                        }
+                    }
                 }
                 UiCommand::Quit => break,
             }
@@ -693,6 +855,38 @@ mod tests {
             Some(UiCommand::ResumeRun {
                 run_id: "run-live".into(),
                 session_id: "session-1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn local_model_panel_loads_selected_installed_model() {
+        let mut app = UiState {
+            local_models: Some(riga_server::LocalModelOverview {
+                accelerator: "CPU (OpenMP)",
+                catalog: Vec::new(),
+                installed: vec![riga_server::local_model::InstalledModel {
+                    id: "local-7b".into(),
+                    name: "Local 7B".into(),
+                    file_name: "local.gguf".into(),
+                    path: "/models/local.gguf".into(),
+                    size_bytes: 1,
+                    curated: true,
+                    recommended_context: Some(8192),
+                    license_url: None,
+                }],
+                loaded: None,
+            }),
+            ..UiState::default()
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL));
+        assert_eq!(app.panel, UiPanel::LocalModels);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(UiCommand::LocalModelAction {
+                action: "load".into(),
+                model_id: Some("local-7b".into()),
+                path: Some("/models/local.gguf".into()),
             })
         );
     }

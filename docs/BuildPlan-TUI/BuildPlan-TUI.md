@@ -2,7 +2,7 @@
 
 ## Status
 
-**Active phased implementation.** This document specifies how to extend `crates/riga-cli` into a full terminal UI that provides feature parity with `@rigai/assistant-ui` while using the same RIGA protocol and runtime semantics. TUI-0 (IPC headless transport), TUI-1 (headless projection), TUI-2 (terminal lifecycle), TUI-3 (streaming transcript and approvals), TUI-4 (sessions, settings, and catalog), and TUI-5 (RunDeck parity) are complete; later phases remain implementation work.
+**Active phased implementation.** This document specifies how to extend `crates/riga-cli` into a full terminal UI that provides feature parity with `@rigai/assistant-ui` while using the same RIGA protocol and runtime semantics. TUI-0 (IPC headless transport), TUI-1 (headless projection), TUI-2 (terminal lifecycle), TUI-3 (streaming transcript and approvals), TUI-4 (sessions, settings, and catalog), TUI-5 (RunDeck parity), and TUI-6 (local models and attachments) are complete; TUI-7 hardening remains.
 
 The Ratatui renderer is implemented through TUI-3 and continues to expand in later feature phases. Current implementation reports live under `docs/BuildPlan-TUI/`.
 

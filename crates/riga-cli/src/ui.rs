@@ -133,11 +133,14 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
             }
             ("Command palette (server catalog)", lines)
         }
+        crate::model::UiPanel::LocalModels => {
+            ("Local models and attachments", render_local_models(app))
+        }
         crate::model::UiPanel::RunDeck => ("RunDeck", render_rundeck(app)),
         crate::model::UiPanel::Help => (
             "Help",
             vec![Line::from(
-                "Ctrl+H history · Ctrl+, settings · Ctrl+K catalog · Ctrl+D RunDeck · ? help · r reasoning · t tools · y/a/n approvals · Esc close/cancel · q quit",
+                "Ctrl+H history · Ctrl+, settings/model · Ctrl+K catalog · Ctrl+D RunDeck · Ctrl+L local models · ? help · r reasoning · t tools · y/a/n approvals · Esc close/cancel · q quit",
             )],
         ),
         crate::model::UiPanel::Transcript => unreachable!(),
@@ -148,6 +151,70 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
             .wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn render_local_models(app: &UiState) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(
+        "↑/↓ select · Enter/d download or load · x cancel download · u unload · a attach file · Esc close",
+    )];
+    if app.local_attachment_input {
+        lines.push(Line::from(format!(
+            "Attachment path: {} · Enter upload",
+            app.panel_input.text()
+        )));
+        return lines;
+    }
+    let Some(overview) = &app.local_models else {
+        lines.push(Line::from(
+            "Local-model protocol is unavailable in this adapter.",
+        ));
+        return lines;
+    };
+    lines.push(Line::from(format!(
+        "Accelerator: {} · loaded: {}",
+        overview.accelerator,
+        overview.loaded.as_deref().unwrap_or("none")
+    )));
+    if let Some(status) = &app.local_model_status {
+        lines.push(Line::from(format!("Status: {status}")));
+    }
+    if overview.installed.is_empty() {
+        lines.push(Line::from(
+            "No installed models. Select a catalog entry to download it.",
+        ));
+    }
+    for (index, model) in overview.installed.iter().enumerate() {
+        lines.push(Line::from(format!(
+            "{} [installed] {} · {} · {}",
+            if index == app.panel_cursor {
+                "▶"
+            } else {
+                " "
+            },
+            model.id,
+            model.name,
+            model.path
+        )));
+    }
+    for (offset, model) in overview.catalog.iter().enumerate() {
+        let index = overview.installed.len() + offset;
+        lines.push(Line::from(format!(
+            "{} [catalog] {} · {} · {:.1} GiB · context {}",
+            if index == app.panel_cursor {
+                "▶"
+            } else {
+                " "
+            },
+            model.id,
+            model.name,
+            model.size_bytes as f64 / 1_073_741_824.0,
+            model.recommended_context
+        )));
+    }
+    if let Some(error) = &app.local_model_error {
+        lines.push(Line::from(format!("ERROR: {error}")));
+    }
+    lines
 }
 
 fn render_rundeck(app: &UiState) -> Vec<Line<'static>> {
@@ -478,7 +545,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
             ),
             Span::raw(" · "),
             Span::styled(status, Style::default().fg(Color::Cyan)),
-            Span::raw(" · r reasoning · t tools · q quit"),
+            Span::raw(" · Ctrl+, settings/model · Ctrl+L local models · ? help · r reasoning · t tools · q quit"),
         ])),
         area,
     );

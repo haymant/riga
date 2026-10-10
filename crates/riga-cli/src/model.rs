@@ -43,6 +43,7 @@ pub enum UiPanel {
     Settings,
     Catalog,
     RunDeck,
+    LocalModels,
     Help,
 }
 
@@ -254,7 +255,7 @@ pub enum ApplyOutcome {
 }
 
 #[derive(Debug, Default)]
-pub struct AppState {
+pub struct UiState {
     pub connection: ConnectionState,
     pub protocol_version: Option<u16>,
     pub server_version: Option<String>,
@@ -265,6 +266,17 @@ pub struct AppState {
     pub active_runs: Vec<ActiveRun>,
 }
 
+#[derive(Debug, Default)]
+pub struct AppState {
+    pub connection: ConnectionState,
+    pub protocol_version: Option<u16>,
+    pub server_version: Option<String>,
+    pub sessions: Vec<Session>,
+    pub selected_session: Option<String>,
+    pub active_run: Option<String>,
+    pub runs: BTreeMap<String, RunView>,
+    pub active_runs: Vec<ActiveRun>,
+}
 impl AppState {
     pub fn apply_event(&mut self, envelope: RigaEventEnvelope) -> ApplyOutcome {
         if envelope.protocol_version != PROTOCOL_VERSION {

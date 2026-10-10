@@ -45,6 +45,7 @@ async fn main() -> Result<(), String> {
     if args.tui {
         let sessions = transport.list_sessions().await;
         let active_runs = transport.list_active_runs().await;
+        let local_models = transport.local_models().await;
         let mut app = app::UiState {
             state: model::AppState {
                 connection: ConnectionState::Connected,
@@ -54,6 +55,7 @@ async fn main() -> Result<(), String> {
                 ..model::AppState::default()
             },
             follow_output: true,
+            local_models: Some(local_models),
             ..app::UiState::default()
         };
         app.set_catalog(parse_catalog(transport.catalog().await));

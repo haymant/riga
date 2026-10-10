@@ -87,6 +87,20 @@ binary on a CUDA-capable machine does not enable GPU offload. The server still
 auto-fits local-model layers to currently available GPU memory. If no CUDA
 toolkit is installed, omit the feature and use the CPU command above.
 
+### Selecting a model in the CLI
+
+Start the TUI with `cargo run -p riga-cli -- --tui`. From the transcript:
+
+1. Press **`Ctrl+,`** to open **Provider settings**.
+2. The **model** row is the third field. Use **Tab** or **Shift+Tab** to reach it, type the model identifier, then press **Ctrl+S** to save.
+3. For a local GGUF model, press **`Ctrl+L`** to open **Local models**. Select an installed model and press **Enter** to load it, or select a catalog entry and press **Enter**/**`d`** to download it. Loading a model also selects its model id for the next run.
+4. Press **`?`** at any time for the keyboard help panel. Press **Esc** to close a panel.
+
+The local-model panel also shows the active accelerator, installed/catalog models,
+download cancellation (`x`), unload (`u`), and attachment upload (`a`). Attachment
+upload accepts a local file path and stores the file in the selected session's
+worktree through the shared IPC service.
+
 Never commit `.env.local`, provider keys, `RIGA_TOKEN`, or uploaded files. The API key is encrypted at rest by the server store and is write-only from the browser.
 
 ### Reference demo and desktop shell

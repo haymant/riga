@@ -264,7 +264,7 @@ async fn local_model_download_events(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LocalModelOverview {
     pub accelerator: &'static str,
     pub catalog: Vec<local_model::CuratedModelEntry>,
