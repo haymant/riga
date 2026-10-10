@@ -9,6 +9,10 @@ description = "RIGA command-line adapter"
 
 [dependencies]
 riga-kernel = { version = "0.1.0", path = "../riga-kernel" }
+riga-server = { version = "0.1.0", path = "../riga-server" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true
