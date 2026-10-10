@@ -265,6 +265,7 @@ impl LocalDeltaStream {
                     .load(std::sync::atomic::Ordering::Relaxed)
             {
                 self.in_reasoning = true;
+                tracing::info!(tag = %self.format.open, "local model prompt opened a reasoning block");
             }
         }
         if self.decided == Some(true) {
@@ -317,6 +318,7 @@ impl LocalDeltaStream {
                 if !open.is_empty() && self.pending[start..].starts_with(open.as_str()) {
                     self.pending = self.pending[start + open.len()..].trim_start().to_owned();
                     self.in_reasoning = true;
+                    tracing::info!(tag = %open, "local model opened a reasoning block");
                     continue;
                 }
                 let trimmed = self.pending.trim_start();
