@@ -63,6 +63,7 @@ pub struct UiState {
     pub reasoning_collapsed: bool,
     pub tools_collapsed: bool,
     pub(crate) approval_submission: Option<String>,
+    pub approval_focused: bool,
     pub panel: UiPanel,
     pub panel_cursor: usize,
     pub panel_input: TextBuffer,
@@ -222,6 +223,10 @@ impl UiState {
         }
         if let Some(approval) = self.state.pending_approval().cloned() {
             if self.approval_submission.is_some() {
+                return None;
+            }
+            if key.code == KeyCode::Tab {
+                self.approval_focused = true;
                 return None;
             }
             let command = match key.code {
@@ -702,6 +707,7 @@ impl UiState {
     pub fn approval_command_finished(&mut self, approval_id: &str) {
         if self.approval_submission.as_deref() == Some(approval_id) {
             self.approval_submission = None;
+            self.approval_focused = false;
         }
     }
 
@@ -805,7 +811,25 @@ pub async fn run_with_transport<T: RigaTransport>(
             match receiver.try_recv() {
                 Ok(envelope) => {
                     app.apply_event(envelope);
-                    if let Some(run_id) = app.state.active_run.as_deref()
+                    let terminal_run = app.state.active_run.as_deref().and_then(|run_id| {
+                        app.state.run(run_id).and_then(|run| {
+                            matches!(
+                                run.status,
+                                crate::model::RunStatus::Completed
+                                    | crate::model::RunStatus::Failed
+                                    | crate::model::RunStatus::Cancelled
+                            )
+                            .then_some(run_id.to_owned())
+                        })
+                    });
+                    if let Some(run_id) = terminal_run {
+                        app.busy = None;
+                        app.archive_active_run();
+                        app.state.active_runs.retain(|active| active.run_id != run_id);
+                        app.state.select_run(None);
+                        app.current_prompt = None;
+                        events = None;
+                    } else if let Some(run_id) = app.state.active_run.as_deref()
                         && let Some(run) = app.state.run(run_id)
                     {
                         app.busy = match run.status {
@@ -847,6 +871,10 @@ pub async fn run_with_transport<T: RigaTransport>(
         {
             match command {
                 UiCommand::StartRun { session_id, prompt } => {
+                    if app.busy.as_deref() == Some("Stopping...") {
+                        app.notice = Some("The previous run is still stopping; please wait a moment.".into());
+                        continue;
+                    }
                     app.archive_active_run();
                     app.current_prompt = Some(prompt.clone());
                     let run_id = format!(
@@ -886,12 +914,12 @@ pub async fn run_with_transport<T: RigaTransport>(
                     app.approval_command_finished(&approval_id);
                 }
                 UiCommand::CancelRun { run_id } => {
-                    let _ = transport.cancel_run(run_id.clone()).await;
-                    events = None;
-                    app.busy = None;
-                    app.state
-                        .active_runs
-                        .retain(|active| active.run_id != run_id);
+                    if transport.cancel_run(run_id).await {
+                        app.busy = Some("Stopping...".into());
+                    } else {
+                        app.busy = None;
+                        app.notice = Some("The run could not be cancelled.".into());
+                    }
                 }
                 UiCommand::SelectSession { session_id } => {
                     app.set_session_history(transport.session_history(session_id.clone()).await);
@@ -1057,6 +1085,21 @@ mod tests {
         assert!(
             app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
                 .is_some()
+        );
+    }
+    #[test]
+    fn tab_focuses_pending_approval_without_submitting_it() {
+        let mut app = approval_app();
+        assert!(app
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .is_none());
+        assert!(app.approval_focused);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Some(UiCommand::Approve {
+                approval_id: "approval-1".into(),
+                always: false
+            })
         );
     }
     #[test]

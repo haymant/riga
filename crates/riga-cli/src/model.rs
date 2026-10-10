@@ -463,7 +463,6 @@ impl AppState {
             }
             RigaEvent::RunCompleted { output } => {
                 run.output = output.clone();
-                run.push_transcript(TranscriptItem::System(format!("Run completed: {output}")));
                 run.settle(RunStatus::Completed);
             }
             RigaEvent::RunFailed { message } => {

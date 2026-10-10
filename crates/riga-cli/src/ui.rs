@@ -25,6 +25,71 @@ fn assistant_text_style(text: &str) -> Style {
     Style::default().fg(color)
 }
 
+fn code_line_style(line: &str) -> Style {
+    let trimmed = line.trim_start();
+    let color = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        Color::LightBlue
+    } else if trimmed.starts_with('$') || trimmed.starts_with("npm ") || trimmed.starts_with("cargo ") {
+        Color::LightYellow
+    } else if trimmed.starts_with("enum ") || trimmed.contains("::") {
+        Color::LightMagenta
+    } else if trimmed.starts_with('-') || trimmed.starts_with('*') {
+        Color::LightGreen
+    } else {
+        Color::Gray
+    };
+    Style::default().fg(color)
+}
+
+fn push_rich_message<'a>(
+    lines: &mut Vec<Line<'a>>,
+    label: &'a str,
+    label_color: Color,
+    text: &'a str,
+) {
+    let mut in_code = false;
+    let mut first = true;
+    for segment in text.split("```") {
+        if in_code {
+            lines.push(Line::from(Span::styled(
+                "┌─ code",
+                Style::default().fg(Color::DarkGray),
+            )));
+            let mut code_lines = segment.lines();
+            let language = code_lines.next().unwrap_or_default();
+            if !language.trim().is_empty() {
+                lines.push(Line::from(Span::styled(
+                    format!("│ {language}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            for line in code_lines {
+                lines.push(Line::from(Span::styled(
+                    format!("│ {line}"),
+                    code_line_style(line),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                "└─ code",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for line in segment.lines() {
+                let prefix = if first { label } else { "      " };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(label_color)),
+                    Span::styled(line, assistant_text_style(line)),
+                ]));
+                first = false;
+            }
+        }
+        in_code = !in_code;
+    }
+    if first {
+        lines.push(Line::from(Span::styled(label, Style::default().fg(label_color))));
+    }
+}
+
 pub fn render(frame: &mut Frame<'_>, app: &UiState) {
     if app.panel != crate::model::UiPanel::Transcript {
         render_panel(frame, app);
@@ -504,10 +569,9 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                 Span::styled("You ", Style::default().fg(Color::Green)),
                 Span::styled(text, Style::default().fg(Color::LightGreen)),
             ])),
-            crate::model::TranscriptItem::AssistantText(text) => lines.push(Line::from(vec![
-                Span::styled("Assistant ", Style::default().fg(Color::Cyan)),
-                Span::styled(text, assistant_text_style(text)),
-            ])),
+            crate::model::TranscriptItem::AssistantText(text) => {
+                push_rich_message(&mut lines, "Assistant ", Color::Cyan, text);
+            }
             crate::model::TranscriptItem::AssistantReasoning(text) => {
                 lines.push(Line::from(Span::styled(
                     format!("Thinking · {text}"),
@@ -528,10 +592,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
         }
     }
     if let Some(prompt) = &app.current_prompt {
-        lines.push(Line::from(vec![
-            Span::styled("You ", Style::default().fg(Color::Green)),
-            Span::styled(prompt, Style::default().fg(Color::LightGreen)),
-        ]));
+        push_rich_message(&mut lines, "You ", Color::Green, prompt);
     }
     if let Some(run_id) = &app.state.active_run {
         if let Some(run) = app.state.run(run_id) {
@@ -558,37 +619,35 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                 {
                     continue;
                 }
-                lines.push(match item {
-                    crate::model::TranscriptItem::UserText(text) => Line::from(vec![
-                        Span::styled("You ", Style::default().fg(Color::Green)),
-                        Span::styled(text, Style::default().fg(Color::LightGreen)),
-                    ]),
-                    crate::model::TranscriptItem::AssistantText(text) => Line::from(vec![
-                        Span::styled("Assistant ", Style::default().fg(Color::Cyan)),
-                        Span::styled(text, assistant_text_style(text)),
-                    ]),
+                match item {
+                    crate::model::TranscriptItem::UserText(text) => {
+                        push_rich_message(&mut lines, "You ", Color::Green, text);
+                    }
+                    crate::model::TranscriptItem::AssistantText(text) => {
+                        push_rich_message(&mut lines, "Assistant ", Color::Cyan, text);
+                    }
                     crate::model::TranscriptItem::AssistantReasoning(text) => {
-                        Line::from(Span::styled(
+                        lines.push(Line::from(Span::styled(
                             format!("Thinking · {text}"),
                             Style::default().fg(Color::DarkGray),
-                        ))
+                        )));
                     }
                     crate::model::TranscriptItem::ToolCall {
                         call_id,
                         tool,
                         call,
-                    } => Line::from(Span::styled(
+                    } => lines.push(Line::from(Span::styled(
                         format!("tool {tool} [{call_id}] · {call}"),
                         Style::default().fg(Color::Yellow),
-                    )),
+                    ))),
                     crate::model::TranscriptItem::ToolOutput { call_id, output } => {
-                        Line::from(Span::styled(
+                        lines.push(Line::from(Span::styled(
                             format!("{call_id} · {output}"),
                             Style::default().fg(Color::Yellow),
-                        ))
+                        )));
                     }
                     crate::model::TranscriptItem::ToolResult { call_id, result } => {
-                        Line::from(Span::styled(
+                        lines.push(Line::from(Span::styled(
                             format!(
                                 "tool result{} · {result}",
                                 call_id
@@ -597,31 +656,34 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                                     .unwrap_or_default()
                             ),
                             Style::default().fg(Color::Yellow),
-                        ))
+                        )));
                     }
                     crate::model::TranscriptItem::TaskResult {
                         task_id,
                         ok,
                         result,
-                    } => Line::from(Span::styled(
+                    } => lines.push(Line::from(Span::styled(
                         format!(
                             "task {task_id} {} · {result}",
                             if *ok { "done" } else { "failed" }
                         ),
                         Style::default().fg(if *ok { Color::Green } else { Color::Red }),
-                    )),
+                    ))),
                     crate::model::TranscriptItem::Approval {
                         approval_id,
                         tool,
                         summary,
-                    } => Line::from(Span::styled(
+                    } => lines.push(Line::from(Span::styled(
                         format!("approval {approval_id} · {tool} · {summary}"),
                         Style::default().fg(Color::Red),
-                    )),
+                    ))),
                     crate::model::TranscriptItem::System(text) => {
-                        Line::from(Span::styled(text, Style::default().fg(Color::Magenta)))
+                        lines.push(Line::from(Span::styled(
+                            text,
+                            Style::default().fg(Color::Magenta),
+                        )));
                     }
-                });
+                }
                 if matches!(item, crate::model::TranscriptItem::AssistantText(_)) {
                     lines.push(Line::default());
                 }
@@ -650,8 +712,10 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
 fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     let title = if let Some(approval) = app.state.pending_approval() {
         format!(
-            "Approval · {} / {} · y allow · a always · n deny",
-            approval.tool, approval.approval_id
+            "Approval{} · {} / {} · Tab focus · y allow · a always · n deny",
+            if app.approval_focused { " [focused]" } else { "" },
+            approval.tool,
+            approval.approval_id
         )
     } else if app.state.active_run.is_some() {
         "Composer · Esc stop · Enter send".to_owned()
@@ -885,6 +949,45 @@ mod tests {
             .collect();
         assert!(text.contains("Assistant Hello"));
         assert!(!text.contains("You Hello"));
+    }
+
+    #[test]
+    fn fenced_code_is_split_into_distinct_transcript_lines() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = UiState::default();
+        app.state.selected_session = Some("session-1".into());
+        app.state.select_run(Some("run-1".into()));
+        for (sequence, event) in [
+            RigaEvent::RunStarted,
+            RigaEvent::TextDelta {
+                delta: "Example:\n```json\n{\"ok\":true}\n```".into(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.state.apply_event(RigaEventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                event_id: format!("event-{sequence}"),
+                session_id: "session-1".into(),
+                run_id: "run-1".into(),
+                sequence: sequence as u64 + 1,
+                timestamp: "now".into(),
+                event,
+            });
+        }
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("┌─ code"));
+        assert!(text.contains("│ {\"ok\":true}"));
+        assert!(text.contains("└─ code"));
     }
 
     #[test]
