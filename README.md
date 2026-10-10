@@ -69,39 +69,38 @@ cargo run -p riga-cli -- --list-sessions
 cargo run -p riga-cli -- --catalog
 ```
 
-To build and start the CLI with NVIDIA CUDA offload, enable the server's
-dependency feature through the CLI package and provide a compatible CUDA
-toolkit and NVIDIA driver on the build and runtime machines:
-
-```bash
-export PATH="/usr/local/cuda-12.6/bin:$PATH"
-export CUDA_PATH=/usr/local/cuda-12.6
-export CUDA_LIBRARY_PATH=/usr/local/cuda-12.6
-export CMAKE_CUDA_ARCHITECTURES=86  # change to the GPU's compute capability
-cargo run -p riga-cli --features riga-server/cuda -- --tui
-```
-
-Use `cargo clean -p llama-cpp-sys-2` after changing CUDA toolkit paths or the
-CUDA feature. CUDA is a compile-time backend choice; merely running the CPU
-binary on a CUDA-capable machine does not enable GPU offload. The server still
-auto-fits local-model layers to currently available GPU memory. If no CUDA
-toolkit is installed, omit the feature and use the CPU command above.
-
-For the CLI CUDA path, use the repository wrapper when possible. It validates
-`cmake`, a C++ compiler, and `nvcc`, sets the CUDA/CMake variables, and removes
-only interrupted `llama-cpp-sys-2` output that has no `Makefile` or
-`build.ninja`:
+To build and start the CLI with NVIDIA CUDA offload, use the repository wrapper.
+It provides the server CUDA feature and prepares a compatible CUDA toolkit,
+stale-CMake recovery, and the glibc/CUDA header compatibility shim required by
+CUDA 12.6 on newer Ubuntu systems:
 
 ```bash
 npm run cli:cuda -- --tui
 ```
 
+Set the GPU architecture and toolkit explicitly when needed:
+
+```bash
+CMAKE_CUDA_ARCHITECTURES=89 CUDA_PATH=/usr/local/cuda-12.6 npm run cli:cuda -- --tui
+```
+
 The CUDA build requires a compatible NVIDIA driver, the NVIDIA CUDA Toolkit
 (including `nvcc`), `cmake`, `ninja-build`, and a C++ toolchain (`build-essential`
-on Debian/Ubuntu). Set `CMAKE_CUDA_ARCHITECTURES` to the target GPU's compute
-capability when the default `86` is not appropriate. If a direct Cargo build
-was interrupted and reports `CMAKE = None` or `Makefile: No such file`, run
-`cargo clean -p llama-cpp-sys-2` once, or use the wrapper above, then rebuild.
+on Debian/Ubuntu). The wrapper detects the glibc/CUDA `cospi`, `sinpi`, and
+`rsqrt` `noexcept` conflict shown by CUDA 12.6 and creates a private patched
+header include tree; it never edits the root-owned CUDA installation.
+
+CUDA is a compile-time backend choice; merely running the CPU binary on a
+CUDA-capable machine does not enable GPU offload. If a direct Cargo build was
+interrupted and reports `CMAKE = None` or `Makefile: No such file`, first run:
+
+```bash
+cargo clean -p llama-cpp-sys-2
+```
+
+Then use `npm run cli:cuda -- --tui` rather than the direct Cargo command. The
+server still auto-fits local-model layers to currently available GPU memory.
+If no CUDA toolkit is installed, use the CPU command above.
 
 ### Selecting a model in the CLI
 
