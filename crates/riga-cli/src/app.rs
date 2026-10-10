@@ -1138,6 +1138,29 @@ mod tests {
     }
 
     #[test]
+    fn loading_session_history_projects_user_and_assistant_messages() {
+        let mut app = UiState::default();
+        app.set_session_history(vec![
+            riga_server::ws::ConversationTurn {
+                role: "user".into(),
+                content: "previous question".into(),
+            },
+            riga_server::ws::ConversationTurn {
+                role: "assistant".into(),
+                content: "previous answer".into(),
+            },
+        ]);
+
+        assert_eq!(
+            app.state.session_history,
+            vec![
+                crate::model::TranscriptItem::UserText("previous question".into()),
+                crate::model::TranscriptItem::AssistantText("previous answer".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn settings_save_command_keeps_the_api_key_out_of_display_state() {
         let mut app = UiState::default();
         app.provider.endpoint = "https://model.test/v1".into();

@@ -86,7 +86,16 @@ impl IpcService {
     }
 
     pub async fn session_history(&self, session_id: &str) -> Vec<ws::ConversationTurn> {
-        crate::secure_store::load_json::<std::collections::HashMap<
+        let live_history = {
+            let transcripts = self.state.transcripts.read().await;
+            transcripts.get(session_id).cloned()
+        };
+        if let Some(history) = live_history {
+            if !history.is_empty() {
+                return history;
+            }
+        }
+        let persisted = crate::secure_store::load_json::<std::collections::HashMap<
             String,
             Vec<ws::ConversationTurn>,
         >>("transcripts")
@@ -94,7 +103,11 @@ impl IpcService {
         .ok()
         .flatten()
         .and_then(|history| history.get(session_id).cloned())
-        .unwrap_or_default()
+        .unwrap_or_default();
+        if !persisted.is_empty() {
+            return persisted;
+        }
+        journal_history(session_id)
     }
 
     /// The runs currently executing. Mirrors the WebSocket `ListActiveRuns`
@@ -440,6 +453,43 @@ fn sanitize_run_id(run_id: &str) -> String {
         .collect()
 }
 
+fn journal_history(session_id: &str) -> Vec<ws::ConversationTurn> {
+    let runs_dir = secure_store::data_root().join("runs");
+    let Ok(entries) = std::fs::read_dir(runs_dir) else {
+        return Vec::new();
+    };
+    let mut runs = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|value| value.to_str()) == Some("json"))
+                .then(|| riga_kernel::persistence::EventJournal::open(path).ok())
+                .flatten()
+        })
+        .filter_map(|journal| {
+            let events = journal.all();
+            let first = events.first()?;
+            if first.session_id != session_id {
+                return None;
+            }
+            let mut output = String::new();
+            for event in events {
+                if let riga_kernel::events::RigaEvent::TextDelta { delta } = &event.event {
+                    output.push_str(delta);
+                }
+            }
+            (!output.is_empty()).then(|| (first.timestamp.clone(), output))
+        })
+        .collect::<Vec<_>>();
+    runs.sort_by(|left, right| left.0.cmp(&right.0));
+    runs.into_iter()
+        .map(|(_, content)| ws::ConversationTurn {
+            role: "assistant".into(),
+            content,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +507,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(service.list_sessions().await.last().unwrap().id, session.id);
+    }
+
+    #[tokio::test]
+    async fn session_history_reads_live_transcripts_for_selected_session() {
+        let service = IpcService::new(ServerState::default());
+        service.state.transcripts.write().await.insert(
+            "session-history".into(),
+            vec![
+                ws::ConversationTurn {
+                    role: "user".into(),
+                    content: "hello from history".into(),
+                },
+                ws::ConversationTurn {
+                    role: "assistant".into(),
+                    content: "welcome back".into(),
+                },
+            ],
+        );
+
+        let history = service.session_history("session-history").await;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "hello from history");
+        assert_eq!(history[1].content, "welcome back");
     }
 
     #[tokio::test]
