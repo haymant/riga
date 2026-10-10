@@ -164,3 +164,37 @@ export interface RigaTransport {
 }
 
 export type ActiveRun = { run_id: string; session_id: string; local: boolean };
+
+/**
+ * Every member of {@link RigaTransport}, as a runtime list.
+ *
+ * A TypeScript interface is not enumerable, so a test cannot walk `RigaTransport`
+ * directly. This list is the runtime stand-in, and `protocol/conformance.test.ts`
+ * checks it for completeness at compile time: adding a method to the interface
+ * without adding it here is a type error. That is what keeps the IPC and
+ * WebSocket transports from drifting apart as the protocol grows.
+ */
+export const RIGA_TRANSPORT_METHODS = [
+  "connect",
+  "wake",
+  "close",
+  "health",
+  "catalog",
+  "listSessions",
+  "createSession",
+  "configureProvider",
+  "startRun",
+  "resumeRun",
+  "cancelRun",
+  "listActiveRuns",
+  "respondToApproval",
+  "listMcpRegistry",
+  "saveMcpRegistry",
+  "uploadAttachment",
+  "listLocalModels",
+  "subscribeLocalModels",
+  "downloadModel",
+  "cancelDownload",
+  "loadModel",
+  "unloadModel",
+] as const satisfies ReadonlyArray<keyof RigaTransport>;

@@ -25,7 +25,11 @@ The workspace is a **single Git repository and a multi-language monorepo**. It d
 - `demo` — reference React + Tauri consumer and browser development app.
 - `packages/assistant-ui` — the assistant surface plus `protocol`, `http`, and `tauri` transport subpaths.
 - `crates/riga-server/src/ipc.rs` — reusable in-process service used by the Tauri host.
-- `packages/transport-http` and `packages/transport-tauri` — compatibility packages for older consumers.
+
+The **desktop** (Tauri) client talks to the in-process server over **IPC**; the
+**browser** client talks to the standalone `riga-server` over **HTTP/WebSocket**.
+Both implement one `RigaTransport` interface (`packages/assistant-ui/src/protocol`),
+and a conformance test asserts they stay in step.
 
 ## Requirements
 

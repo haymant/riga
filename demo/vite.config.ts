@@ -39,6 +39,10 @@ export default defineConfig(() => ({
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
     },
+    // The browser development client talks to the standalone `riga-server` over
+    // HTTP/WebSocket on 8787. The Tauri desktop client does not use this proxy:
+    // it talks to the in-process server over IPC (see `src/App.tsx`, which uses
+    // `@rigai/assistant-ui/tauri`). The proxy exists only for `npm run dev`.
     proxy: {
       "/ws": { target: "ws://127.0.0.1:8787", ws: true },
       "/health": { target: "http://127.0.0.1:8787" },

@@ -8,8 +8,7 @@
     "baseUrl": ".",
     "ignoreDeprecations": "6.0",
     "paths": {
-      "@rigai/assistant-ui": ["../packages/assistant-ui/src/index.ts"],
-      "@haymant/transport-http": ["../packages/transport-http/src/index.ts"]
+      "@rigai/assistant-ui": ["../packages/assistant-ui/src/index.ts"]
     },
 
     /* Bundler mode */
