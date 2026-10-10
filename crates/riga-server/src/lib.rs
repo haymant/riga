@@ -64,10 +64,44 @@ pub struct ServerState {
 impl Default for ServerState {
     fn default() -> Self {
         let secure_store = secure_store::SecureStore::from_env().map(Arc::new);
-        let sessions = secure_store
+        let mut sessions = secure_store
             .as_ref()
             .and_then(|store| store.load::<Vec<Session>>("sessions").ok().flatten())
             .unwrap_or_default();
+        let mut known: std::collections::HashSet<String> =
+            sessions.iter().map(|session| session.id.clone()).collect();
+        if let Ok(entries) = std::fs::read_dir(secure_store::data_root().join("runs")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                let Ok(events) =
+                    serde_json::from_slice::<Vec<riga_kernel::events::RigaEventEnvelope>>(&bytes)
+                else {
+                    continue;
+                };
+                let Some(first) = events.first() else {
+                    continue;
+                };
+                if !known.contains(&first.session_id) {
+                    sessions.push(Session {
+                        id: first.session_id.clone(),
+                        title: format!("Run {}", first.session_id),
+                        workspace: workspace_from_env(),
+                        created_at: first.timestamp.clone(),
+                        updated_at: events
+                            .last()
+                            .map(|event| event.timestamp.clone())
+                            .unwrap_or_else(|| first.timestamp.clone()),
+                    });
+                    known.insert(first.session_id.clone());
+                }
+            }
+        }
         let workspace_root = catalog::workspace_root();
         let transcripts = secure_store
             .as_ref()
@@ -107,6 +141,14 @@ impl Default for ServerState {
             runs: ws::RunRegistry::default(),
         }
     }
+}
+
+fn workspace_from_env() -> String {
+    std::env::var_os("RIGA_WORKSPACE_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .display()
+        .to_string()
 }
 
 #[derive(Debug, Deserialize)]

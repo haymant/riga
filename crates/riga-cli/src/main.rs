@@ -72,6 +72,29 @@ async fn main() -> Result<(), String> {
             app.set_session_history(transport.session_history(&session_id).await);
         }
         app.set_catalog(parse_catalog(transport.catalog().await));
+        let mut candidates = vec![
+            "/help".into(),
+            "/model".into(),
+            "/settings".into(),
+            "/skills".into(),
+            "/mcp".into(),
+        ];
+        for entry in &app.catalog {
+            candidates.push(format!("/{}/{}", entry.kind, entry.id));
+            if entry.kind.contains("agent") || entry.kind.contains("skill") {
+                candidates.push(format!("@{}", entry.id));
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(riga_server::catalog::workspace_root()) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    candidates.push(format!("@{name}"));
+                }
+            }
+        }
+        candidates.sort();
+        candidates.dedup();
+        app.set_command_candidates(candidates);
         if let Ok(Some(provider)) = transport.provider().await {
             app.set_provider(ProviderForm {
                 endpoint: provider.endpoint,

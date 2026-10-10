@@ -85,6 +85,10 @@ pub struct UiState {
     pub busy_tick: u64,
     pub clear_screen: bool,
     pub current_prompt: Option<String>,
+    pub rundeck_open: bool,
+    pub completion_trigger: Option<char>,
+    pub completion_cursor: usize,
+    pub command_candidates: Vec<String>,
 }
 
 enum BackgroundResult {
@@ -111,6 +115,75 @@ impl UiState {
                 role => TranscriptItem::System(format!("{role}: {}", turn.content)),
             })
             .collect();
+    }
+
+    pub fn set_command_candidates(&mut self, candidates: Vec<String>) {
+        self.command_candidates = candidates;
+    }
+
+    fn matching_candidates(&self, token: &str) -> Vec<String> {
+        self.command_candidates
+            .iter()
+            .filter(|candidate| candidate.starts_with(token))
+            .cloned()
+            .collect()
+    }
+
+    pub fn completion_items(&self) -> Vec<String> {
+        let text = self.draft.text();
+        let start = text
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map(|(index, _)| index + 1)
+            .unwrap_or(0);
+        self.matching_candidates(&text[start..])
+    }
+
+    fn refresh_completion(&mut self) {
+        let text = self.draft.text();
+        let start = text
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map(|(index, _)| index + 1)
+            .unwrap_or(0);
+        let token = &text[start..];
+        if !matches!(token.chars().next(), Some('/' | '@')) {
+            self.completion_trigger = None;
+            return;
+        }
+        self.completion_trigger = token.chars().next();
+        self.completion_cursor = self
+            .completion_cursor
+            .min(self.matching_candidates(token).len().saturating_sub(1));
+    }
+
+    fn accept_completion(&mut self) -> bool {
+        let Some(_) = self.completion_trigger else {
+            return false;
+        };
+        let text = self.draft.text().to_owned();
+        let start = text
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map(|(index, _)| index + 1)
+            .unwrap_or(0);
+        let token = &text[start..];
+        let matches = self.matching_candidates(token);
+        let Some(candidate) = matches.get(self.completion_cursor) else {
+            return false;
+        };
+        for _ in token.chars() {
+            self.draft.backspace();
+        }
+        for character in candidate.chars() {
+            self.draft.insert(character);
+        }
+        self.draft.insert(' ');
+        self.completion_trigger = None;
+        true
     }
 
     fn archive_active_run(&mut self) {
@@ -232,14 +305,17 @@ impl UiState {
                 self.catalog_query.clear();
                 return None;
             }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.draft.insert('\n');
+                self.refresh_completion();
+                return None;
+            }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.panel = UiPanel::RunDeck;
-                self.panel_cursor = 0;
+                self.rundeck_open = !self.rundeck_open;
                 return None;
             }
             KeyCode::Char('\u{4}') => {
-                self.panel = UiPanel::RunDeck;
-                self.panel_cursor = 0;
+                self.rundeck_open = !self.rundeck_open;
                 return None;
             }
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -251,6 +327,19 @@ impl UiState {
             KeyCode::Char('?') => {
                 self.panel = UiPanel::Help;
                 return None;
+            }
+            KeyCode::Up if self.completion_trigger.is_some() => {
+                self.completion_cursor = self.completion_cursor.saturating_sub(1);
+                return None;
+            }
+            KeyCode::Down if self.completion_trigger.is_some() => {
+                self.completion_cursor = self.completion_cursor.saturating_add(1);
+                return None;
+            }
+            KeyCode::Enter if self.completion_trigger.is_some() => {
+                if self.accept_completion() {
+                    return None;
+                }
             }
             KeyCode::PageUp => {
                 self.follow_output = false;
@@ -310,6 +399,7 @@ impl UiState {
                 prompt,
             });
         }
+        self.refresh_completion();
         None
     }
 
@@ -1049,7 +1139,10 @@ mod tests {
             local: true,
         });
         app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
-        assert_eq!(app.panel, UiPanel::RunDeck);
+        assert!(app.rundeck_open);
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(!app.rundeck_open);
+        app.panel = UiPanel::RunDeck;
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.deck_lens, DeckLens::Evidence);
         assert_eq!(
@@ -1193,10 +1286,33 @@ mod tests {
         assert_eq!(app.draft.text(), "a\nb\n");
 
         app.handle_key(KeyEvent::new(KeyCode::Char('\u{4}'), KeyModifiers::NONE));
-        assert_eq!(app.panel, UiPanel::RunDeck);
+        assert!(app.rundeck_open);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert_eq!(app.draft.text(), "a\nb\n\n");
         app.panel = UiPanel::Transcript;
         app.handle_key(KeyEvent::new(KeyCode::Char('\u{8}'), KeyModifiers::NONE));
         assert_eq!(app.panel, UiPanel::History);
+    }
+
+    #[test]
+    fn slash_and_at_commands_filter_and_insert_candidates() {
+        let mut app = UiState {
+            command_candidates: vec![
+                "/tools/read".into(),
+                "/tools/write".into(),
+                "@README.md".into(),
+            ],
+            ..UiState::default()
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert_eq!(app.completion_items(), vec!["/tools/read", "/tools/write"]);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.draft.text(), "/tools/read ");
+        app.handle_key(KeyEvent::new(KeyCode::Char('@'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE));
+        assert_eq!(app.completion_items(), vec!["@README.md"]);
     }
 
     #[test]

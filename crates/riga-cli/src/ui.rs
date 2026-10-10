@@ -9,25 +9,109 @@ use ratatui::{
 use crate::app::UiState;
 use crate::model::{ConnectionState, RunStatus};
 
+fn assistant_text_style(text: &str) -> Style {
+    let trimmed = text.trim_start();
+    let color = if trimmed.contains("```") || trimmed.starts_with("$ ") {
+        Color::LightYellow
+    } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        Color::LightBlue
+    } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("1. ") {
+        Color::LightGreen
+    } else if trimmed.contains("::") || trimmed.contains("enum ") {
+        Color::LightMagenta
+    } else {
+        Color::White
+    };
+    Style::default().fg(color)
+}
+
 pub fn render(frame: &mut Frame<'_>, app: &UiState) {
     if app.panel != crate::model::UiPanel::Transcript {
         render_panel(frame, app);
         return;
     }
+    if app.rundeck_open {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(72), Constraint::Percentage(28)])
+            .split(frame.area());
+        render_transcript_column(frame, columns[0], app);
+        frame.render_widget(
+            Paragraph::new(Text::from(render_rundeck(app)))
+                .block(Block::default().borders(Borders::ALL).title("RunDeck"))
+                .wrap(Wrap { trim: false }),
+            columns[1],
+        );
+        return;
+    }
+    render_transcript_column(frame, frame.area(), app);
+}
+
+fn render_transcript_column(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(composer_height(app, frame.area())),
+            Constraint::Length(composer_height(app, area)),
             Constraint::Length(1),
         ])
-        .split(frame.area());
+        .split(area);
 
     render_topbar(frame, chunks[0], app);
     render_transcript(frame, chunks[1], app);
     render_composer(frame, chunks[2], app);
+    render_completion_popup(frame, chunks[2], app);
     render_footer(frame, chunks[3], app);
+}
+
+fn render_completion_popup(frame: &mut Frame<'_>, composer: Rect, app: &UiState) {
+    if app.completion_trigger.is_none() {
+        return;
+    }
+    let items = app.completion_items();
+    if items.is_empty() {
+        return;
+    }
+    let height = items.len().min(8) as u16 + 2;
+    let area = Rect {
+        x: composer.x,
+        y: composer.y.saturating_sub(height),
+        width: composer.width.min(60),
+        height,
+    };
+    let lines = items
+        .iter()
+        .take(8)
+        .enumerate()
+        .map(|(index, item)| {
+            Line::from(Span::styled(
+                format!(
+                    "{} {item}",
+                    if index == app.completion_cursor {
+                        "▶"
+                    } else {
+                        " "
+                    }
+                ),
+                if index == app.completion_cursor {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::White).bg(Color::DarkGray)
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL).title(
+            if app.completion_trigger == Some('@') {
+                "Files / agents"
+            } else {
+                "Commands"
+            },
+        )),
+        area,
+    );
 }
 
 fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
@@ -140,7 +224,7 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
         crate::model::UiPanel::Help => (
             "Help",
             vec![Line::from(
-                "Ctrl+H history · Ctrl+,/F2 settings/model · Ctrl+K catalog · Ctrl+D RunDeck · Ctrl+L local models · ? help · Ctrl+R reasoning · Ctrl+T tools · y/a/n approvals · Esc close/cancel · q quit",
+                "Ctrl+H history · Ctrl+,/F2 settings/model · Ctrl+K catalog · Ctrl+J newline · Ctrl+D RunDeck side panel · Ctrl+L local models · ? help · Ctrl+R reasoning · Ctrl+T tools · y/a/n approvals · Esc close/cancel · q quit",
             )],
         ),
         crate::model::UiPanel::Transcript => unreachable!(),
@@ -422,7 +506,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
             ])),
             crate::model::TranscriptItem::AssistantText(text) => lines.push(Line::from(vec![
                 Span::styled("Assistant ", Style::default().fg(Color::Cyan)),
-                Span::styled(text, Style::default().fg(Color::White)),
+                Span::styled(text, assistant_text_style(text)),
             ])),
             crate::model::TranscriptItem::AssistantReasoning(text) => {
                 lines.push(Line::from(Span::styled(
@@ -438,6 +522,9 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                 "[tool activity available in RunDeck]",
                 Style::default().fg(Color::Yellow),
             ))),
+        }
+        if matches!(item, crate::model::TranscriptItem::AssistantText(_)) {
+            lines.push(Line::default());
         }
     }
     if let Some(prompt) = &app.current_prompt {
@@ -478,7 +565,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                     ]),
                     crate::model::TranscriptItem::AssistantText(text) => Line::from(vec![
                         Span::styled("Assistant ", Style::default().fg(Color::Cyan)),
-                        Span::styled(text, Style::default().fg(Color::White)),
+                        Span::styled(text, assistant_text_style(text)),
                     ]),
                     crate::model::TranscriptItem::AssistantReasoning(text) => {
                         Line::from(Span::styled(
@@ -535,6 +622,9 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                         Line::from(Span::styled(text, Style::default().fg(Color::Magenta)))
                     }
                 });
+                if matches!(item, crate::model::TranscriptItem::AssistantText(_)) {
+                    lines.push(Line::default());
+                }
             }
             if lines.is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -566,7 +656,7 @@ fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     } else if app.state.active_run.is_some() {
         "Composer · Esc stop · Enter send".to_owned()
     } else {
-        "Composer · Shift+Enter newline · Enter send".to_owned()
+        "Composer · Ctrl+J newline · Enter send".to_owned()
     };
     frame.render_widget(
         Paragraph::new(app.draft.text())
