@@ -19,3 +19,13 @@ These are living documents. They change as the plan changes.
 settled description of what RIGA actually does. A feature lands here once it is
 complete, so this directory is the durable, current record of RIGA's
 capabilities, kept separate from the evolving build plans above.
+
+- `SUBAGENT.md` — orchestration: profiles, dispatch, graph nodes, tool grants,
+  the model budget, and the read-only boundaries.
+- `EVIDENCE.md` — the automatic record of what ran, and the Evidence lens.
+- `KNOWLEDGE.md` — the reusable lessons a run leaves, and their injection into
+  the next run.
+- `RUNSHELL.md` — the workspace, the run lifecycle, the local tool loop and its
+  guards, reasoning, budget/context, and the native shell helpers.
+
+Each doc ends with **potential future work ordered by least ROI**.
