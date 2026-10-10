@@ -5,7 +5,7 @@ use crate::{
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
@@ -77,9 +77,25 @@ pub struct UiState {
     pub local_models: Option<riga_server::LocalModelOverview>,
     pub local_model_error: Option<String>,
     pub local_model_status: Option<String>,
+    pub local_model_progress: Option<f64>,
     pub local_attachment_input: bool,
     pub notice: Option<String>,
     pub confirm_quit: bool,
+    pub busy: Option<String>,
+    pub busy_tick: u64,
+}
+
+enum BackgroundResult {
+    StartRun {
+        run_id: String,
+        session_id: String,
+        result: Result<broadcast::Receiver<riga_kernel::events::RigaEventEnvelope>, String>,
+    },
+    LocalModel {
+        action: String,
+        model_id: Option<String>,
+        result: Result<(), String>,
+    },
 }
 
 impl UiState {
@@ -559,28 +575,105 @@ pub async fn run_with_transport<T: RigaTransport>(
     let mut terminal = crate::terminal::TerminalGuard::enter()?;
     let mut events: Option<broadcast::Receiver<riga_kernel::events::RigaEventEnvelope>> = None;
     let mut local_events = transport.subscribe_local_models();
+    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
     loop {
+        app.busy_tick = app.busy_tick.wrapping_add(1);
+        while let Ok(result) = completion_rx.try_recv() {
+            match result {
+                BackgroundResult::StartRun {
+                    run_id,
+                    session_id,
+                    result,
+                } => match result {
+                    Ok(receiver) => {
+                        app.notice = None;
+                        app.busy = Some("Thinking...".into());
+                        app.state.active_runs.push(riga_server::ws::ActiveRun {
+                            run_id: run_id.clone(),
+                            session_id,
+                            local: false,
+                        });
+                        app.state.select_run(Some(run_id));
+                        events = Some(receiver);
+                    }
+                    Err(error) => {
+                        app.busy = None;
+                        app.notice = Some(format!("Unable to start run: {error}"));
+                    }
+                },
+                BackgroundResult::LocalModel {
+                    action,
+                    model_id,
+                    result,
+                } => match result {
+                    Ok(()) => {
+                        app.local_models = Some(transport.local_models().await);
+                        app.local_model_error = None;
+                        if action == "load" {
+                            app.busy = None;
+                            if let Some(id) = model_id {
+                                app.provider.kind = riga_server::ws::ProviderKind::Local;
+                                app.provider.model = id;
+                                if let Err(error) =
+                                    transport.configure_provider(app.provider.to_config()).await
+                                {
+                                    app.local_model_error = Some(error);
+                                }
+                            }
+                        } else if action == "unload" {
+                            app.busy = None;
+                        }
+                    }
+                    Err(error) => {
+                        app.busy = None;
+                        app.local_model_error = Some(error);
+                    }
+                },
+            }
+        }
         while let Ok(event) = local_events.try_recv() {
             match event {
                 riga_server::local_model::LocalModelEvent::DownloadProgress(progress) => {
                     app.local_model_status =
                         Some(format!("{}: {:.1}%", progress.model_id, progress.percent));
+                    app.local_model_progress = Some((progress.percent / 100.0).clamp(0.0, 1.0));
+                    app.busy = Some(format!("Downloading {}...", progress.model_id));
                 }
                 riga_server::local_model::LocalModelEvent::DownloadFinished {
                     model_id, ..
                 } => {
                     app.local_model_status = Some(format!("{model_id}: downloaded"));
+                    app.local_model_progress = Some(1.0);
+                    app.busy = None;
                     app.local_models = Some(transport.local_models().await);
                 }
                 riga_server::local_model::LocalModelEvent::DownloadFailed { model_id, message } => {
                     app.local_model_status = Some(format!("{model_id}: failed — {message}"));
+                    app.local_model_progress = None;
+                    app.busy = None;
                 }
                 riga_server::local_model::LocalModelEvent::Token { .. } => {}
             }
         }
         while let Some(receiver) = events.as_mut() {
             match receiver.try_recv() {
-                Ok(envelope) => app.apply_event(envelope),
+                Ok(envelope) => {
+                    app.apply_event(envelope);
+                    if let Some(run_id) = app.state.active_run.as_deref()
+                        && let Some(run) = app.state.run(run_id)
+                    {
+                        app.busy = match run.status {
+                            crate::model::RunStatus::Running => Some("Thinking...".into()),
+                            crate::model::RunStatus::WaitingForApproval => {
+                                Some("Waiting for approval...".into())
+                            }
+                            crate::model::RunStatus::Unknown => Some("Starting...".into()),
+                            crate::model::RunStatus::Completed
+                            | crate::model::RunStatus::Failed
+                            | crate::model::RunStatus::Cancelled => None,
+                        };
+                    }
+                }
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                     app.new_events = app.new_events.saturating_add(skipped as usize);
@@ -611,22 +704,19 @@ pub async fn run_with_transport<T: RigaTransport>(
                             .unwrap_or_default()
                             .as_nanos()
                     );
-                    match transport
-                        .start_run(run_id.clone(), session_id, prompt)
-                        .await
-                    {
-                        Ok(receiver) => {
-                            app.notice = None;
-                            app.state.active_runs.push(riga_server::ws::ActiveRun {
-                                run_id: run_id.clone(),
-                                session_id: app.state.selected_session.clone().unwrap_or_default(),
-                                local: false,
-                            });
-                            app.state.select_run(Some(run_id));
-                            events = Some(receiver);
-                        }
-                        Err(error) => app.notice = Some(format!("Unable to start run: {error}")),
-                    }
+                    app.busy = Some("Starting...".into());
+                    let tx = completion_tx.clone();
+                    let transport = transport.clone();
+                    tokio::spawn(async move {
+                        let result = transport
+                            .start_run(run_id.clone(), session_id.clone(), prompt)
+                            .await;
+                        let _ = tx.send(BackgroundResult::StartRun {
+                            run_id,
+                            session_id,
+                            result,
+                        });
+                    });
                 }
                 UiCommand::Approve {
                     approval_id,
@@ -690,30 +780,29 @@ pub async fn run_with_transport<T: RigaTransport>(
                     model_id,
                     path,
                 } => {
-                    match transport
-                        .local_model_action(action.clone(), model_id.clone(), path.clone())
-                        .await
-                    {
-                        Ok(()) => {
-                            app.local_models = Some(transport.local_models().await);
-                            app.local_model_error = None;
-                            if action == "load" {
-                                if let Some(id) = model_id {
-                                    app.provider.kind = riga_server::ws::ProviderKind::Local;
-                                    app.provider.model = id;
-                                    if let Err(error) =
-                                        transport.configure_provider(app.provider.to_config()).await
-                                    {
-                                        app.local_model_error = Some(error);
-                                    }
-                                }
-                            } else if action == "download" {
-                                app.local_model_status =
-                                    model_id.map(|id| format!("{id}: download started"));
-                            }
-                        }
-                        Err(error) => app.local_model_error = Some(error),
+                    app.busy = Some(match action.as_str() {
+                        "load" => "Loading local model...".into(),
+                        "download" => "Starting download...".into(),
+                        "unload" => "Unloading local model...".into(),
+                        _ => "Working...".into(),
+                    });
+                    if action == "download" {
+                        app.local_model_status =
+                            model_id.clone().map(|id| format!("{id}: download started"));
+                        app.local_model_progress = Some(0.0);
                     }
+                    let tx = completion_tx.clone();
+                    let transport = transport.clone();
+                    tokio::spawn(async move {
+                        let result = transport
+                            .local_model_action(action.clone(), model_id.clone(), path)
+                            .await;
+                        let _ = tx.send(BackgroundResult::LocalModel {
+                            action,
+                            model_id,
+                            result,
+                        });
+                    });
                 }
                 UiCommand::UploadAttachment { path } => {
                     let file_name = std::path::Path::new(&path)

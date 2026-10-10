@@ -1,16 +1,9 @@
 
 
-## Manual-test regression pass
+## Progress and CUDA follow-up
 
-A follow-up manual-test pass fixed the issues found in the first TUI-6 build:
+Long-running local-model actions now run behind the TUI event loop instead of being awaited in the key/render loop. Loading and unloading show an animated Ratatui gauge, downloads show a percentage Gauge sourced from the shared local-model progress stream, and completion/failure clears or updates the operation state. Starting a chat run is also dispatched in the background; the footer shows `Starting...`, `Thinking...`, or `Waiting for approval...` while events arrive. The UI continues polling keys and redrawing during these operations.
 
-- The composer now positions the terminal cursor at the UTF-8-safe insertion point, including multiline drafts.
-- Start-run and resume errors stay in the TUI as an `ERROR:` footer toaster instead of propagating out of the event loop and terminating the application.
-- Shift+Enter is handled before submit and inserts a newline; Enter remains submit.
-- Plain `r` and `t` are composer input. Reasoning/tools toggles use Ctrl+R/Ctrl+T.
-- llama.cpp backend logs are voided while the server owns the terminal, preventing tensor repack diagnostics from corrupting the alternate screen.
-- Ctrl+H history also handles terminals that encode Ctrl+H as Backspace when the composer is empty. F2 and Ctrl+S provide settings fallbacks for terminals that do not transmit Ctrl-comma reliably.
-- Escape closes panels, but from the transcript it opens a y/n quit confirmation rather than exiting immediately.
-- CUDA CLI builds have a wrapper that validates the required toolchain and repairs stale CMake output with a missing Makefile/build.ninja.
+The CUDA wrapper now passes the generated compatibility include directory through both `CUDAFLAGS` and `CMAKE_CUDA_FLAGS`, because `llama-cpp-sys-2`'s CMake compiler-identification step does not reliably inherit the former alone. It also invalidates a cached CMake tree when the cache predates the shim or is not configured with CUDA. This addresses the reported CUDA 12.6/glibc conflict for `cospi`, `sinpi`, `rsqrt`, `cospif`, `sinpif`, and `rsqrtf`; the wrapper remains the canonical CUDA CLI entry point.
 
-Automated coverage now includes cursor/toaster rendering, plain composer `r`/`t`, Shift+Enter, Ctrl+R/Ctrl+T, Escape confirmation, F2 settings, local-model selection, and a selected-downloaded-model flow that submits two chat threads in the same session. The focused CLI suite passes with **25 tests, 0 failures**.
+The focused CLI suite now passes with **26 tests, 0 failures**, including the local-model progress gauge. Workspace clippy and tests also pass.

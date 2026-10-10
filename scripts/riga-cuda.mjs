@@ -53,7 +53,10 @@ function conflictingSymbols(include) {
   const probeDir = path.join(targetRoot, "cuda-header-probe");
   fs.mkdirSync(probeDir, { recursive: true });
   const source = path.join(probeDir, "probe.cu");
-  fs.writeFileSync(source, "#include <cuda_runtime.h>\n#include <cmath>\nint main() { return (int)rsqrtf(1.0f); }\n");
+  fs.writeFileSync(
+    source,
+    "#include <cuda_runtime.h>\n#include <cmath>\n#include <mutex>\n#include <locale>\n__global__ void k(float* p) { p[threadIdx.x] = rsqrtf(p[threadIdx.x]) + std::sqrt(2.0f) + rsqrt((double)p[threadIdx.x]); }\nint main() { std::mutex m; std::locale l(\"C\"); (void)m; (void)l; return 0; }\n",
+  );
   const args = ["-c", source, "-o", path.join(probeDir, "probe.o")];
   if (include) args.unshift(`-I${include}`);
   const probe = spawnSync(nvcc, args, { encoding: "utf8" });
@@ -88,12 +91,14 @@ function patchDeclarations(shimInclude, symbols) {
 // Shadow the toolkit include tree and add noexcept(true) to only the conflicting
 // CUDA declarations. This is the same compatibility strategy used by the Tauri
 // CUDA launcher, but is applied to the CLI's Cargo build as well.
+let cudaShimInclude = null;
 if (process.platform === "linux" && env.RIGA_CUDA_HEADER_SHIM !== "off") {
   const sourceInclude = includeDir(cudaRoot);
   const symbols = conflictingSymbols(null);
   if (symbols.length > 0 && sourceInclude) {
     const version = spawnSync(nvcc, ["--version"], { encoding: "utf8" }).stdout?.match(/release ([\d.]+)/)?.[1] || "unknown";
     const shimInclude = path.join(targetRoot, "cuda-header-shim", `${path.basename(cudaRoot)}-${version}`, "include");
+    cudaShimInclude = shimInclude;
     fs.rmSync(path.dirname(shimInclude), { recursive: true, force: true });
     fs.mkdirSync(path.dirname(shimInclude), { recursive: true });
     fs.cpSync(sourceInclude, shimInclude, { recursive: true });
@@ -104,6 +109,7 @@ if (process.platform === "linux" && env.RIGA_CUDA_HEADER_SHIM !== "off") {
     }
     console.log(`Using CUDA/glibc header compatibility shim for: ${[...new Set(symbols)].join(", ")}`);
     env.CUDAFLAGS = `${env.CUDAFLAGS} -I${shimInclude}`;
+    env.CMAKE_CUDA_FLAGS = `${env.CMAKE_CUDA_FLAGS} -I${shimInclude}`;
   }
 }
 
@@ -116,7 +122,13 @@ for (const profile of ["debug", "release"]) {
     if (!entry.startsWith("llama-cpp-sys-2-")) continue;
     const out = path.join(buildRoot, entry, "out");
     const cmakeBuild = path.join(out, "build");
-    if (fs.existsSync(cmakeBuild) && !fs.existsSync(path.join(cmakeBuild, "Makefile")) && !fs.existsSync(path.join(cmakeBuild, "build.ninja"))) {
+    const hasBuildSystem = fs.existsSync(path.join(cmakeBuild, "Makefile")) || fs.existsSync(path.join(cmakeBuild, "build.ninja"));
+    const cache = path.join(cmakeBuild, "CMakeCache.txt");
+    const cacheText = fs.existsSync(cache) ? fs.readFileSync(cache, "utf8") : "";
+    const cacheFlags = cacheText.match(/^CMAKE_CUDA_FLAGS:STRING=(.*)$/m)?.[1] || "";
+    const missingShim = cudaShimInclude && !cacheFlags.includes(cudaShimInclude);
+    const missingCuda = cacheText && !/^GGML_CUDA:BOOL=ON$/m.test(cacheText);
+    if (fs.existsSync(cmakeBuild) && (!hasBuildSystem || missingShim || missingCuda)) {
       console.log(`Removing stale CUDA CMake output: ${cmakeBuild}`);
       fs.rmSync(out, { recursive: true, force: true });
     }

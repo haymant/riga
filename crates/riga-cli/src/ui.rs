@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Gauge, Paragraph, Wrap},
 };
 
 use crate::app::UiState;
@@ -151,6 +151,32 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
             .wrap(Wrap { trim: false }),
         area,
     );
+    if app.panel == crate::model::UiPanel::LocalModels {
+        let gauge_area = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(area.height.saturating_sub(2)),
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        if let Some(progress) = app.local_model_progress {
+            frame.render_widget(
+                Gauge::default()
+                    .gauge_style(Style::default().fg(Color::Cyan))
+                    .ratio(progress.clamp(0.0, 1.0))
+                    .label(format!("Downloading {:.1}%", progress * 100.0)),
+                gauge_area,
+            );
+        } else if app.busy.is_some() {
+            let ratio = ((app.busy_tick % 20) as f64 + 1.0) / 20.0;
+            frame.render_widget(
+                Gauge::default()
+                    .gauge_style(Style::default().fg(Color::Yellow))
+                    .ratio(ratio)
+                    .label(app.busy.as_deref().unwrap_or("Working...")),
+                gauge_area,
+            );
+        }
+    }
 }
 
 fn render_local_models(app: &UiState) -> Vec<Line<'static>> {
@@ -547,6 +573,18 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
         );
         return;
     }
+    if let Some(busy) = &app.busy {
+        const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} {busy}",
+                SPINNER[(app.busy_tick as usize) % SPINNER.len()]
+            ))
+            .style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+        return;
+    }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(" ↑↓ history ", Style::default().fg(Color::DarkGray)),
@@ -657,6 +695,27 @@ mod tests {
             terminal.backend_mut().get_cursor_position().unwrap(),
             (2, 21).into()
         );
+    }
+
+    #[test]
+    fn local_model_progress_gauge_is_rendered() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = UiState {
+            panel: crate::model::UiPanel::LocalModels,
+            local_model_progress: Some(0.5),
+            busy: Some("Downloading model...".into()),
+            ..UiState::default()
+        };
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Downloading 50.0%"));
     }
 
     #[test]
