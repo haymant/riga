@@ -1,7 +1,12 @@
+mod app;
+mod input;
 mod model;
+mod terminal;
 mod transport;
+mod ui;
 
 use clap::Parser;
+use model::ConnectionState;
 use riga_server::{CreateSessionRequest, ServerState};
 use serde_json::json;
 use transport::IpcTransport;
@@ -27,12 +32,27 @@ struct Args {
     /// Print the discovered catalog.
     #[arg(long)]
     catalog: bool,
+    /// Start the interactive Ratatui terminal UI.
+    #[arg(long)]
+    tui: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let args = Args::parse();
     let transport = IpcTransport::new(ServerState::default());
+
+    if args.tui {
+        let state = model::AppState {
+            connection: ConnectionState::Connected,
+            sessions: transport.list_sessions().await,
+            ..model::AppState::default()
+        };
+        return app::run(app::UiState {
+            state,
+            ..app::UiState::default()
+        });
+    }
 
     // TUI-0 intentionally has a deterministic headless surface. Interactive
     // Ratatui mode is added in the next phase, while IPC remains the default

@@ -11,6 +11,8 @@ description = "RIGA command-line adapter"
 riga-kernel = { version = "0.1.0", path = "../riga-kernel" }
 riga-server = { version = "0.1.0", path = "../riga-server" }
 clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+ratatui = "0.29"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
