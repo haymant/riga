@@ -1109,9 +1109,18 @@ pub(crate) async fn start_ipc_run(
     // not rediscover what an earlier failure already taught.
     let prior_knowledge = load_session_knowledge(&session_id).await;
     let run_prompt = format!("{}{}", knowledge_preamble(&prior_knowledge), prompt);
+    append_turns(
+        &transcripts,
+        &secure_store,
+        &session_id,
+        &[ConversationTurn {
+            role: "user".into(),
+            content: prompt.clone(),
+        }],
+    )
+    .await;
     let run_id_task = run_id.clone();
     let session_id_task = session_id.clone();
-    let prompt_task = prompt.clone();
     let run_prompt_task = run_prompt;
     let config_task = config.clone();
     let mcp_task = mcp_runtime.clone();
@@ -1139,10 +1148,7 @@ pub(crate) async fn start_ipc_run(
         .await;
         // Persist the lessons for the next run in this session.
         save_session_knowledge(&session_id_task, &run_id_task, evidence.lessons().await).await;
-        let mut turns = vec![ConversationTurn {
-            role: "user".into(),
-            content: prompt_task,
-        }];
+        let mut turns = Vec::new();
         if let Some(output) = output {
             turns.push(ConversationTurn {
                 role: "assistant".into(),
@@ -1493,10 +1499,19 @@ pub(crate) async fn upgrade(
                         let prior_knowledge = load_session_knowledge(&session_id).await;
                         let run_prompt =
                             format!("{}{}", knowledge_preamble(&prior_knowledge), prompt);
+                        append_turns(
+                            &transcripts,
+                            &secure_store,
+                            &session_id,
+                            &[ConversationTurn {
+                                role: "user".into(),
+                                content: prompt.clone(),
+                            }],
+                        )
+                        .await;
                         {
                             let run_id_task = run_id.clone();
                             let session_id_task = session_id.clone();
-                            let prompt_task = prompt.clone();
                             let run_prompt_task = run_prompt;
                             let config_task = config.clone();
                             let run_root_task = run_root.clone();
@@ -1530,10 +1545,7 @@ pub(crate) async fn upgrade(
                                     evidence.lessons().await,
                                 )
                                 .await;
-                                let mut turns = vec![ConversationTurn {
-                                    role: "user".into(),
-                                    content: prompt_task,
-                                }];
+                                let mut turns = Vec::new();
                                 if let Some(output) = output {
                                     turns.push(ConversationTurn {
                                         role: "assistant".into(),

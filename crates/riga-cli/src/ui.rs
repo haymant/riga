@@ -596,14 +596,7 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     }
     if let Some(run_id) = &app.state.active_run {
         if let Some(run) = app.state.run(run_id) {
-            let capacity = area.height.saturating_sub(2) as usize * 3;
-            let start = run
-                .transcript
-                .len()
-                .saturating_sub(capacity)
-                .saturating_sub(app.transcript_scroll);
-            let end = (start + capacity).min(run.transcript.len());
-            for item in &run.transcript[start..end] {
+            for item in &run.transcript {
                 if app.reasoning_collapsed
                     && matches!(item, crate::model::TranscriptItem::AssistantReasoning(_))
                 {
@@ -701,10 +694,19 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
             Style::default().fg(Color::DarkGray),
         )));
     }
+    let paragraph = Paragraph::new(Text::from(lines))
+        .block(Block::default().borders(Borders::ALL).title("Transcript"))
+        .wrap(Wrap { trim: false });
+    let total_lines = paragraph.line_count(area.width.saturating_sub(2));
+    let viewport_lines = area.height.saturating_sub(2) as usize;
+    let bottom_offset = total_lines.saturating_sub(viewport_lines);
+    let offset = if app.follow_output {
+        bottom_offset
+    } else {
+        bottom_offset.saturating_sub(app.transcript_scroll)
+    };
     frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .block(Block::default().borders(Borders::ALL).title("Transcript"))
-            .wrap(Wrap { trim: false }),
+        paragraph.scroll((offset.min(u16::MAX as usize) as u16, 0)),
         area,
     );
 }
@@ -949,6 +951,39 @@ mod tests {
             .collect();
         assert!(text.contains("Assistant Hello"));
         assert!(!text.contains("You Hello"));
+    }
+
+    #[test]
+    fn long_loaded_history_follows_the_last_message() {
+        let backend = TestBackend::new(100, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = UiState::default();
+        app.state.selected_session = Some("session-1".into());
+        let mut turns = Vec::new();
+        for index in 0..20 {
+            turns.push(riga_server::ws::ConversationTurn {
+                role: "user".into(),
+                content: format!("old question {index}"),
+            });
+            turns.push(riga_server::ws::ConversationTurn {
+                role: "assistant".into(),
+                content: if index == 19 {
+                    "final answer".into()
+                } else {
+                    format!("old answer {index}")
+                },
+            });
+        }
+        app.set_session_history(turns);
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("final answer"));
     }
 
     #[test]

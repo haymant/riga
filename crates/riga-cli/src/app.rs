@@ -3,7 +3,7 @@ use crate::{
     model::{AppState, CatalogEntry, DeckLens, ProviderForm, TranscriptItem, UiPanel},
     transport::RigaTransport,
 };
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 
@@ -56,9 +56,12 @@ pub struct UiState {
     pub state: AppState,
     pub draft: TextBuffer,
     pub last_submitted: Option<String>,
+    pub prompt_history: Vec<String>,
+    pub prompt_history_cursor: Option<usize>,
     pub should_quit: bool,
     pub follow_output: bool,
     pub transcript_scroll: usize,
+    pub transcript_focused: bool,
     pub new_events: usize,
     pub reasoning_collapsed: bool,
     pub tools_collapsed: bool,
@@ -116,6 +119,35 @@ impl UiState {
                 role => TranscriptItem::System(format!("{role}: {}", turn.content)),
             })
             .collect();
+        self.jump_to_bottom();
+    }
+
+    fn navigate_prompt_history(&mut self, down: bool) -> bool {
+        if self.prompt_history.is_empty() {
+            return false;
+        }
+        if down {
+            let Some(index) = self.prompt_history_cursor else {
+                return false;
+            };
+            if index + 1 >= self.prompt_history.len() {
+                self.prompt_history_cursor = None;
+                self.draft.clear();
+            } else {
+                let next = index + 1;
+                self.prompt_history_cursor = Some(next);
+                self.draft.replace(&self.prompt_history[next]);
+            }
+        } else {
+            let next = self
+                .prompt_history_cursor
+                .map(|index| index.saturating_sub(1))
+                .unwrap_or(self.prompt_history.len().saturating_sub(1));
+            self.prompt_history_cursor = Some(next);
+            self.draft.replace(&self.prompt_history[next]);
+        }
+        self.refresh_completion();
+        true
     }
 
     pub fn set_command_candidates(&mut self, candidates: Vec<String>) {
@@ -200,6 +232,24 @@ impl UiState {
         }
     }
 
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, terminal_height: u16) {
+        match mouse.kind {
+            MouseEventKind::Down(_) => {
+                self.transcript_focused = mouse.row < terminal_height.saturating_sub(4);
+            }
+            MouseEventKind::ScrollUp => {
+                self.transcript_focused = true;
+                self.follow_output = false;
+                self.transcript_scroll = self.transcript_scroll.saturating_add(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.transcript_focused = true;
+                self.transcript_scroll = self.transcript_scroll.saturating_sub(3);
+            }
+            _ => {}
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<UiCommand> {
         if self.confirm_quit {
             match key.code {
@@ -257,6 +307,9 @@ impl UiState {
         }
         if self.panel != UiPanel::Transcript {
             return self.handle_panel_key(key);
+        }
+        if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            self.transcript_focused = false;
         }
         if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
             let _ = self.draft.handle_key(key);
@@ -346,6 +399,23 @@ impl UiState {
                     return None;
                 }
             }
+            KeyCode::Up if self.transcript_focused => {
+                self.follow_output = false;
+                self.transcript_scroll = self.transcript_scroll.saturating_add(1);
+                return None;
+            }
+            KeyCode::Down if self.transcript_focused => {
+                self.transcript_scroll = self.transcript_scroll.saturating_sub(1);
+                return None;
+            }
+            KeyCode::Up => {
+                self.navigate_prompt_history(false);
+                return None;
+            }
+            KeyCode::Down => {
+                self.navigate_prompt_history(true);
+                return None;
+            }
             KeyCode::PageUp => {
                 self.follow_output = false;
                 self.transcript_scroll = self.transcript_scroll.saturating_add(3);
@@ -397,12 +467,18 @@ impl UiState {
             }
             _ => {}
         }
-        if let InputAction::Submit(prompt) = self.draft.handle_key(key) {
-            self.last_submitted = Some(prompt.clone());
-            return Some(UiCommand::StartRun {
-                session_id: self.state.selected_session.clone().unwrap_or_default(),
-                prompt,
-            });
+        match self.draft.handle_key(key) {
+            InputAction::Changed => self.prompt_history_cursor = None,
+            InputAction::Submit(prompt) => {
+                self.last_submitted = Some(prompt.clone());
+                self.prompt_history.push(prompt.clone());
+                self.prompt_history_cursor = None;
+                return Some(UiCommand::StartRun {
+                    session_id: self.state.selected_session.clone().unwrap_or_default(),
+                    prompt,
+                });
+            }
+            InputAction::Ignored => {}
         }
         self.refresh_completion();
         None
@@ -865,11 +941,20 @@ pub async fn run_with_transport<T: RigaTransport>(
         if app.should_quit {
             break;
         }
-        if event::poll(Duration::from_millis(60)).map_err(|error| error.to_string())?
-            && let Event::Key(key) = event::read().map_err(|error| error.to_string())?
-            && let Some(command) = app.handle_key(key)
-        {
-            match command {
+        if event::poll(Duration::from_millis(60)).map_err(|error| error.to_string())? {
+            match event::read().map_err(|error| error.to_string())? {
+                Event::Mouse(mouse) => {
+                    let height = terminal
+                        .size()
+                        .map_err(|error| error.to_string())?
+                        .height;
+                    app.handle_mouse(mouse, height);
+                }
+                Event::Key(key) => {
+                    let Some(command) = app.handle_key(key) else {
+                        continue;
+                    };
+                    match command {
                 UiCommand::StartRun { session_id, prompt } => {
                     if app.busy.as_deref() == Some("Stopping...") {
                         app.notice = Some("The previous run is still stopping; please wait a moment.".into());
@@ -1018,7 +1103,10 @@ pub async fn run_with_transport<T: RigaTransport>(
                         }
                     }
                 }
-                UiCommand::Quit => break,
+                        UiCommand::Quit => break,
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -1158,6 +1246,44 @@ mod tests {
                 crate::model::TranscriptItem::AssistantText("previous answer".into()),
             ]
         );
+    }
+
+    #[test]
+    fn composer_up_down_navigates_submitted_prompt_history() {
+        let mut app = UiState::default();
+        app.state.selected_session = Some("session-1".into());
+        for prompt in ["first prompt", "second prompt"] {
+            for character in prompt.chars() {
+                app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+            }
+            assert!(matches!(
+                app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                Some(UiCommand::StartRun { .. })
+            ));
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.draft.text(), "second prompt");
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.draft.text(), "first prompt");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.draft.text(), "second prompt");
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.draft.is_empty());
+    }
+
+    #[test]
+    fn focused_transcript_up_down_controls_follow_offset() {
+        let mut app = UiState {
+            transcript_focused: true,
+            follow_output: true,
+            ..UiState::default()
+        };
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(!app.follow_output);
+        assert_eq!(app.transcript_scroll, 1);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.transcript_scroll, 0);
     }
 
     #[test]

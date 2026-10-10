@@ -32,6 +32,12 @@ impl TextBuffer {
         self.cursor = 0;
     }
 
+    pub fn replace(&mut self, value: &str) {
+        self.text.clear();
+        self.text.push_str(value);
+        self.cursor = self.text.len();
+    }
+
     pub fn insert(&mut self, value: char) {
         self.text.insert(self.cursor, value);
         self.cursor += value.len_utf8();
