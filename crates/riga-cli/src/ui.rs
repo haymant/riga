@@ -9,22 +9,6 @@ use ratatui::{
 use crate::app::UiState;
 use crate::model::{ConnectionState, RunStatus};
 
-fn assistant_text_style(text: &str) -> Style {
-    let trimmed = text.trim_start();
-    let color = if trimmed.contains("```") || trimmed.starts_with("$ ") {
-        Color::LightYellow
-    } else if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        Color::LightBlue
-    } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("1. ") {
-        Color::LightGreen
-    } else if trimmed.contains("::") || trimmed.contains("enum ") {
-        Color::LightMagenta
-    } else {
-        Color::White
-    };
-    Style::default().fg(color)
-}
-
 fn code_line_style(line: &str) -> Style {
     let trimmed = line.trim_start();
     let color = if trimmed.starts_with('{') || trimmed.starts_with('[') {
@@ -41,52 +25,82 @@ fn code_line_style(line: &str) -> Style {
     Style::default().fg(color)
 }
 
-fn push_rich_message<'a>(
-    lines: &mut Vec<Line<'a>>,
-    label: &'a str,
-    label_color: Color,
-    text: &'a str,
-) {
+fn push_rich_message(lines: &mut Vec<Line<'static>>, rail_color: Color, text: &str) {
     let mut in_code = false;
-    let mut first = true;
     for segment in text.split("```") {
         if in_code {
-            lines.push(Line::from(Span::styled(
-                "┌─ code",
-                Style::default().fg(Color::DarkGray),
-            )));
             let mut code_lines = segment.lines();
             let language = code_lines.next().unwrap_or_default();
-            if !language.trim().is_empty() {
-                lines.push(Line::from(Span::styled(
-                    format!("│ {language}"),
+            let language = if language.trim().is_empty() {
+                "code"
+            } else {
+                language.trim()
+            };
+            lines.push(Line::from(vec![
+                Span::styled("┃ ", Style::default().fg(rail_color)),
+                Span::styled(
+                    format!("┌─ {language}"),
                     Style::default().fg(Color::DarkGray),
-                )));
-            }
+                ),
+            ]));
             for line in code_lines {
-                lines.push(Line::from(Span::styled(
-                    format!("│ {line}"),
-                    code_line_style(line),
-                )));
-            }
-            lines.push(Line::from(Span::styled(
-                "└─ code",
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            for line in segment.lines() {
-                let prefix = if first { label } else { "      " };
                 lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(label_color)),
-                    Span::styled(line, assistant_text_style(line)),
+                    Span::styled("┃ ", Style::default().fg(rail_color)),
+                    Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(line.to_owned(), code_line_style(line)),
                 ]));
-                first = false;
+            }
+            lines.push(Line::from(vec![
+                Span::styled("┃ ", Style::default().fg(rail_color)),
+                Span::styled("└─", Style::default().fg(Color::DarkGray)),
+            ]));
+        } else {
+            for raw_line in segment.lines() {
+                let trimmed = raw_line.trim_start();
+                let heading_level = trimmed.chars().take_while(|ch| *ch == '#').count();
+                let (content, style) = if heading_level > 0
+                    && trimmed.as_bytes().get(heading_level) == Some(&b' ')
+                {
+                    (
+                        trimmed[heading_level..].trim_start().to_owned(),
+                        Style::default()
+                            .fg(Color::LightCyan)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else if let Some(quote) = trimmed.strip_prefix("> ") {
+                    (
+                        format!("│ {quote}"),
+                        Style::default()
+                            .fg(Color::LightYellow)
+                            .add_modifier(Modifier::ITALIC),
+                    )
+                } else if matches!(trimmed, "---" | "***" | "___") {
+                    ("────────────────────────".to_owned(), Style::default().fg(Color::DarkGray))
+                } else {
+                    (raw_line.to_owned(), Style::default().fg(Color::White))
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("┃ ", Style::default().fg(rail_color)),
+                    Span::styled(content, style),
+                ]));
             }
         }
         in_code = !in_code;
     }
-    if first {
-        lines.push(Line::from(Span::styled(label, Style::default().fg(label_color))));
+    if text.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "┃",
+            Style::default().fg(rail_color),
+        )));
+    }
+}
+
+fn push_transcript_note(lines: &mut Vec<Line<'static>>, text: &str, color: Color) {
+    for line in text.lines() {
+        lines.push(Line::from(vec![
+            Span::styled("┃ ", Style::default().fg(Color::DarkGray)),
+            Span::styled(line.to_owned(), Style::default().fg(color)),
+        ]));
     }
 }
 
@@ -563,36 +577,56 @@ fn render_topbar(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
 
 fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     let mut lines = Vec::new();
+    let user_rail = Color::LightBlue;
+    let assistant_rail = Color::LightYellow;
     for item in &app.state.session_history {
         match item {
-            crate::model::TranscriptItem::UserText(text) => lines.push(Line::from(vec![
-                Span::styled("You ", Style::default().fg(Color::Green)),
-                Span::styled(text, Style::default().fg(Color::LightGreen)),
-            ])),
+            crate::model::TranscriptItem::UserText(text) => {
+                push_rich_message(&mut lines, user_rail, text);
+                lines.push(Line::default());
+            }
             crate::model::TranscriptItem::AssistantText(text) => {
-                push_rich_message(&mut lines, "Assistant ", Color::Cyan, text);
+                push_rich_message(&mut lines, assistant_rail, text);
+                lines.push(Line::default());
             }
             crate::model::TranscriptItem::AssistantReasoning(text) => {
-                lines.push(Line::from(Span::styled(
-                    format!("Thinking · {text}"),
-                    Style::default().fg(Color::DarkGray),
-                )))
+                push_transcript_note(&mut lines, &format!("Thinking · {text}"), Color::DarkGray);
             }
-            crate::model::TranscriptItem::System(text) => lines.push(Line::from(Span::styled(
-                text,
-                Style::default().fg(Color::Magenta),
-            ))),
-            _ => lines.push(Line::from(Span::styled(
-                "[tool activity available in RunDeck]",
-                Style::default().fg(Color::Yellow),
-            ))),
-        }
-        if matches!(item, crate::model::TranscriptItem::AssistantText(_)) {
-            lines.push(Line::default());
+            crate::model::TranscriptItem::System(text) => {
+                push_transcript_note(&mut lines, text, Color::Magenta);
+            }
+            crate::model::TranscriptItem::ToolCall { tool, call, .. } => {
+                push_transcript_note(&mut lines, &format!("{tool} · {call}"), Color::DarkGray);
+            }
+            crate::model::TranscriptItem::ToolOutput { output, .. } => {
+                push_transcript_note(&mut lines, output, Color::DarkGray);
+            }
+            crate::model::TranscriptItem::ToolResult { result, .. } => {
+                push_transcript_note(&mut lines, &format!("Result · {result}"), Color::DarkGray);
+            }
+            crate::model::TranscriptItem::TaskResult {
+                task_id,
+                ok,
+                result,
+            } => push_transcript_note(
+                &mut lines,
+                &format!("Task {task_id} {} · {result}", if *ok { "done" } else { "failed" }),
+                if *ok { Color::Green } else { Color::Red },
+            ),
+            crate::model::TranscriptItem::Approval {
+                approval_id,
+                tool,
+                summary,
+            } => push_transcript_note(
+                &mut lines,
+                &format!("Approval · {tool} · {summary} [{approval_id}]"),
+                Color::LightYellow,
+            ),
         }
     }
     if let Some(prompt) = &app.current_prompt {
-        push_rich_message(&mut lines, "You ", Color::Green, prompt);
+        push_rich_message(&mut lines, user_rail, prompt);
+        lines.push(Line::default());
     }
     if let Some(run_id) = &app.state.active_run {
         if let Some(run) = app.state.run(run_id) {
@@ -614,71 +648,62 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
                 }
                 match item {
                     crate::model::TranscriptItem::UserText(text) => {
-                        push_rich_message(&mut lines, "You ", Color::Green, text);
+                        push_rich_message(&mut lines, user_rail, text);
+                        lines.push(Line::default());
                     }
                     crate::model::TranscriptItem::AssistantText(text) => {
-                        push_rich_message(&mut lines, "Assistant ", Color::Cyan, text);
+                        push_rich_message(&mut lines, assistant_rail, text);
+                        lines.push(Line::default());
                     }
                     crate::model::TranscriptItem::AssistantReasoning(text) => {
-                        lines.push(Line::from(Span::styled(
-                            format!("Thinking · {text}"),
-                            Style::default().fg(Color::DarkGray),
-                        )));
+                        push_transcript_note(
+                            &mut lines,
+                            &format!("Thinking · {text}"),
+                            Color::DarkGray,
+                        );
                     }
                     crate::model::TranscriptItem::ToolCall {
-                        call_id,
                         tool,
                         call,
+                        ..
                     } => lines.push(Line::from(Span::styled(
-                        format!("tool {tool} [{call_id}] · {call}"),
-                        Style::default().fg(Color::Yellow),
+                        format!("┃ {tool} · {call}"),
+                        Style::default().fg(Color::DarkGray),
                     ))),
-                    crate::model::TranscriptItem::ToolOutput { call_id, output } => {
-                        lines.push(Line::from(Span::styled(
-                            format!("{call_id} · {output}"),
-                            Style::default().fg(Color::Yellow),
-                        )));
+                    crate::model::TranscriptItem::ToolOutput { output, .. } => {
+                        push_transcript_note(&mut lines, output, Color::DarkGray);
                     }
-                    crate::model::TranscriptItem::ToolResult { call_id, result } => {
-                        lines.push(Line::from(Span::styled(
-                            format!(
-                                "tool result{} · {result}",
-                                call_id
-                                    .as_deref()
-                                    .map(|id| format!(" [{id}]"))
-                                    .unwrap_or_default()
-                            ),
-                            Style::default().fg(Color::Yellow),
-                        )));
+                    crate::model::TranscriptItem::ToolResult { result, .. } => {
+                        push_transcript_note(
+                            &mut lines,
+                            &format!("Result · {result}"),
+                            Color::DarkGray,
+                        );
                     }
                     crate::model::TranscriptItem::TaskResult {
                         task_id,
                         ok,
                         result,
-                    } => lines.push(Line::from(Span::styled(
-                        format!(
-                            "task {task_id} {} · {result}",
+                    } => push_transcript_note(
+                        &mut lines,
+                        &format!(
+                            "Task {task_id} {} · {result}",
                             if *ok { "done" } else { "failed" }
                         ),
-                        Style::default().fg(if *ok { Color::Green } else { Color::Red }),
-                    ))),
+                        if *ok { Color::Green } else { Color::Red },
+                    ),
                     crate::model::TranscriptItem::Approval {
                         approval_id,
                         tool,
                         summary,
-                    } => lines.push(Line::from(Span::styled(
-                        format!("approval {approval_id} · {tool} · {summary}"),
-                        Style::default().fg(Color::Red),
-                    ))),
+                    } => push_transcript_note(
+                        &mut lines,
+                        &format!("Approval · {tool} · {summary} [{approval_id}]"),
+                        Color::Red,
+                    ),
                     crate::model::TranscriptItem::System(text) => {
-                        lines.push(Line::from(Span::styled(
-                            text,
-                            Style::default().fg(Color::Magenta),
-                        )));
+                        push_transcript_note(&mut lines, text, Color::Magenta);
                     }
-                }
-                if matches!(item, crate::model::TranscriptItem::AssistantText(_)) {
-                    lines.push(Line::default());
                 }
             }
             if lines.is_empty() {
@@ -694,21 +719,24 @@ fn render_transcript(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
             Style::default().fg(Color::DarkGray),
         )));
     }
-    let paragraph = Paragraph::new(Text::from(lines))
-        .block(Block::default().borders(Borders::ALL).title("Transcript"))
-        .wrap(Wrap { trim: false });
-    let total_lines = paragraph.line_count(area.width.saturating_sub(2));
-    let viewport_lines = area.height.saturating_sub(2) as usize;
+    let total_lines = wrapped_line_count(&lines, area.width as usize);
+    let viewport_lines = area.height as usize;
     let bottom_offset = total_lines.saturating_sub(viewport_lines);
     let offset = if app.follow_output {
         bottom_offset
     } else {
         bottom_offset.saturating_sub(app.transcript_scroll)
     };
-    frame.render_widget(
-        paragraph.scroll((offset.min(u16::MAX as usize) as u16, 0)),
-        area,
-    );
+    let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph.scroll((offset.min(u16::MAX as usize) as u16, 0)), area);
+}
+
+fn wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
+    let width = width.max(1);
+    lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum()
 }
 
 fn render_composer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
@@ -915,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_stream_is_labeled_assistant_not_you() {
+    fn assistant_stream_uses_its_own_transcript_rail() {
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = UiState::default();
@@ -949,7 +977,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Assistant Hello"));
+        assert!(text.contains("┃ Hello"));
         assert!(!text.contains("You Hello"));
     }
 
@@ -1020,9 +1048,9 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("┌─ code"));
-        assert!(text.contains("│ {\"ok\":true}"));
-        assert!(text.contains("└─ code"));
+        assert!(text.contains("┌─ json"));
+        assert!(text.contains("┃ │ {\"ok\":true}"));
+        assert!(text.contains("┃ └─"));
     }
 
     #[test]

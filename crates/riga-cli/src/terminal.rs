@@ -44,6 +44,10 @@ impl TerminalGuard {
         self.terminal.draw(render)
     }
 
+    pub fn size(&self) -> io::Result<ratatui::layout::Size> {
+        self.terminal.size()
+    }
+
     pub fn clear(&mut self) -> io::Result<()> {
         self.terminal.clear()
     }

@@ -399,6 +399,15 @@ impl UiState {
                     return None;
                 }
             }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.follow_output = false;
+                self.transcript_scroll = self.transcript_scroll.saturating_add(1);
+                return None;
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.transcript_scroll = self.transcript_scroll.saturating_sub(1);
+                return None;
+            }
             KeyCode::Up if self.transcript_focused => {
                 self.follow_output = false;
                 self.transcript_scroll = self.transcript_scroll.saturating_add(1);
@@ -424,15 +433,6 @@ impl UiState {
             }
             KeyCode::PageDown => {
                 self.transcript_scroll = self.transcript_scroll.saturating_sub(3);
-                return None;
-            }
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.follow_output = false;
-                self.transcript_scroll = self.transcript_scroll.saturating_add(1);
-                return None;
-            }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.transcript_scroll = self.transcript_scroll.saturating_sub(1);
                 return None;
             }
             KeyCode::Home => {
