@@ -1629,6 +1629,7 @@ struct ToolOutputStream {
     graph: std::sync::Arc<tokio::sync::Mutex<GraphRuntime>>,
     budget: std::sync::Arc<tokio::sync::Mutex<crate::local_model::LocalBudget>>,
     tool_grants: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ToolOutputStream {
@@ -2163,11 +2164,13 @@ async fn execute_streaming_bash(
     output_stream: ToolOutputStream,
 ) -> Result<String, String> {
     let (output_sender, mut output_receiver) = mpsc::channel(1);
+    let cancelled = output_stream.cancelled.clone();
     let mut execution = Box::pin(crate::catalog::execute_bash_streaming(
         workspace_root,
         command,
         output_stream.call_id.clone(),
         output_sender,
+        cancelled,
     ));
     let mut output_open = true;
     loop {
@@ -2840,6 +2843,7 @@ async fn run_chat_loop(
                                 graph: evidence.graph(),
                                 budget: evidence.budget(),
                                 tool_grants: evidence.tool_grants(),
+                                cancelled: evidence.cancel_flag(),
                             }),
                         )
                         .await
@@ -4115,6 +4119,7 @@ async fn run_local_loop(
                                 graph: evidence.graph(),
                                 budget: evidence.budget(),
                                 tool_grants: evidence.tool_grants(),
+                                cancelled: evidence.cancel_flag(),
                             }),
                         )
                         .await
@@ -4340,6 +4345,7 @@ async fn call_responses_api(
                     graph: evidence.graph(),
                     budget: evidence.budget(),
                     tool_grants: evidence.tool_grants(),
+                    cancelled: evidence.cancel_flag(),
                 }),
             )
             .await;
@@ -5550,6 +5556,7 @@ mod tests {
             tool_grants: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let result = super::execute_tool(
             std::path::Path::new("."),
@@ -5587,6 +5594,7 @@ mod tests {
             tool_grants: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let result = super::execute_tool(
             std::path::Path::new("."),
@@ -5623,6 +5631,7 @@ mod tests {
             tool_grants: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let result = super::execute_tool(
             std::path::Path::new("."),
@@ -5667,6 +5676,7 @@ mod tests {
             graph: std::sync::Arc::new(tokio::sync::Mutex::new(super::GraphRuntime::default())),
             budget,
             tool_grants,
+            cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 

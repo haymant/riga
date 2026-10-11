@@ -191,6 +191,11 @@ fn completion_candidates(
     for (command, detail) in [
         ("/model", "Choose or set the active remote model"),
         ("/models", "Alias for /model"),
+        ("/tools", "Browse built-in tools"),
+        ("/mcp", "Browse configured MCP servers and tools"),
+        ("/skills", "Browse discovered skills"),
+        ("/settings", "Open provider settings"),
+        ("/local-models", "Open the local model manager"),
         ("/new", "Start a new session"),
         ("/clear", "Alias for /new; keep the old session in history"),
         ("/resume", "Open session history"),
@@ -432,9 +437,15 @@ mod tests {
         assert!(labels.contains(&"/mcp/docs/search"));
         assert!(labels.contains(&"/mcp/riga-health-stdio/health"));
         assert!(labels.contains(&"/model"));
+        assert!(labels.contains(&"/tools"));
+        assert!(labels.contains(&"/mcp"));
+        assert!(labels.contains(&"/skills"));
+        assert!(labels.contains(&"/settings"));
+        assert!(labels.contains(&"/local-models"));
         assert!(labels.contains(&"/new"));
         assert!(labels.contains(&"/resume"));
         assert!(labels.contains(&"/status"));
+        assert!(labels.contains(&"/quit"));
         assert!(labels.contains(&"@src/main.rs"));
         assert!(labels.contains(&"@researcher"));
         assert!(!labels.contains(&"@rust-review"));

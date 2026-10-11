@@ -95,6 +95,7 @@ pub struct UiState {
     pub provider_field: usize,
     pub catalog: Vec<CatalogEntry>,
     pub catalog_query: TextBuffer,
+    pub catalog_scope: Option<String>,
     pub deck_lens: DeckLens,
     pub deck_details_expanded: bool,
     pub local_models_expanded: bool,
@@ -245,6 +246,14 @@ impl UiState {
         let token = &text[start..cursor];
         let trigger = token.chars().next()?;
         if !matches!(trigger, '/' | '@') {
+            return None;
+        }
+        if start > 0
+            && !matches!(
+                text[..start].chars().next_back(),
+                Some(' ' | '\t' | '\n' | '\r')
+            )
+        {
             return None;
         }
         let end = text[cursor..]
@@ -449,6 +458,17 @@ impl UiState {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<UiCommand> {
+        // Some terminals encode Backspace as Ctrl+H (or the legacy U+0008
+        // character). Normalize both before shortcut routing so deleting at
+        // the start of an empty composer can never open session history.
+        let key = if key.code == KeyCode::Char('\u{8}')
+            || (matches!(key.code, KeyCode::Char('h' | 'H'))
+                && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+        } else {
+            key
+        };
         if self.confirm_quit {
             match key.code {
                 KeyCode::Char('y') => {
@@ -463,6 +483,25 @@ impl UiState {
                 }
                 _ => return None,
             }
+        }
+        if matches!(key.code, KeyCode::Char('c' | 'C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+        {
+            if let Some(run_id) = self.state.active_run.clone() {
+                self.shell_input_mode = false;
+                self.notice = Some("Stopping active run…".into());
+                return Some(UiCommand::CancelRun { run_id });
+            }
+            if self.panel == UiPanel::Transcript && !self.draft.is_empty() {
+                self.draft.clear();
+                self.prompt_history_cursor = None;
+                self.refresh_completion();
+                self.notice = Some("Composer cleared; no run was active.".into());
+            } else {
+                self.notice = Some("No active run to stop.".into());
+            }
+            return None;
         }
         if self.shell_input_mode {
             if key.code == KeyCode::Esc
@@ -610,7 +649,9 @@ impl UiState {
                     self.clear_selection();
                     return None;
                 }
-                _ if key.modifiers.contains(KeyModifiers::CONTROL) || key.code == KeyCode::F(1) => {
+                _ if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || matches!(key.code, KeyCode::F(1) | KeyCode::F(3)) =>
+                {
                     self.transcript_focused = false;
                 }
                 _ => return None,
@@ -653,12 +694,7 @@ impl UiState {
                     self.panel = UiPanel::Help;
                     return None;
                 }
-                KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.panel = UiPanel::History;
-                    self.panel_cursor = 0;
-                    return None;
-                }
-                KeyCode::Char('\u{8}') => {
+                KeyCode::F(3) => {
                     self.panel = UiPanel::History;
                     self.panel_cursor = 0;
                     return None;
@@ -694,6 +730,7 @@ impl UiState {
                     self.panel = UiPanel::Catalog;
                     self.panel_cursor = 0;
                     self.catalog_query.clear();
+                    self.catalog_scope = None;
                     return None;
                 }
                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -724,17 +761,7 @@ impl UiState {
             return None;
         }
         match key.code {
-            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.panel = UiPanel::History;
-                self.panel_cursor = 0;
-                return None;
-            }
-            KeyCode::Char('\u{8}') => {
-                self.panel = UiPanel::History;
-                self.panel_cursor = 0;
-                return None;
-            }
-            KeyCode::Backspace if self.draft.is_empty() => {
+            KeyCode::F(3) => {
                 self.panel = UiPanel::History;
                 self.panel_cursor = 0;
                 return None;
@@ -761,6 +788,7 @@ impl UiState {
                 self.panel = UiPanel::Catalog;
                 self.panel_cursor = 0;
                 self.catalog_query.clear();
+                self.catalog_scope = None;
                 return None;
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1276,13 +1304,19 @@ impl UiState {
 
     pub fn filtered_catalog(&self) -> Vec<&CatalogEntry> {
         let query = self.catalog_query.text().to_lowercase();
+        let scope = self
+            .catalog_scope
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
         self.catalog
             .iter()
             .filter(|entry| {
-                query.is_empty()
-                    || entry.id.to_lowercase().contains(&query)
-                    || entry.kind.to_lowercase().contains(&query)
-                    || entry.description.to_lowercase().contains(&query)
+                (scope.is_empty() || entry.kind.to_lowercase().contains(&scope))
+                    && (query.is_empty()
+                        || entry.id.to_lowercase().contains(&query)
+                        || entry.kind.to_lowercase().contains(&query)
+                        || entry.description.to_lowercase().contains(&query))
             })
             .collect()
     }
@@ -1313,6 +1347,14 @@ impl UiState {
         self.panel_cursor = 0;
         self.notice = Some("Loading remote models from the configured provider…".into());
         UiCommand::LoadRemoteModels
+    }
+
+    fn open_catalog_scope(&mut self, scope: &str, query: &str) {
+        self.show_sidebar_panel(UiPanel::Catalog);
+        self.catalog_scope = Some(scope.into());
+        self.catalog_query.clear();
+        self.catalog_query.insert_str(query);
+        self.panel_cursor = 0;
     }
 
     fn handle_slash_command(&mut self, prompt: &str) -> SlashCommandResult {
@@ -1388,6 +1430,30 @@ impl UiState {
                 {
                     self.panel_cursor = index;
                 }
+                SlashCommandResult::Consumed
+            }
+            "/tools" => {
+                self.open_catalog_scope("tools", &arguments);
+                SlashCommandResult::Consumed
+            }
+            "/mcp" => {
+                self.open_catalog_scope("mcp", &arguments);
+                SlashCommandResult::Consumed
+            }
+            "/skills" => {
+                self.open_catalog_scope("skills", &arguments);
+                SlashCommandResult::Consumed
+            }
+            "/settings" => {
+                self.show_sidebar_panel(UiPanel::Settings);
+                self.provider_field = 0;
+                self.sync_provider_input();
+                SlashCommandResult::Consumed
+            }
+            "/local-models" => {
+                self.show_sidebar_panel(UiPanel::LocalModels);
+                self.panel_cursor = 0;
+                self.local_attachment_input = false;
                 SlashCommandResult::Consumed
             }
             "/rename" => {
@@ -1515,6 +1581,11 @@ fn is_native_slash_command(prompt: &str) -> bool {
         prompt.split_whitespace().next().unwrap_or_default(),
         "/model"
             | "/models"
+            | "/tools"
+            | "/mcp"
+            | "/skills"
+            | "/settings"
+            | "/local-models"
             | "/new"
             | "/clear"
             | "/resume"
@@ -1746,10 +1817,16 @@ pub async fn run_with_transport<T: RigaTransport>(
                     app.handle_paste(&text);
                 }
                 Event::Key(key) => {
-                    if key.code == KeyCode::Char('c')
+                    if matches!(key.code, KeyCode::Char('c' | 'C'))
                         && key.modifiers.contains(KeyModifiers::CONTROL)
-                        && app.selection_anchor.is_some()
+                        && key.modifiers.contains(KeyModifiers::SHIFT)
                     {
+                        if app.selection_anchor.is_none() {
+                            app.notice = Some(
+                                "Select transcript text first, then press Ctrl+Shift+C.".into(),
+                            );
+                            continue;
+                        }
                         let size = terminal.size().map_err(|error| error.to_string())?;
                         let text =
                             crate::ui::selected_transcript_text(&app, size.width, size.height);
@@ -2112,6 +2189,148 @@ mod tests {
     }
 
     #[test]
+    fn slash_navigation_commands_open_scoped_sidebar_panels() {
+        let mut app = UiState::default();
+        app.set_catalog(vec![
+            CatalogEntry {
+                id: "read".into(),
+                kind: "tools".into(),
+                description: "Read files".into(),
+                insert_text: String::new(),
+                requires_approval: false,
+            },
+            CatalogEntry {
+                id: "docs".into(),
+                kind: "mcp_servers".into(),
+                description: "Documentation server".into(),
+                insert_text: String::new(),
+                requires_approval: false,
+            },
+            CatalogEntry {
+                id: "rust-review".into(),
+                kind: "skills".into(),
+                description: "Review Rust code".into(),
+                insert_text: String::new(),
+                requires_approval: false,
+            },
+            CatalogEntry {
+                id: "src/main.rs".into(),
+                kind: "files".into(),
+                description: String::new(),
+                insert_text: String::new(),
+                requires_approval: false,
+            },
+        ]);
+
+        submit_text(&mut app, "/tools read");
+        assert_eq!(app.panel, UiPanel::Catalog);
+        assert_eq!(app.catalog_scope.as_deref(), Some("tools"));
+        assert_eq!(app.catalog_query.text(), "read");
+        assert_eq!(
+            app.filtered_catalog()
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read"]
+        );
+
+        app.panel = UiPanel::Transcript;
+        submit_text(&mut app, "/mcp");
+        assert_eq!(app.catalog_scope.as_deref(), Some("mcp"));
+        assert_eq!(app.filtered_catalog()[0].id, "docs");
+
+        app.panel = UiPanel::Transcript;
+        submit_text(&mut app, "/skills");
+        assert_eq!(app.catalog_scope.as_deref(), Some("skills"));
+        assert_eq!(app.filtered_catalog()[0].id, "rust-review");
+
+        app.panel = UiPanel::Transcript;
+        submit_text(&mut app, "/settings");
+        assert_eq!(app.panel, UiPanel::Settings);
+
+        app.panel = UiPanel::Transcript;
+        submit_text(&mut app, "/local-models");
+        assert_eq!(app.panel, UiPanel::LocalModels);
+    }
+
+    #[test]
+    fn slash_and_at_completions_require_a_line_or_space_boundary() {
+        let mut app = UiState::default();
+        app.set_completion_candidates(vec![
+            CompletionItem {
+                trigger: '/',
+                category: "Commands".into(),
+                label: "/model".into(),
+                detail: "Choose a model".into(),
+                insert_text: "/model".into(),
+            },
+            CompletionItem {
+                trigger: '@',
+                category: "Files".into(),
+                label: "@src/main.rs".into(),
+                detail: "Workspace file".into(),
+                insert_text: "@src/main.rs".into(),
+            },
+        ]);
+        for character in "word|/".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(app.completion_trigger, None);
+
+        app.draft.clear();
+        for character in "word /".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(app.completion_trigger, Some('/'));
+
+        app.draft.clear();
+        for character in "first line\n@".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(app.completion_trigger, Some('@'));
+    }
+
+    #[test]
+    fn backspace_at_the_start_of_the_composer_never_opens_history() {
+        let mut app = UiState::default();
+        for key in [
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('\u{8}'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        ] {
+            app.handle_key(key);
+            assert_eq!(app.panel, UiPanel::Transcript);
+            assert!(app.draft.is_empty());
+        }
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::History);
+    }
+
+    #[test]
+    fn ctrl_c_stops_the_active_run_and_clears_draft_only_when_idle() {
+        let mut running = UiState::default();
+        running.state.active_run = Some("run-1".into());
+        running.busy = Some("Running".into());
+        running.shell_input_mode = true;
+        assert_eq!(
+            running.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL,)),
+            Some(UiCommand::CancelRun {
+                run_id: "run-1".into(),
+            })
+        );
+        assert!(!running.shell_input_mode);
+
+        let mut idle = UiState::default();
+        idle.draft.insert_str("unsent draft");
+        assert!(
+            idle.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL,))
+                .is_none()
+        );
+        assert!(idle.draft.is_empty());
+        assert_eq!(idle.panel, UiPanel::Transcript);
+    }
+
+    #[test]
     fn unknown_slash_text_remains_a_normal_chat_prompt() {
         let mut app = UiState::default();
         app.state.selected_session = Some("session-1".into());
@@ -2178,7 +2397,7 @@ mod tests {
     fn history_panel_creates_a_valid_session_without_touching_the_draft() {
         let mut app = UiState::default();
         app.draft.insert('x');
-        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
         assert_eq!(app.panel, UiPanel::History);
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         for character in "demo".chars() {
@@ -2205,7 +2424,7 @@ mod tests {
             created_at: "now".into(),
             updated_at: "now".into(),
         });
-        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
         for _ in 0..3 {
             app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
@@ -2626,7 +2845,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_shift_enter_adds_a_newline_and_control_shortcuts_select_panels() {
+    fn raw_shift_enter_adds_newlines_and_backspace_does_not_open_history() {
         let mut app = UiState::default();
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE));
@@ -2640,7 +2859,10 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert_eq!(app.draft.text(), "a\nb\n\n");
         app.panel = UiPanel::Transcript;
+        app.draft.clear();
         app.handle_key(KeyEvent::new(KeyCode::Char('\u{8}'), KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::Transcript);
+        app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
         assert_eq!(app.panel, UiPanel::History);
     }
 

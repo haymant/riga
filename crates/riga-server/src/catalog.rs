@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{Mutex, OnceLock},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -671,7 +672,7 @@ pub async fn execute_write(root: &Path, path: &str, content: &str) -> Result<Str
 
 pub async fn execute_bash(root: &Path, command: &str) -> Result<String, String> {
     // Authorization is the caller's job; see `execute_write`.
-    execute_bash_inner(root, command, None, None).await
+    execute_bash_inner(root, command, None, None, None).await
 }
 
 pub async fn execute_bash_streaming(
@@ -679,8 +680,16 @@ pub async fn execute_bash_streaming(
     command: &str,
     call_id: String,
     output_sender: mpsc::Sender<String>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<String, String> {
-    execute_bash_inner(root, command, Some(output_sender), Some(call_id)).await
+    execute_bash_inner(
+        root,
+        command,
+        Some(output_sender),
+        Some(call_id),
+        Some(cancelled),
+    )
+    .await
 }
 
 async fn execute_bash_inner(
@@ -688,6 +697,7 @@ async fn execute_bash_inner(
     command: &str,
     output_sender: Option<mpsc::Sender<String>>,
     interactive_call_id: Option<String>,
+    cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<String, String> {
     let mut command_builder = Command::new("bash");
     command_builder
@@ -697,6 +707,11 @@ async fn execute_bash_inner(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command_builder.as_std_mut().process_group(0);
+    }
     if interactive_call_id.is_some() {
         command_builder.stdin(Stdio::piped());
     }
@@ -724,9 +739,35 @@ async fn execute_bash_inner(
     let mut stdout_buffer = [0_u8; 1_024];
     let mut stderr_buffer = [0_u8; 1_024];
     let mut output = String::new();
+    let mut child_status = None;
+    let mut cancellation_started = None;
+    let mut force_kill_sent = false;
+    let mut cancelled_by_user = false;
+    let mut process_poll = tokio::time::interval(Duration::from_millis(50));
 
-    while stdout_open || stderr_open {
+    while stdout_open || stderr_open || child_status.is_none() {
         tokio::select! {
+            _ = process_poll.tick() => {
+                if child_status.is_none() {
+                    child_status = child.try_wait().map_err(|error| error.to_string())?;
+                }
+                if cancellation.as_ref().is_some_and(|flag| {
+                    flag.load(std::sync::atomic::Ordering::Relaxed)
+                }) {
+                    cancelled_by_user = true;
+                    let now = tokio::time::Instant::now();
+                    if cancellation_started.is_none() {
+                        interrupt_shell_process_group(&mut child, false);
+                        cancellation_started = Some(now);
+                    } else if !force_kill_sent
+                        && cancellation_started
+                            .is_some_and(|started| now.duration_since(started) >= Duration::from_millis(750))
+                    {
+                        interrupt_shell_process_group(&mut child, true);
+                        force_kill_sent = true;
+                    }
+                }
+            }
             read = stdout.read(&mut stdout_buffer), if stdout_open => {
                 let bytes_read = read.map_err(|e| e.to_string())?;
                 if bytes_read == 0 {
@@ -764,11 +805,39 @@ async fn execute_bash_inner(
     {
         inputs.remove(call_id);
     }
-    let status = child.wait().await.map_err(|e| e.to_string())?;
-    if status.success() {
+    let status = child_status.ok_or("shell process exited without a status")?;
+    if cancelled_by_user {
+        Err(format!("command cancelled: {output}"))
+    } else if status.success() {
         Ok(output)
     } else {
         Err(format!("command failed: {output}"))
+    }
+}
+
+fn interrupt_shell_process_group(child: &mut tokio::process::Child, force: bool) {
+    #[cfg(unix)]
+    {
+        use nix::{
+            sys::signal::{Signal, kill},
+            unistd::Pid,
+        };
+        if let Some(pid) = child.id() {
+            let pid = pid as i32;
+            let signal = if force {
+                Signal::SIGKILL
+            } else {
+                Signal::SIGINT
+            };
+            if kill(Pid::from_raw(-pid), signal).is_err() {
+                let _ = kill(Pid::from_raw(pid), signal);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = force;
+        let _ = child.start_kill();
     }
 }
 
@@ -996,6 +1065,7 @@ mod tests {
             "printf stdout; printf stderr >&2",
             Some(sender),
             None,
+            None,
         )
         .await
         .expect("command should succeed");
@@ -1021,6 +1091,7 @@ mod tests {
                 r#"read -r answer; printf 'answer=%s\n' "$answer""#,
                 task_call_id,
                 sender,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
             .await
         });
@@ -1042,6 +1113,48 @@ mod tests {
             .expect("shell process should succeed");
         assert!(output.contains("answer=yes"));
         while receiver.try_recv().is_ok() {}
+        assert!(!super::send_interactive_shell_input(
+            &call_id,
+            "late\n".into()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_interactive_shell_terminates_process_group_and_cleans_registry() {
+        let call_id = "catalog-test-cancel-shell".to_owned();
+        let (sender, _receiver) = mpsc::channel(8);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_call_id = call_id.clone();
+        let task_cancelled = cancelled.clone();
+        let execution = tokio::spawn(async move {
+            super::execute_bash_inner(
+                Path::new("."),
+                "sleep 30 & wait",
+                Some(sender),
+                Some(task_call_id),
+                Some(task_cancelled),
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if super::send_interactive_shell_input(&call_id, String::new()) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("interactive shell should register");
+        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), execution)
+            .await
+            .expect("cancellation should stop the process promptly")
+            .expect("shell task should not panic");
+        assert!(result.unwrap_err().contains("command cancelled"));
         assert!(!super::send_interactive_shell_input(
             &call_id,
             "late\n".into()

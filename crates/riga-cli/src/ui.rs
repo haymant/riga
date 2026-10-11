@@ -399,6 +399,9 @@ fn sidebar_panel_lines(
         }
         UiPanel::Catalog => {
             let entries = app.filtered_catalog();
+            if let Some(scope) = &app.catalog_scope {
+                lines.push(sidebar_field("Scope", scope, max_width));
+            }
             lines.push(sidebar_field("Filter", app.catalog_query.text(), max_width));
             lines.push(sidebar_field(
                 "Matches",
@@ -418,21 +421,17 @@ fn sidebar_panel_lines(
         }
         UiPanel::Help => {
             lines.extend([
-                Line::from("Ctrl+I / F1 · Info"),
-                Line::from("Ctrl+H · session history"),
-                Line::from("Ctrl+, / F2 · provider settings"),
-                Line::from("Ctrl+L · local models"),
-                Line::from("Ctrl+K · server catalog"),
-                Line::from("Ctrl+D · RunDeck"),
-                Line::from("/ · tools, skills, MCP"),
-                Line::from("@ · files, subagents"),
-                Line::from("/model · choose remote model"),
-                Line::from("/new · /resume · /rename · /status"),
-                Line::from("v · model choices / RunDeck details"),
-                Line::from("Ctrl+R / Ctrl+T · collapse output"),
-                Line::from("Tab / mouse · focus composer, chat, sidebar"),
-                Line::from("Shift+drag select · Ctrl+C copy · Ctrl+Shift+V paste"),
-                Line::from("+/- · resize sidebar · Esc close · q quit"),
+                Line::from("Ctrl+I / F1 info · F3 history"),
+                Line::from("Ctrl+, / F2 settings · Ctrl+L local models"),
+                Line::from("Ctrl+K catalog · Ctrl+D RunDeck"),
+                Line::from("/model · /new · /resume · /rename · /status"),
+                Line::from("/tools · /mcp · /skills · /settings · /local-models"),
+                Line::from("/quit or /exit · q quit"),
+                Line::from("Ctrl+O shell input · Ctrl+R reasoning · Ctrl+T tools"),
+                Line::from("Ctrl+C stop run · Ctrl+Shift+C copy"),
+                Line::from("Shift+drag select · Ctrl+Shift+V paste"),
+                Line::from("@ · files / agents · Tab/mouse focus · +/- resize"),
+                Line::from("v · details · Esc close/cancel"),
             ]);
         }
     }
@@ -444,13 +443,13 @@ fn sidebar_footer_hints(app: &UiState, panel: UiPanel) -> Vec<String> {
     if app.panel != panel {
         return vec![
             "Tab focus · +/- resize".into(),
-            "Ctrl+H history · Ctrl+I info".into(),
+            "F3 history · Ctrl+I info".into(),
         ];
     }
     match panel {
         UiPanel::History if app.creating_session || app.renaming_session.is_some() => [
             "Enter save · Esc cancel".into(),
-            "Tab chat · Ctrl+H history".into(),
+            "Tab chat · F3 history".into(),
         ]
         .into(),
         UiPanel::History | UiPanel::Transcript => [
@@ -1173,7 +1172,7 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     );
     let selected = active_sidebar_panel(app);
     let entries = [
-        (UiPanel::History, "History     ^H"),
+        (UiPanel::History, "History     F3"),
         (UiPanel::Settings, "Settings    ^,"),
         (UiPanel::LocalModels, "Local models ^L"),
         (UiPanel::Help, "Info        ^I"),
@@ -1442,7 +1441,7 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
         crate::model::UiPanel::Help => (
             "Help",
             vec![Line::from(
-                "Ctrl+I info · Ctrl+H history · Ctrl+,/F2 settings · Ctrl+K catalog · Ctrl+J newline · Ctrl+D RunDeck · Ctrl+L models · Ctrl+O shell stdin · Ctrl+R reasoning · Ctrl+T tools · Tab focus · drag select · Ctrl+C copy · Ctrl+Shift+V paste · +/- sidebar · y/a/n approvals · Esc close/cancel · q quit",
+                "Ctrl+I info · F3 history · Ctrl+,/F2 settings · Ctrl+K catalog · Ctrl+J newline · Ctrl+D RunDeck · Ctrl+L models · Ctrl+O shell stdin · Ctrl+R reasoning · Ctrl+T tools · Ctrl+C stop · Ctrl+Shift+C copy · Ctrl+Shift+V paste · +/- sidebar · y/a/n approvals · Esc close/cancel · q quit",
             )],
         ),
         crate::model::UiPanel::Transcript => unreachable!(),
@@ -2115,9 +2114,9 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
         return;
     }
     let navigation = if area.width < 90 {
-        "Tab focus · Ctrl+I info · Ctrl+H history · / tools · @ files"
+        "Tab focus · Ctrl+I info · F3 history · / tools · @ files"
     } else {
-        "Tab focus · Ctrl+I info · Ctrl+H history · Ctrl+, settings · Ctrl+L models · / tools · @ files"
+        "Tab focus · Ctrl+I info · F3 history · Ctrl+, settings · Ctrl+L models · / tools · @ files"
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -2136,7 +2135,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
             Span::raw(" · "),
             Span::styled(status, Style::default().fg(Color::Cyan)),
             Span::raw(format!(
-                " · {navigation} · Ctrl+O shell stdin · Ctrl+R reasoning · Ctrl+T tools · drag select · Ctrl+C copy · Ctrl+Shift+V paste · +/- sidebar · q quit"
+                " · {navigation} · Ctrl+O shell stdin · Ctrl+R reasoning · Ctrl+T tools · Ctrl+C stop · drag select · Ctrl+Shift+C copy · Ctrl+Shift+V paste · +/- sidebar · q quit"
             )),
         ])),
         area,
@@ -2797,7 +2796,7 @@ mod tests {
             let mut app = UiState::default();
             app.draft.replace("draft remains visible");
 
-            app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+            app.handle_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
             assert_eq!(app.panel, UiPanel::History);
             terminal.draw(|frame| render(frame, &app)).unwrap();
             let history: String = terminal
