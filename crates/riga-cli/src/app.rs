@@ -493,14 +493,7 @@ impl UiState {
                 self.notice = Some("Stopping active run…".into());
                 return Some(UiCommand::CancelRun { run_id });
             }
-            if self.panel == UiPanel::Transcript && !self.draft.is_empty() {
-                self.draft.clear();
-                self.prompt_history_cursor = None;
-                self.refresh_completion();
-                self.notice = Some("Composer cleared; no run was active.".into());
-            } else {
-                self.notice = Some("No active run to stop.".into());
-            }
+            self.notice = Some("No active run to stop.".into());
             return None;
         }
         if self.shell_input_mode {
@@ -2307,7 +2300,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_stops_the_active_run_and_clears_draft_only_when_idle() {
+    fn ctrl_c_stops_the_active_run_and_preserves_draft_when_idle() {
         let mut running = UiState::default();
         running.state.active_run = Some("run-1".into());
         running.busy = Some("Running".into());
@@ -2326,7 +2319,7 @@ mod tests {
             idle.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL,))
                 .is_none()
         );
-        assert!(idle.draft.is_empty());
+        assert_eq!(idle.draft.text(), "unsent draft");
         assert_eq!(idle.panel, UiPanel::Transcript);
     }
 
