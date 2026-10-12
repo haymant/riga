@@ -177,6 +177,7 @@ impl IpcService {
             ),
             title: request.title,
             workspace: request.workspace,
+            archived: false,
             created_at: "now".into(),
             updated_at: "now".into(),
         };
@@ -205,6 +206,75 @@ impl IpcService {
         secure_store::save_json("sessions", &updated).await?;
         *sessions = updated;
         Ok(session)
+    }
+
+    pub async fn set_session_archived(
+        &self,
+        session_id: &str,
+        archived: bool,
+    ) -> Result<Session, String> {
+        self.ensure_sessions_loaded().await?;
+        let mut sessions = self.state.sessions.write().await;
+        let Some(index) = sessions.iter().position(|session| session.id == session_id) else {
+            return Err("session not found".into());
+        };
+        let mut updated = sessions.clone();
+        updated[index].archived = archived;
+        updated[index].updated_at = "now".into();
+        let session = updated[index].clone();
+        secure_store::save_json("sessions", &updated).await?;
+        *sessions = updated;
+        Ok(session)
+    }
+
+    pub async fn delete_session(
+        &self,
+        session_id: &str,
+        confirmation_name: &str,
+    ) -> Result<(), String> {
+        self.ensure_sessions_loaded().await?;
+        if self
+            .list_active_runs()
+            .await
+            .iter()
+            .any(|run| run.session_id == session_id)
+        {
+            return Err("cannot delete a session with an active run".into());
+        }
+
+        let mut sessions = self.state.sessions.write().await;
+        let Some(session) = sessions.iter().find(|session| session.id == session_id) else {
+            return Err("session not found".into());
+        };
+        if session.title != confirmation_name {
+            return Err("session name did not match; nothing was deleted".into());
+        }
+        let original_sessions = sessions.clone();
+        let updated_sessions = sessions
+            .iter()
+            .filter(|session| session.id != session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut transcripts = self.state.transcripts.write().await;
+        let original_transcripts = transcripts.clone();
+        let mut updated_transcripts = original_transcripts.clone();
+        updated_transcripts.remove(session_id);
+
+        remove_session_journals(session_id)?;
+        secure_store::save_json("sessions", &updated_sessions).await?;
+        if let Err(error) = secure_store::save_json("transcripts", &updated_transcripts).await {
+            let rollback = secure_store::save_json("sessions", &original_sessions).await;
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(format!(
+                    "could not save deleted conversation history ({error}); restoring session list also failed ({rollback_error})"
+                )),
+            };
+        }
+        *sessions = updated_sessions;
+        *transcripts = updated_transcripts;
+        Ok(())
     }
 
     pub async fn configure_provider(
@@ -588,6 +658,41 @@ fn run_journal_path(run_id: &str) -> PathBuf {
     secure_store::data_root()
         .join("runs")
         .join(format!("run-{}.json", sanitize_run_id(run_id)))
+}
+
+fn remove_session_journals(session_id: &str) -> Result<(), String> {
+    let runs_dir = secure_store::data_root().join("runs");
+    let entries = match std::fs::read_dir(&runs_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("could not inspect run journals: {error}")),
+    };
+    let mut journals = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("could not inspect run journal: {error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(events) = serde_json::from_slice::<Vec<RigaEventEnvelope>>(&bytes) else {
+            continue;
+        };
+        if events.iter().any(|event| event.session_id == session_id) {
+            journals.push(path);
+        }
+    }
+    for journal in journals {
+        std::fs::remove_file(&journal).map_err(|error| {
+            format!(
+                "could not remove run journal {}: {error}",
+                journal.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn sanitize_run_id(run_id: &str) -> String {

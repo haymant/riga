@@ -23,6 +23,7 @@ export type Health = {
 export type CreateSessionRequest = { title: string; workspace: string };
 export type Session = CreateSessionRequest & {
   id: string;
+  archived?: boolean;
   created_at: string;
   updated_at: string;
 };

@@ -92,6 +92,7 @@ impl Default for ServerState {
                         id: first.session_id.clone(),
                         title: format!("Run {}", first.session_id),
                         workspace: workspace_from_env(),
+                        archived: false,
                         created_at: first.timestamp.clone(),
                         updated_at: events
                             .last()
@@ -218,7 +219,14 @@ pub fn router(state: ServerState) -> Router {
         .route("/mcp/health", post(mcp_health_http))
         .route("/attachments", post(upload_attachment))
         .route("/sessions", get(list_sessions).post(create_session))
-        .route("/sessions/{session_id}", patch(rename_session))
+        .route(
+            "/sessions/{session_id}",
+            patch(rename_session).delete(delete_session),
+        )
+        .route(
+            "/sessions/{session_id}/archive",
+            patch(set_session_archived),
+        )
         .route("/sessions/{session_id}/history", get(session_history))
         .route("/runs/{run_id}/events", get(stream_events))
         .route("/ws", get(ws_upgrade))
@@ -714,6 +722,16 @@ struct RenameSessionRequest {
     title: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SetSessionArchivedRequest {
+    archived: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteSessionRequest {
+    confirm_name: String,
+}
+
 async fn rename_session(
     State(state): State<ServerState>,
     Path(session_id): Path<String>,
@@ -726,6 +744,52 @@ async fn rename_session(
         Ok(session) => Json(session).into_response(),
         Err(error) => {
             let status = if error.contains("title") || error == "session not found" {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({ "error": error }))).into_response()
+        }
+    }
+}
+
+async fn set_session_archived(
+    State(state): State<ServerState>,
+    Path(session_id): Path<String>,
+    Json(request): Json<SetSessionArchivedRequest>,
+) -> impl IntoResponse {
+    match ipc::IpcService::new(state)
+        .set_session_archived(&session_id, request.archived)
+        .await
+    {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => {
+            let status = if error == "session not found" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, Json(serde_json::json!({ "error": error }))).into_response()
+        }
+    }
+}
+
+async fn delete_session(
+    State(state): State<ServerState>,
+    Path(session_id): Path<String>,
+    Json(request): Json<DeleteSessionRequest>,
+) -> impl IntoResponse {
+    match ipc::IpcService::new(state)
+        .delete_session(&session_id, &request.confirm_name)
+        .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => {
+            let status = if error == "session not found" {
+                StatusCode::NOT_FOUND
+            } else if error.starts_with("cannot delete a session with an active run") {
+                StatusCode::CONFLICT
+            } else if error.starts_with("session name did not match") {
                 StatusCode::BAD_REQUEST
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR

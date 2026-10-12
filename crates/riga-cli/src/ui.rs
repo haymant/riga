@@ -188,6 +188,91 @@ fn has_wide_sidebar(area: Rect) -> bool {
     area.width >= 112 && area.height >= 12
 }
 
+pub(crate) fn history_session_index_at(
+    app: &UiState,
+    terminal_width: u16,
+    terminal_height: u16,
+    x: u16,
+    y: u16,
+) -> Option<usize> {
+    if app.creating_session || app.renaming_session.is_some() || app.deleting_session.is_some() {
+        return None;
+    }
+    let screen = Rect::new(0, 0, terminal_width, terminal_height);
+    let (panel_area, show_title) = if has_wide_sidebar(screen) {
+        let sidebar_width = if app.sidebar_width == 0 {
+            34
+        } else {
+            app.sidebar_width.clamp(24, 56)
+        };
+        let sidebar_x = terminal_width.saturating_sub(sidebar_width);
+        if x < sidebar_x || active_sidebar_panel(app) != UiPanel::History {
+            return None;
+        }
+        (
+            Rect {
+                x: sidebar_x,
+                y: 7,
+                width: sidebar_width,
+                height: terminal_height.saturating_sub(7),
+            },
+            true,
+        )
+    } else {
+        if app.panel != UiPanel::History {
+            return None;
+        }
+        let composer = composer_height(app, screen);
+        let height = terminal_height
+            .saturating_sub(composer.saturating_add(3))
+            .min(14);
+        if height < 3 || terminal_width < 8 {
+            return None;
+        }
+        let popup = Rect {
+            x: 1,
+            y: 1,
+            width: terminal_width.saturating_sub(2),
+            height,
+        };
+        let content = Rect {
+            x: popup.x.saturating_add(1),
+            y: popup.y.saturating_add(1),
+            width: popup.width.saturating_sub(2),
+            height: popup.height.saturating_sub(2),
+        };
+        if x < content.x || x >= content.x.saturating_add(content.width) {
+            return None;
+        }
+        (content, false)
+    };
+
+    let footer_height = sidebar_footer_height(app, UiPanel::History, panel_area.height);
+    let editor_height = u16::from(
+        active_panel_editor(app, UiPanel::History).is_some()
+            && panel_area.height > footer_height.saturating_add(1),
+    );
+    let body_height = panel_area
+        .height
+        .saturating_sub(editor_height)
+        .saturating_sub(footer_height);
+    let first_session_row = panel_area
+        .y
+        .saturating_add(u16::from(show_title))
+        .saturating_add(1); // History's Active/Archived sessions heading.
+    if y < first_session_row || y >= panel_area.y.saturating_add(body_height) {
+        return None;
+    }
+    let index = y.saturating_sub(first_session_row) as usize;
+    let visible_count = app
+        .state
+        .sessions
+        .iter()
+        .filter(|session| session.archived == app.history_archived_view)
+        .count();
+    (index < visible_count).then_some(index)
+}
+
 fn active_sidebar_panel(app: &UiState) -> UiPanel {
     if app.panel != UiPanel::Transcript {
         app.panel
@@ -281,7 +366,18 @@ fn sidebar_panel_lines(
     let mut lines = Vec::new();
     match panel {
         UiPanel::History | UiPanel::Transcript => {
-            if app.creating_session {
+            if let Some(session_id) = &app.deleting_session {
+                lines.push(sidebar_section("Permanently delete"));
+                if let Some(session) = app
+                    .state
+                    .sessions
+                    .iter()
+                    .find(|session| &session.id == session_id)
+                {
+                    lines.push(Line::from(fit_sidebar_text(&session.title, max_width)));
+                }
+                lines.push(Line::from("Type the exact name below"));
+            } else if app.creating_session {
                 lines.push(Line::from("New session"));
                 lines.push(Line::from(format!("Title: {}", app.panel_input.text())));
                 lines.push(Line::from(format!(
@@ -292,10 +388,25 @@ fn sidebar_panel_lines(
                 lines.push(Line::from("Rename session"));
                 lines.push(Line::from(app.panel_input.text().to_owned()));
             } else {
-                if app.state.sessions.is_empty() {
-                    lines.push(Line::from("No sessions yet"));
+                lines.push(sidebar_section(if app.history_archived_view {
+                    "Archived sessions"
+                } else {
+                    "Active sessions"
+                }));
+                let sessions = app
+                    .state
+                    .sessions
+                    .iter()
+                    .filter(|session| session.archived == app.history_archived_view)
+                    .collect::<Vec<_>>();
+                if sessions.is_empty() {
+                    lines.push(Line::from(if app.history_archived_view {
+                        "No archived sessions"
+                    } else {
+                        "No active sessions"
+                    }));
                 }
-                for (index, session) in app.state.sessions.iter().enumerate() {
+                for (index, session) in sessions.iter().enumerate() {
                     let selected = if app.panel == UiPanel::History {
                         index == app.panel_cursor
                     } else {
@@ -425,6 +536,7 @@ fn sidebar_panel_lines(
                 Line::from("Ctrl+, / F2 settings · Ctrl+L local models"),
                 Line::from("Ctrl+K catalog · Ctrl+D RunDeck"),
                 Line::from("/model · /new · /resume · /rename · /status"),
+                Line::from("/export [path] · JSONL conversation"),
                 Line::from("/tools · /mcp · /skills · /settings · /local-models"),
                 Line::from("/quit or /exit · q quit"),
                 Line::from("Ctrl+O shell input · Ctrl+R reasoning · Ctrl+T tools"),
@@ -447,12 +559,26 @@ fn sidebar_footer_hints(app: &UiState, panel: UiPanel) -> Vec<String> {
         ];
     }
     match panel {
+        UiPanel::History if app.deleting_session.is_some() => [
+            "Type the exact session name".into(),
+            "Enter delete · Esc cancel".into(),
+        ]
+        .into(),
         UiPanel::History if app.creating_session || app.renaming_session.is_some() => [
             "Enter save · Esc cancel".into(),
             "Tab chat · F3 history".into(),
         ]
         .into(),
-        UiPanel::History | UiPanel::Transcript => [
+        UiPanel::History => vec![
+            "↑/↓ or click · Enter open".into(),
+            "n new · r rename".into(),
+            if app.history_archived_view {
+                "u restore · x delete · v active".into()
+            } else {
+                "a archive · x delete · v archived".into()
+            },
+        ],
+        UiPanel::Transcript => [
             "↑/↓ select · Enter open".into(),
             "n new · r rename · Esc close".into(),
         ]
@@ -1014,6 +1140,9 @@ fn render_rundeck_sidebar(app: &UiState, max_lines: usize, max_width: usize) -> 
 
 fn active_panel_editor(app: &UiState, panel: UiPanel) -> Option<(&'static str, String, usize)> {
     let (label, input, masked) = match panel {
+        UiPanel::History if app.deleting_session.is_some() => {
+            ("Confirm name", &app.panel_input, false)
+        }
         UiPanel::History if app.renaming_session.is_some() => ("Title", &app.panel_input, false),
         UiPanel::History if app.creating_session && app.session_field == 0 => {
             ("Title", &app.panel_input, false)
@@ -1441,7 +1570,7 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
         crate::model::UiPanel::Help => (
             "Help",
             vec![Line::from(
-                "Ctrl+I info · F3 history · Ctrl+,/F2 settings · Ctrl+K catalog · Ctrl+J newline · Ctrl+D RunDeck · Ctrl+L models · Ctrl+O shell stdin · Ctrl+R reasoning · Ctrl+T tools · Ctrl+C stop · Ctrl+Shift+C copy · Ctrl+Shift+V paste · +/- sidebar · y/a/n approvals · Esc close/cancel · q quit",
+                "Ctrl+I info · F3 history · Ctrl+,/F2 settings · Ctrl+K catalog · Ctrl+J newline · Ctrl+D RunDeck · Ctrl+L models · Ctrl+O shell stdin · Ctrl+R reasoning · Ctrl+T tools · Ctrl+C stop · Ctrl+Shift+C copy · Ctrl+Shift+V paste · /export [path] JSONL · +/- sidebar · y/a/n approvals · Esc close/cancel · q quit",
             )],
         ),
         crate::model::UiPanel::Transcript => unreachable!(),
@@ -2516,6 +2645,7 @@ mod tests {
             id: "session-1".into(),
             title: "Design review".into(),
             workspace: ".".into(),
+            archived: false,
             created_at: "now".into(),
             updated_at: "now".into(),
         });
@@ -2655,6 +2785,7 @@ mod tests {
             id: "session-1".into(),
             title: "Build session".into(),
             workspace: ".".into(),
+            archived: false,
             created_at: "now".into(),
             updated_at: "now".into(),
         });

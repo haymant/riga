@@ -47,6 +47,18 @@ pub trait RigaTransport: Clone + Send + Sync + 'static {
         title: String,
     ) -> TransportFuture<Result<Session, String>>;
 
+    fn set_session_archived(
+        &self,
+        session_id: String,
+        archived: bool,
+    ) -> TransportFuture<Result<Session, String>>;
+
+    fn delete_session(
+        &self,
+        session_id: String,
+        confirmation_name: String,
+    ) -> TransportFuture<Result<(), String>>;
+
     fn configure_provider(
         &self,
         config: ProviderConfig,
@@ -117,6 +129,26 @@ impl IpcTransport {
 
     pub async fn rename_session(&self, session_id: &str, title: String) -> Result<Session, String> {
         self.service.rename_session(session_id, title).await
+    }
+
+    pub async fn set_session_archived(
+        &self,
+        session_id: &str,
+        archived: bool,
+    ) -> Result<Session, String> {
+        self.service
+            .set_session_archived(session_id, archived)
+            .await
+    }
+
+    pub async fn delete_session(
+        &self,
+        session_id: &str,
+        confirmation_name: &str,
+    ) -> Result<(), String> {
+        self.service
+            .delete_session(session_id, confirmation_name)
+            .await
     }
 
     pub async fn provider(&self) -> Result<Option<ProviderConfigured>, String> {
@@ -253,6 +285,28 @@ impl RigaTransport for IpcTransport {
     ) -> TransportFuture<Result<Session, String>> {
         let transport = self.clone();
         Box::pin(async move { transport.rename_session(&session_id, title).await })
+    }
+
+    fn set_session_archived(
+        &self,
+        session_id: String,
+        archived: bool,
+    ) -> TransportFuture<Result<Session, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.set_session_archived(&session_id, archived).await })
+    }
+
+    fn delete_session(
+        &self,
+        session_id: String,
+        confirmation_name: String,
+    ) -> TransportFuture<Result<(), String>> {
+        let transport = self.clone();
+        Box::pin(async move {
+            transport
+                .delete_session(&session_id, &confirmation_name)
+                .await
+        })
     }
 
     fn configure_provider(

@@ -55,12 +55,20 @@ async fn main() -> Result<(), String> {
                     .await?,
             );
         }
+        let initial_session = sessions
+            .iter()
+            .find(|session| !session.archived)
+            .or_else(|| sessions.first())
+            .cloned();
+        let history_archived_view = initial_session
+            .as_ref()
+            .is_some_and(|session| session.archived);
         let active_runs = transport.list_active_runs().await;
         let local_models = transport.local_models().await;
         let mut app = app::UiState {
             state: model::AppState {
                 connection: ConnectionState::Connected,
-                selected_session: sessions.first().map(|session| session.id.clone()),
+                selected_session: initial_session.as_ref().map(|session| session.id.clone()),
                 sessions,
                 active_runs,
                 ..model::AppState::default()
@@ -69,6 +77,7 @@ async fn main() -> Result<(), String> {
             reasoning_collapsed: true,
             tools_collapsed: true,
             local_models: Some(local_models),
+            history_archived_view,
             ..app::UiState::default()
         };
         if let Some(session_id) = app.state.selected_session.clone() {
@@ -191,6 +200,7 @@ fn completion_candidates(
     for (command, detail) in [
         ("/model", "Choose or set the active remote model"),
         ("/models", "Alias for /model"),
+        ("/export", "Export the current conversation as JSONL"),
         ("/tools", "Browse built-in tools"),
         ("/mcp", "Browse configured MCP servers and tools"),
         ("/skills", "Browse discovered skills"),
@@ -437,6 +447,7 @@ mod tests {
         assert!(labels.contains(&"/mcp/docs/search"));
         assert!(labels.contains(&"/mcp/riga-health-stdio/health"));
         assert!(labels.contains(&"/model"));
+        assert!(labels.contains(&"/export"));
         assert!(labels.contains(&"/tools"));
         assert!(labels.contains(&"/mcp"));
         assert!(labels.contains(&"/skills"));

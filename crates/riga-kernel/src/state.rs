@@ -70,6 +70,8 @@ pub struct Session {
     pub id: String,
     pub title: String,
     pub workspace: String,
+    #[serde(default)]
+    pub archived: bool,
     pub created_at: String,
     pub updated_at: String,
 }

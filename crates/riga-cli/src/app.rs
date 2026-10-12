@@ -8,7 +8,11 @@ use crate::{
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +42,14 @@ pub enum UiCommand {
         session_id: String,
         title: String,
     },
+    SetSessionArchived {
+        session_id: String,
+        archived: bool,
+    },
+    DeleteSession {
+        session_id: String,
+        confirmation_name: String,
+    },
     SaveProvider {
         config: riga_server::ws::ProviderConfig,
     },
@@ -60,6 +72,11 @@ pub enum UiCommand {
     SendShellInput {
         call_id: String,
         text: String,
+    },
+    ExportConversation {
+        path: PathBuf,
+        jsonl: String,
+        record_count: usize,
     },
     Quit,
 }
@@ -90,6 +107,8 @@ pub struct UiState {
     pub workspace_input: TextBuffer,
     pub creating_session: bool,
     pub renaming_session: Option<String>,
+    pub deleting_session: Option<String>,
+    pub history_archived_view: bool,
     pub session_field: usize,
     pub provider: ProviderForm,
     pub provider_field: usize,
@@ -177,6 +196,29 @@ impl UiState {
             })
             .collect();
         self.jump_to_bottom();
+    }
+
+    fn conversation_export_items(&self) -> Vec<TranscriptItem> {
+        let mut items = self.state.session_history.clone();
+        if let Some(prompt) = &self.current_prompt {
+            items.push(TranscriptItem::UserText(prompt.clone()));
+        }
+        if let Some(run_id) = self.state.active_run.as_deref()
+            && let Some(run) = self.state.run(run_id)
+            && self.state.selected_session.as_deref() == Some(run.session_id.as_str())
+        {
+            items.extend(run.transcript.clone());
+        }
+        items
+    }
+
+    fn visible_history_sessions(&self) -> Vec<riga_kernel::state::Session> {
+        self.state
+            .sessions
+            .iter()
+            .filter(|session| session.archived == self.history_archived_view)
+            .cloned()
+            .collect()
     }
 
     fn navigate_prompt_history(&mut self, down: bool) -> bool {
@@ -314,9 +356,26 @@ impl UiState {
         }
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent, terminal_width: u16, terminal_height: u16) {
+    pub fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        terminal_width: u16,
+        terminal_height: u16,
+    ) -> Option<UiCommand> {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(index) = crate::ui::history_session_index_at(
+                    self,
+                    terminal_width,
+                    terminal_height,
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    self.panel = UiPanel::History;
+                    self.panel_cursor = index;
+                    return self
+                        .handle_panel_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
                 let wide_sidebar = terminal_width >= 112 && terminal_height >= 12;
                 let sidebar_width = if self.sidebar_width == 0 {
                     34
@@ -396,6 +455,7 @@ impl UiState {
             }
             _ => {}
         }
+        None
     }
 
     fn show_sidebar_panel(&mut self, panel: UiPanel) {
@@ -434,6 +494,9 @@ impl UiState {
             return;
         }
         match self.panel {
+            UiPanel::History if self.deleting_session.is_some() => {
+                self.panel_input.insert_str(text)
+            }
             UiPanel::History if self.creating_session && self.session_field == 1 => {
                 self.workspace_input.insert_str(text)
             }
@@ -973,10 +1036,41 @@ impl UiState {
             self.transcript_focused = false;
             self.creating_session = false;
             self.renaming_session = None;
+            self.deleting_session = None;
+            self.panel_input.clear();
             return None;
         }
         match self.panel {
             UiPanel::History => {
+                if let Some(session_id) = self.deleting_session.clone() {
+                    if key.code == KeyCode::Enter {
+                        let Some(session) = self
+                            .state
+                            .sessions
+                            .iter()
+                            .find(|session| session.id == session_id)
+                        else {
+                            self.deleting_session = None;
+                            self.panel_input.clear();
+                            self.notice = Some("The session no longer exists.".into());
+                            return None;
+                        };
+                        if self.panel_input.text() == session.title {
+                            let confirmation_name = self.panel_input.text().to_owned();
+                            self.deleting_session = None;
+                            self.panel_input.clear();
+                            return Some(UiCommand::DeleteSession {
+                                session_id,
+                                confirmation_name,
+                            });
+                        }
+                        self.notice =
+                            Some("Session name did not match; nothing was deleted.".into());
+                        return None;
+                    }
+                    let _ = self.panel_input.handle_key(key);
+                    return None;
+                }
                 if let Some(session_id) = self.renaming_session.clone() {
                     if key.code == KeyCode::Enter && !self.panel_input.is_empty() {
                         self.renaming_session = None;
@@ -1016,7 +1110,43 @@ impl UiState {
                         self.panel_cursor = self
                             .panel_cursor
                             .saturating_add(1)
-                            .min(self.state.sessions.len().saturating_sub(1))
+                            .min(self.visible_history_sessions().len().saturating_sub(1))
+                    }
+                    KeyCode::Char('v') => {
+                        self.history_archived_view = !self.history_archived_view;
+                        self.panel_cursor = 0;
+                    }
+                    KeyCode::Char('a') if !self.history_archived_view => {
+                        if let Some(session) =
+                            self.visible_history_sessions().get(self.panel_cursor)
+                        {
+                            return Some(UiCommand::SetSessionArchived {
+                                session_id: session.id.clone(),
+                                archived: true,
+                            });
+                        }
+                    }
+                    KeyCode::Char('u') if self.history_archived_view => {
+                        if let Some(session) =
+                            self.visible_history_sessions().get(self.panel_cursor)
+                        {
+                            return Some(UiCommand::SetSessionArchived {
+                                session_id: session.id.clone(),
+                                archived: false,
+                            });
+                        }
+                    }
+                    KeyCode::Char('x') => {
+                        if let Some(session) =
+                            self.visible_history_sessions().get(self.panel_cursor)
+                        {
+                            self.deleting_session = Some(session.id.clone());
+                            self.panel_input.clear();
+                            self.notice = Some(format!(
+                                "Type the exact session name {:?} to permanently delete it.",
+                                session.title
+                            ));
+                        }
                     }
                     KeyCode::Char('n') => {
                         self.creating_session = true;
@@ -1026,7 +1156,9 @@ impl UiState {
                         self.session_field = 0;
                     }
                     KeyCode::Char('r') => {
-                        if let Some(session) = self.state.sessions.get(self.panel_cursor) {
+                        if let Some(session) =
+                            self.visible_history_sessions().get(self.panel_cursor)
+                        {
                             self.renaming_session = Some(session.id.clone());
                             self.panel_input.clear();
                             for character in session.title.chars() {
@@ -1035,7 +1167,10 @@ impl UiState {
                         }
                     }
                     KeyCode::Enter => {
-                        if let Some(session) = self.state.sessions.get(self.panel_cursor) {
+                        if let Some(session) =
+                            self.visible_history_sessions().get(self.panel_cursor)
+                        {
+                            self.last_sidebar_panel = Some(UiPanel::History);
                             self.panel = UiPanel::Transcript;
                             return Some(UiCommand::SelectSession {
                                 session_id: session.id.clone(),
@@ -1383,6 +1518,24 @@ impl UiState {
                     config: self.provider.to_config(),
                 })
             }
+            "/export" => {
+                let items = self.conversation_export_items();
+                let session_id = self.state.selected_session.clone();
+                let session_title = session_id.as_deref().and_then(|session_id| {
+                    self.state
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .map(|session| session.title.clone())
+                });
+                let jsonl =
+                    conversation_jsonl(&items, session_id.as_deref(), session_title.as_deref());
+                SlashCommandResult::Execute(UiCommand::ExportConversation {
+                    path: jsonl_export_path(&arguments),
+                    jsonl,
+                    record_count: items.len(),
+                })
+            }
             "/new" | "/clear" => {
                 if self.state.active_run.is_some() || self.busy.is_some() {
                     self.notice = Some(
@@ -1542,6 +1695,133 @@ impl UiState {
     }
 }
 
+fn conversation_jsonl(
+    items: &[TranscriptItem],
+    session_id: Option<&str>,
+    session_title: Option<&str>,
+) -> String {
+    let mut records = Vec::with_capacity(items.len() + 1);
+    records.push(serde_json::json!({
+        "type": "conversation",
+        "format": "riga-jsonl-v1",
+        "session_id": session_id,
+        "session_title": session_title,
+    }));
+    for item in items {
+        records.push(match item {
+            TranscriptItem::UserText(content) => {
+                serde_json::json!({ "type": "message", "role": "user", "content": content })
+            }
+            TranscriptItem::AssistantText(content) => {
+                serde_json::json!({ "type": "message", "role": "assistant", "content": content })
+            }
+            TranscriptItem::AssistantReasoning(content) => {
+                serde_json::json!({ "type": "reasoning", "content": content })
+            }
+            TranscriptItem::ToolCall {
+                call_id,
+                tool,
+                call,
+            } => serde_json::json!({
+                "type": "tool_call",
+                "call_id": call_id,
+                "tool": tool,
+                "arguments": call,
+            }),
+            TranscriptItem::ToolOutput { call_id, output } => serde_json::json!({
+                "type": "tool_output",
+                "call_id": call_id,
+                "output": output,
+            }),
+            TranscriptItem::ToolResult { call_id, result } => serde_json::json!({
+                "type": "tool_result",
+                "call_id": call_id,
+                "result": result,
+            }),
+            TranscriptItem::TaskResult {
+                task_id,
+                ok,
+                result,
+            } => serde_json::json!({
+                "type": "task_result",
+                "task_id": task_id,
+                "ok": ok,
+                "result": result,
+            }),
+            TranscriptItem::Approval {
+                approval_id,
+                tool,
+                summary,
+            } => serde_json::json!({
+                "type": "approval",
+                "approval_id": approval_id,
+                "tool": tool,
+                "summary": summary,
+            }),
+            TranscriptItem::System(content) => {
+                serde_json::json!({ "type": "message", "role": "system", "content": content })
+            }
+        });
+    }
+    let mut jsonl = records
+        .iter()
+        .map(|record| serde_json::to_string(record).unwrap_or_else(|_| "{}".into()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    jsonl.push('\n');
+    jsonl
+}
+
+fn jsonl_export_path(argument: &str) -> PathBuf {
+    let supplied = argument.trim();
+    let supplied = supplied
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            supplied
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(supplied);
+    let mut path = if supplied.is_empty() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(format!("riga-conversation-{stamp}.jsonl"))
+    } else {
+        PathBuf::from(supplied)
+    };
+    if path.extension().is_none() {
+        path.set_extension("jsonl");
+    }
+    path
+}
+
+async fn write_jsonl_export(path: &Path, jsonl: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Err(error) = file.write_all(jsonl.as_bytes()).await {
+        drop(file);
+        let _ = tokio::fs::remove_file(path).await;
+        return Err(error.to_string());
+    }
+    file.flush().await.map_err(|error| error.to_string())
+}
+
 fn session_title_from_response(response: &str) -> Option<String> {
     let line = response
         .lines()
@@ -1574,6 +1854,7 @@ fn is_native_slash_command(prompt: &str) -> bool {
         prompt.split_whitespace().next().unwrap_or_default(),
         "/model"
             | "/models"
+            | "/export"
             | "/tools"
             | "/mcp"
             | "/skills"
@@ -1804,7 +2085,17 @@ pub async fn run_with_transport<T: RigaTransport>(
             match event::read().map_err(|error| error.to_string())? {
                 Event::Mouse(mouse) => {
                     let size = terminal.size().map_err(|error| error.to_string())?;
-                    app.handle_mouse(mouse, size.width, size.height);
+                    if let Some(UiCommand::SelectSession { session_id }) =
+                        app.handle_mouse(mouse, size.width, size.height)
+                    {
+                        app.set_session_history(
+                            transport.session_history(session_id.clone()).await,
+                        );
+                        app.state.selected_session = Some(session_id);
+                        app.state.active_run = None;
+                        app.current_prompt = None;
+                        events = None;
+                    }
                 }
                 Event::Paste(text) => {
                     app.handle_paste(&text);
@@ -1901,6 +2192,7 @@ pub async fn run_with_transport<T: RigaTransport>(
                             app.state.selected_session = Some(session_id);
                             app.state.active_run = None;
                             app.current_prompt = None;
+                            events = None;
                         }
                         UiCommand::CreateSession { title, workspace } => {
                             let session = transport
@@ -1931,6 +2223,102 @@ pub async fn run_with_transport<T: RigaTransport>(
                                 }
                                 Err(error) => {
                                     app.notice = Some(format!("Could not rename session: {error}"))
+                                }
+                            }
+                        }
+                        UiCommand::SetSessionArchived {
+                            session_id,
+                            archived,
+                        } => {
+                            match transport
+                                .set_session_archived(session_id.clone(), archived)
+                                .await
+                            {
+                                Ok(session) => {
+                                    if let Some(existing) = app
+                                        .state
+                                        .sessions
+                                        .iter_mut()
+                                        .find(|existing| existing.id == session_id)
+                                    {
+                                        *existing = session;
+                                    }
+                                    app.panel_cursor = app.panel_cursor.min(
+                                        app.visible_history_sessions().len().saturating_sub(1),
+                                    );
+                                    app.notice = Some(if archived {
+                                        "Session archived. Press v to browse archived sessions."
+                                            .into()
+                                    } else {
+                                        "Session restored to active history.".into()
+                                    });
+                                }
+                                Err(error) => {
+                                    app.notice = Some(format!("Could not update session: {error}"));
+                                }
+                            }
+                        }
+                        UiCommand::DeleteSession {
+                            session_id,
+                            confirmation_name,
+                        } => {
+                            let deleted = app
+                                .state
+                                .sessions
+                                .iter()
+                                .find(|session| session.id == session_id)
+                                .cloned();
+                            match transport
+                                .delete_session(session_id.clone(), confirmation_name)
+                                .await
+                            {
+                                Ok(()) => {
+                                    app.state
+                                        .sessions
+                                        .retain(|session| session.id != session_id);
+                                    app.panel_cursor = app.panel_cursor.min(
+                                        app.visible_history_sessions().len().saturating_sub(1),
+                                    );
+                                    if app.state.selected_session.as_deref()
+                                        == Some(session_id.as_str())
+                                    {
+                                        let replacement = app
+                                            .state
+                                            .sessions
+                                            .iter()
+                                            .find(|session| !session.archived)
+                                            .or_else(|| app.state.sessions.first())
+                                            .cloned();
+                                        if let Some(session) = replacement {
+                                            app.history_archived_view = session.archived;
+                                            app.state.selected_session = Some(session.id.clone());
+                                            app.set_session_history(
+                                                transport.session_history(session.id.clone()).await,
+                                            );
+                                        } else {
+                                            let workspace = deleted
+                                                .as_ref()
+                                                .map(|session| session.workspace.clone())
+                                                .unwrap_or_else(|| ".".into());
+                                            let session = transport
+                                                .create_session(riga_server::CreateSessionRequest {
+                                                    title: "New session".into(),
+                                                    workspace,
+                                                })
+                                                .await?;
+                                            app.state.selected_session = Some(session.id.clone());
+                                            app.state.sessions.push(session);
+                                            app.history_archived_view = false;
+                                            app.set_session_history(Vec::new());
+                                        }
+                                        app.state.active_run = None;
+                                        app.current_prompt = None;
+                                        events = None;
+                                    }
+                                    app.notice = Some("Session permanently deleted.".into());
+                                }
+                                Err(error) => {
+                                    app.notice = Some(format!("Could not delete session: {error}"));
                                 }
                             }
                         }
@@ -2050,6 +2438,24 @@ pub async fn run_with_transport<T: RigaTransport>(
                                 }
                             }
                         }
+                        UiCommand::ExportConversation {
+                            path,
+                            jsonl,
+                            record_count,
+                        } => match write_jsonl_export(&path, &jsonl).await {
+                            Ok(()) => {
+                                app.notice = Some(format!(
+                                    "Exported {record_count} conversation records to {}.",
+                                    path.display()
+                                ));
+                            }
+                            Err(error) => {
+                                app.notice = Some(format!(
+                                    "Could not export conversation to {}: {error}",
+                                    path.display()
+                                ));
+                            }
+                        },
                         UiCommand::Quit => break,
                     }
                 }
@@ -2140,6 +2546,95 @@ mod tests {
     }
 
     #[test]
+    fn export_jsonl_contains_only_the_open_conversation() {
+        let mut app = UiState::default();
+        app.state.selected_session = Some("open-session".into());
+        app.state.sessions.extend([
+            riga_kernel::state::Session {
+                id: "open-session".into(),
+                title: "Open conversation".into(),
+                workspace: ".".into(),
+                archived: false,
+                created_at: "now".into(),
+                updated_at: "now".into(),
+            },
+            riga_kernel::state::Session {
+                id: "other-session".into(),
+                title: "Do not export".into(),
+                workspace: ".".into(),
+                archived: false,
+                created_at: "now".into(),
+                updated_at: "now".into(),
+            },
+        ]);
+        app.set_session_history(vec![
+            riga_server::ws::ConversationTurn {
+                role: "user".into(),
+                content: "question from current session".into(),
+            },
+            riga_server::ws::ConversationTurn {
+                role: "assistant".into(),
+                content: "answer from current session".into(),
+            },
+        ]);
+        app.set_completion_candidates(vec![CompletionItem {
+            trigger: '/',
+            category: "Commands".into(),
+            label: "/export".into(),
+            detail: "Export this conversation as JSONL".into(),
+            insert_text: "/export".into(),
+        }]);
+
+        let command = submit_text(&mut app, "/export current.jsonl");
+        let Some(UiCommand::ExportConversation {
+            path,
+            jsonl,
+            record_count,
+        }) = command
+        else {
+            panic!("/export should produce a JSONL export command");
+        };
+        assert_eq!(path, PathBuf::from("current.jsonl"));
+        assert_eq!(record_count, 2);
+        let records = jsonl
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["type"], "conversation");
+        assert_eq!(records[0]["session_id"], "open-session");
+        assert_eq!(records[0]["session_title"], "Open conversation");
+        assert_eq!(records[1]["content"], "question from current session");
+        assert_eq!(records[2]["content"], "answer from current session");
+        assert!(!jsonl.contains("Do not export"));
+    }
+
+    #[tokio::test]
+    async fn jsonl_export_creates_new_file_without_overwriting_existing_data() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "riga-cli-export-{}-{stamp}.jsonl",
+            std::process::id()
+        ));
+        write_jsonl_export(&path, "{\"type\":\"conversation\"}\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "{\"type\":\"conversation\"}\n"
+        );
+        assert!(write_jsonl_export(&path, "replacement\n").await.is_err());
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "{\"type\":\"conversation\"}\n"
+        );
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[test]
     fn remote_model_picker_filters_and_selects_the_active_provider_model() {
         let mut app = UiState {
             panel: UiPanel::Settings,
@@ -2165,6 +2660,7 @@ mod tests {
             id: "session-1".into(),
             title: "Current".into(),
             workspace: "/project".into(),
+            archived: false,
             created_at: "now".into(),
             updated_at: "now".into(),
         });
@@ -2414,6 +2910,7 @@ mod tests {
             id: "session-1".into(),
             title: "Old".into(),
             workspace: ".".into(),
+            archived: false,
             created_at: "now".into(),
             updated_at: "now".into(),
         });
@@ -2430,6 +2927,98 @@ mod tests {
             Some(UiCommand::RenameSession {
                 session_id: "session-1".into(),
                 title: "Renamed".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn history_archives_restores_and_filters_sessions() {
+        let mut app = UiState {
+            panel: UiPanel::History,
+            ..UiState::default()
+        };
+        app.state.sessions.extend([
+            riga_kernel::state::Session {
+                id: "active-session".into(),
+                title: "Active".into(),
+                workspace: ".".into(),
+                archived: false,
+                created_at: "now".into(),
+                updated_at: "now".into(),
+            },
+            riga_kernel::state::Session {
+                id: "archived-session".into(),
+                title: "Archived".into(),
+                workspace: ".".into(),
+                archived: true,
+                created_at: "now".into(),
+                updated_at: "now".into(),
+            },
+        ]);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Some(UiCommand::SetSessionArchived {
+                session_id: "active-session".into(),
+                archived: true,
+            })
+        );
+
+        // Simulate the server's successful archive response before changing views.
+        app.state.sessions[0].archived = true;
+        app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+        assert!(app.history_archived_view);
+        assert_eq!(
+            app.visible_history_sessions()
+                .iter()
+                .map(|session| session.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Active", "Archived"]
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+            Some(UiCommand::SetSessionArchived {
+                session_id: "active-session".into(),
+                archived: false,
+            })
+        );
+    }
+
+    #[test]
+    fn session_deletion_requires_an_exact_name_match() {
+        let mut app = UiState {
+            panel: UiPanel::History,
+            ..UiState::default()
+        };
+        app.state.sessions.push(riga_kernel::state::Session {
+            id: "protected-session".into(),
+            title: "Exact Session Name".into(),
+            workspace: ".".into(),
+            archived: false,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        for character in "wrong name".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_none()
+        );
+        assert_eq!(app.state.sessions.len(), 1);
+        assert!(app.deleting_session.is_some());
+
+        for _ in 0.."wrong name".chars().count() {
+            app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for character in "Exact Session Name".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(UiCommand::DeleteSession {
+                session_id: "protected-session".into(),
+                confirmation_name: "Exact Session Name".into(),
             })
         );
     }
@@ -2618,6 +3207,37 @@ mod tests {
         );
         assert_eq!(app.panel, UiPanel::Transcript);
         assert_eq!(app.last_sidebar_panel, Some(UiPanel::Help));
+    }
+
+    #[test]
+    fn mouse_clicking_a_history_session_opens_it() {
+        let mut app = UiState::default();
+        app.state.sessions.push(riga_kernel::state::Session {
+            id: "clicked-session".into(),
+            title: "Clicked session".into(),
+            workspace: ".".into(),
+            archived: false,
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        });
+
+        assert_eq!(
+            app.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 90,
+                    row: 9,
+                    modifiers: KeyModifiers::NONE,
+                },
+                120,
+                40,
+            ),
+            Some(UiCommand::SelectSession {
+                session_id: "clicked-session".into(),
+            })
+        );
+        assert_eq!(app.panel, UiPanel::Transcript);
+        assert_eq!(app.last_sidebar_panel, Some(UiPanel::History));
     }
 
     #[test]

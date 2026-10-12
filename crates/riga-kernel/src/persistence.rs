@@ -167,6 +167,7 @@ mod tests {
             id: id.into(),
             title: "Test".into(),
             workspace: "/workspace".into(),
+            archived: false,
             created_at: "now".into(),
             updated_at: "now".into(),
         }
