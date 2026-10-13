@@ -1,9 +1,50 @@
 import { timingSafeEqual, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { ResponseStateStore } from "./state.js";
-import type { OpenAIError, OpenAIModel, OpenAIResponse, OpenCodeClient, OpenCodeProvider } from "./protocol.js";
+import type {
+  OpenAIError,
+  OpenAIModel,
+  OpenAIResponse,
+  OpenCodeApprovalReply,
+  OpenCodeApprovalRequest,
+  OpenCodeClient,
+  OpenCodeProvider,
+  OpenCodeStreamEvent,
+} from "./protocol.js";
 
 const BODY_LIMIT_BYTES = 10 * 1024 * 1024;
+/** How long an OpenCode permission/question may wait for a client answer. */
+const APPROVAL_TIMEOUT_MS = 15 * 60 * 1000;
+
+/**
+ * Tracks in-flight OpenCode permission/question requests. The streaming client
+ * sees `response.riga.approval.requested` and answers with a separate
+ * `POST /v1/approvals/{id}`; the pending prompt resumes with that reply.
+ */
+class ApprovalRegistry {
+  private readonly pending = new Map<string, (reply: OpenCodeApprovalReply) => void>();
+
+  create(): { id: string; reply: Promise<OpenCodeApprovalReply> } {
+    const id = `approval-${randomUUID()}`;
+    let settle!: (reply: OpenCodeApprovalReply) => void;
+    const reply = new Promise<OpenCodeApprovalReply>((resolve) => { settle = resolve; });
+    const timer = setTimeout(() => { this.resolve(id, "reject"); }, APPROVAL_TIMEOUT_MS);
+    timer.unref?.();
+    this.pending.set(id, (value) => {
+      clearTimeout(timer);
+      settle(value);
+    });
+    return { id, reply };
+  }
+
+  resolve(id: string, reply: OpenCodeApprovalReply): boolean {
+    const settle = this.pending.get(id);
+    if (!settle) return false;
+    this.pending.delete(id);
+    settle(reply);
+    return true;
+  }
+}
 
 type ResponseRequest = {
   model?: unknown;
@@ -26,9 +67,10 @@ type Prompt = { text: string; system?: string };
 export function createResponseApiServer(client: OpenCodeClient, options: ResponseApiOptions = {}): Server {
   const store = new ResponseStateStore(options.statePath);
   const sessionQueues = new Map<string, Promise<void>>();
+  const approvals = new ApprovalRegistry();
 
   return createServer((request, response) => {
-    void handleRequest(request, response, client, store, sessionQueues, options.apiKey)
+    void handleRequest(request, response, client, store, sessionQueues, approvals, options.apiKey)
       .catch((error: unknown) => {
         if (response.headersSent) {
           response.end();
@@ -45,6 +87,7 @@ async function handleRequest(
   client: OpenCodeClient,
   store: ResponseStateStore,
   sessionQueues: Map<string, Promise<void>>,
+  approvals: ApprovalRegistry,
   apiKey?: string,
 ): Promise<void> {
   const url = new URL(request.url ?? "/", "http://localhost");
@@ -52,6 +95,15 @@ async function handleRequest(
     sendError(response, 401, "Invalid or missing bearer token.", "authentication_error", undefined, "invalid_api_key");
     return;
   }
+
+  // Abort in-flight upstream work when the caller goes away so a stalled turn
+  // does not hold the per-session queue for subsequent requests.
+  const controller = new AbortController();
+  const onDisconnect = () => {
+    if (!response.writableFinished) controller.abort();
+  };
+  request.once("aborted", onDisconnect);
+  response.once("close", onDisconnect);
 
   if (request.method === "GET" && url.pathname === "/health") {
     sendJson(response, 200, { status: "ok", adapter: "riga-opencode" });
@@ -72,6 +124,24 @@ async function handleRequest(
       return;
     }
     sendJson(response, 200, saved);
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname.startsWith("/v1/approvals/")) {
+    const approvalId = decodeURIComponent(url.pathname.slice("/v1/approvals/".length));
+    let decision: { reply?: unknown };
+    try {
+      decision = await readJson(request) as { reply?: unknown };
+    } catch (error) {
+      sendError(response, 400, errorMessage(error), "invalid_request_error", "reply", "invalid_json");
+      return;
+    }
+    if (!approvals.resolve(approvalId, normalizeApprovalReply(decision.reply))) {
+      sendError(response, 404, `Approval '${approvalId}' is not pending.`, "invalid_request_error", "reply", "not_found");
+      return;
+    }
+    response.writeHead(204);
+    response.end();
     return;
   }
 
@@ -125,6 +195,11 @@ async function handleRequest(
     return;
   }
 
+  if (body.stream === true) {
+    await streamResponse(response, client, store, sessionQueues, approvals, controller, model, prompt, sessionId);
+    return;
+  }
+
   try {
     const result = unwrapSdkResult(await withSessionQueue(sessionQueues, sessionId, () => client.session.prompt({
       path: { id: sessionId },
@@ -133,18 +208,168 @@ async function handleRequest(
         parts: [{ type: "text", text: prompt.text }],
         ...(prompt.system ? { system: prompt.system } : {}),
       },
+      signal: controller.signal,
     })));
     const outputText = extractAssistantText(result);
     const responseObject = makeResponse(result, outputText, model.fullID, sessionId);
     await store.recordResponse(responseObject);
-    if (body.stream === true) {
-      sendBufferedStream(response, responseObject);
-    } else {
-      sendJson(response, 200, responseObject);
-    }
+    sendJson(response, 200, responseObject);
   } catch (error) {
     sendError(response, 502, errorMessage(error), "server_error", undefined, "upstream_error");
   }
+}
+
+/**
+ * Stream one turn as Responses SSE. Text, reasoning, and tool activity are
+ * forwarded as OpenCode produces them, so a long tool-using turn is visible
+ * instead of buffered. OpenCode permission/question requests become
+ * `response.riga.approval.requested` frames answered through
+ * `POST /v1/approvals/{id}`, which resumes the pending prompt.
+ */
+async function streamResponse(
+  response: ServerResponse,
+  client: OpenCodeClient,
+  store: ResponseStateStore,
+  sessionQueues: Map<string, Promise<void>>,
+  approvals: ApprovalRegistry,
+  controller: AbortController,
+  model: ResolvedModel,
+  prompt: Prompt,
+  sessionId: string,
+): Promise<void> {
+  response.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  });
+  const pending = {
+    id: sessionId,
+    object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "in_progress",
+    model: model.fullID,
+    conversation: { id: sessionId },
+    output: [],
+    output_text: "",
+  };
+  writeEvent(response, "response.created", { type: "response.created", response: pending });
+  writeEvent(response, "response.in_progress", { type: "response.in_progress", response: pending });
+
+  let streamedText = "";
+  const toolNames = new Map<string, string>();
+  const write = (event: string, data: unknown): void => {
+    if (!response.writableEnded && !response.destroyed) writeEvent(response, event, data);
+  };
+  const onEvent = (event: OpenCodeStreamEvent): void => {
+    switch (event.type) {
+      case "text":
+        streamedText += event.delta;
+        write("response.output_text.delta", { type: "response.output_text.delta", delta: event.delta });
+        break;
+      case "reasoning":
+        write("response.riga.reasoning.delta", { type: "response.riga.reasoning.delta", delta: event.delta });
+        break;
+      case "tool_started":
+        toolNames.set(event.callId, event.tool);
+        write("response.riga.tool_call.started", {
+          type: "response.riga.tool_call.started",
+          call_id: event.callId,
+          name: event.tool,
+          arguments: event.input,
+        });
+        break;
+      case "tool_finished":
+        write("response.riga.tool_call.finished", {
+          type: "response.riga.tool_call.finished",
+          call_id: event.callId,
+          name: event.tool || toolNames.get(event.callId) || "tool",
+          ok: event.ok,
+          output: event.output,
+        });
+        break;
+    }
+  };
+  const onApproval = (approval: OpenCodeApprovalRequest): Promise<OpenCodeApprovalReply> => {
+    const summary = approval.kind === "permission"
+      ? `${approval.action}${approval.resources.length ? ` ${approval.resources.join(" ")}` : ""}`
+      : approval.kind === "form"
+        ? formSummary(approval.form)
+        : "OpenCode is asking a question";
+    const pendingApproval = approvals.create();
+    write("response.riga.approval.requested", {
+      type: "response.riga.approval.requested",
+      approval_id: pendingApproval.id,
+      tool: approval.kind === "permission" ? approval.action : approval.kind,
+      summary,
+      kind: approval.kind,
+      ...(approval.kind === "question" ? { questions: approval.questions } : {}),
+    });
+    return pendingApproval.reply;
+  };
+
+  try {
+    const result = unwrapSdkResult(await withSessionQueue(sessionQueues, sessionId, () => client.session.prompt({
+      path: { id: sessionId },
+      body: {
+        model: { providerID: model.providerID, modelID: model.modelID },
+        parts: [{ type: "text", text: prompt.text }],
+        ...(prompt.system ? { system: prompt.system } : {}),
+      },
+      signal: controller.signal,
+      onEvent,
+      onApproval,
+    })));
+    const finalText = extractAssistantText(result);
+    // Prefer what was actually streamed: a multi-step turn can emit prose
+    // between tool calls, and the client has already seen all of it.
+    const outputText = streamedText.length > 0 ? streamedText : finalText;
+    const responseObject = makeResponse(result, outputText, model.fullID, sessionId);
+    await store.recordResponse(responseObject);
+    if (outputText.length > 0) {
+      // A provider that reported no incremental text still needs one delta.
+      if (streamedText.length === 0) {
+        write("response.output_text.delta", { type: "response.output_text.delta", delta: outputText });
+      }
+      write("response.output_text.done", {
+        type: "response.output_text.done",
+        item_id: responseObject.output[0]?.id,
+        output_index: 0,
+        content_index: 0,
+        text: outputText,
+      });
+    }
+    write("response.completed", { type: "response.completed", response: responseObject });
+  } catch (error) {
+    write("response.failed", {
+      type: "response.failed",
+      response: {
+        id: sessionId,
+        object: "response",
+        status: "failed",
+        model: model.fullID,
+        error: { message: errorMessage(error), type: "server_error", code: "upstream_error" },
+      },
+    });
+  } finally {
+    if (!response.writableEnded) response.end();
+  }
+}
+
+function normalizeApprovalReply(value: unknown): OpenCodeApprovalReply {
+  return value === "once" || value === "always" ? value : "reject";
+}
+
+/** A one-line description of a form (the modern `question` tool). */
+function formSummary(form: unknown): string {
+  if (!form || typeof form !== "object") return "OpenCode is asking for input";
+  const record = form as { title?: unknown; fields?: unknown };
+  const title = typeof record.title === "string" && record.title.trim()
+    ? record.title.trim()
+    : "OpenCode is asking for input";
+  const count = record.fields && typeof record.fields === "object"
+    ? Object.keys(record.fields as Record<string, unknown>).length
+    : 0;
+  return count > 0 ? `${title} (${count} field${count === 1 ? "" : "s"})` : title;
 }
 
 function authorized(request: IncomingMessage, expected: string): boolean {
@@ -155,8 +380,12 @@ function authorized(request: IncomingMessage, expected: string): boolean {
   return actual.length === wanted.length && timingSafeEqual(actual, wanted);
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function listModels(client: OpenCodeClient): Promise<OpenAIModel[]> {
-  const providers = await listProviders(client);
+  const providers = await settleCatalog(client, hasModels);
   return providers
     .flatMap((provider: OpenCodeProvider) => Object.values(provider.models ?? {}).map((model) => ({
       id: `${provider.id}/${model.id}`,
@@ -176,29 +405,64 @@ async function listProviders(client: OpenCodeClient): Promise<OpenCodeProvider[]
   return (catalog as { providers: OpenCodeProvider[] }).providers;
 }
 
-async function resolveModel(client: OpenCodeClient, modelValue: unknown): Promise<ResolvedModel> {
-  if (typeof modelValue !== "string" || !modelValue.trim()) {
-    throw new RequestValidationError("model is required and must be a provider/model ID.", "model", "model_required");
-  }
-  const providers = await listProviders(client);
-  const fullID = modelValue.trim();
+const CATALOG_POLL_MS = 150;
+const CATALOG_TIMEOUT_MS = 30_000;
+
+function hasModels(providers: OpenCodeProvider[]): boolean {
+  return providers.some((provider) => Object.keys(provider.models ?? {}).length > 0);
+}
+
+/** The provider/model match for a `provider/model` (or bare `model`) id. */
+function matchModel(
+  providers: OpenCodeProvider[],
+  fullID: string,
+): { provider: OpenCodeProvider; model: { id: string } } | undefined {
   const separator = fullID.indexOf("/");
-  let matches: Array<{ provider: OpenCodeProvider; model: { id: string } }> = [];
   if (separator > 0) {
     const providerID = fullID.slice(0, separator);
     const modelID = fullID.slice(separator + 1);
     const provider = providers.find((candidate) => candidate.id === providerID);
-    const model = provider?.models?.[modelID] ?? Object.values(provider?.models ?? {}).find((candidate) => candidate.id === modelID);
-    if (provider && model) matches = [{ provider, model }];
-  } else {
-    matches = providers.flatMap((provider) => Object.values(provider.models ?? {})
-      .filter((candidate) => candidate.id === fullID)
-      .map((candidate) => ({ provider, model: candidate })));
+    const model = provider?.models?.[modelID]
+      ?? Object.values(provider?.models ?? {}).find((candidate) => candidate.id === modelID);
+    return provider && model ? { provider, model } : undefined;
   }
-  if (matches.length !== 1) {
+  const matches = providers.flatMap((provider) => Object.values(provider.models ?? {})
+    .filter((candidate) => candidate.id === fullID)
+    .map((model) => ({ provider, model })));
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+/**
+ * Read the provider catalog, tolerating OpenCode's cold-start behavior: the
+ * first read triggers the upstream provider/model load and returns the
+ * pre-settlement (often empty) snapshot, while later reads include it. Retry
+ * until the predicate holds or the catalog is non-empty; an upstream error is
+ * surfaced rather than retried.
+ */
+async function settleCatalog(
+  client: OpenCodeClient,
+  ready: (providers: OpenCodeProvider[]) => boolean,
+): Promise<OpenCodeProvider[]> {
+  const deadline = Date.now() + CATALOG_TIMEOUT_MS;
+  for (;;) {
+    const providers = await listProviders(client);
+    if (ready(providers) || providers.length > 0 || Date.now() >= deadline) {
+      return providers;
+    }
+    await delay(CATALOG_POLL_MS);
+  }
+}
+
+async function resolveModel(client: OpenCodeClient, modelValue: unknown): Promise<ResolvedModel> {
+  if (typeof modelValue !== "string" || !modelValue.trim()) {
+    throw new RequestValidationError("model is required and must be a provider/model ID.", "model", "model_required");
+  }
+  const fullID = modelValue.trim();
+  const providers = await settleCatalog(client, (list) => matchModel(list, fullID) !== undefined);
+  const match = matchModel(providers, fullID);
+  if (!match) {
     throw new RequestValidationError(`Model '${fullID}' is not available. Use a model ID returned by GET /v1/models.`, "model", "model_not_found");
   }
-  const match = matches[0]!;
   return { providerID: match.provider.id, modelID: match.model.id, fullID: `${match.provider.id}/${match.model.id}` };
 }
 
@@ -358,29 +622,6 @@ async function withSessionQueue<T>(queues: Map<string, Promise<void>>, sessionId
   }
 }
 
-function sendBufferedStream(response: ServerResponse, value: OpenAIResponse): void {
-  response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
-  const message = value.output[0]!;
-  const content = message.content[0]!;
-  const pending = { ...value, status: "in_progress" as const, output: [] };
-  writeEvent(response, "response.created", { type: "response.created", response: pending });
-  writeEvent(response, "response.in_progress", { type: "response.in_progress", response: pending });
-  const partialMessage = { ...message, status: "in_progress" as const, content: [] };
-  writeEvent(response, "response.output_item.added", { type: "response.output_item.added", output_index: 0, item: partialMessage });
-  writeEvent(response, "response.content_part.added", { type: "response.content_part.added", item_id: message.id, output_index: 0, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
-  const chunks = Array.from(content.text).reduce<string[]>((all, character, index) => {
-    const chunkIndex = Math.floor(index / 48);
-    all[chunkIndex] = (all[chunkIndex] ?? "") + character;
-    return all;
-  }, []);
-  for (const delta of chunks) writeEvent(response, "response.output_text.delta", { type: "response.output_text.delta", item_id: message.id, output_index: 0, content_index: 0, delta });
-  writeEvent(response, "response.output_text.done", { type: "response.output_text.done", item_id: message.id, output_index: 0, content_index: 0, text: content.text });
-  writeEvent(response, "response.content_part.done", { type: "response.content_part.done", item_id: message.id, output_index: 0, content_index: 0, part: content });
-  writeEvent(response, "response.output_item.done", { type: "response.output_item.done", output_index: 0, item: message });
-  writeEvent(response, "response.completed", { type: "response.completed", response: value });
-  response.end();
-}
-
 function writeEvent(response: ServerResponse, event: string, data: unknown): void {
   response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
@@ -400,6 +641,7 @@ async function readJson(request: IncomingMessage): Promise<ResponseRequest> {
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
+  if (response.writableEnded || response.destroyed) return;
   response.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(body));
 }

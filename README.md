@@ -246,9 +246,10 @@ Set `RIGA_TOKEN` to the encryption secret used by the server-side store. Use a d
 ### OpenCode Responses API adapter
 
 `packages/opencode` is a standalone TypeScript server that uses the official
-[`@opencode-ai/sdk`](https://opencode.ai/docs/sdk/) to start OpenCode and expose
-its configured providers through an OpenAI Responses-compatible API. Install and
-configure the OpenCode CLI first, then from the repository root run:
+[`@opencode-ai/sdk`](https://opencode.ai/docs/sdk/) (`@opencode-ai/sdk/v2`) to
+start OpenCode and expose its configured providers through an OpenAI
+Responses-compatible API. Install and configure the OpenCode CLI first, then
+from the repository root run:
 
 ```bash
 npm install
@@ -260,7 +261,9 @@ starts the OpenCode server on `127.0.0.1:4096`. Build and run the compiled
 package with `npm run build --workspace @rigai/opencode` followed by
 `npm run start --workspace @rigai/opencode`. To connect to an OpenCode server
 that is already running instead, set `OPENCODE_BASE_URL` and the adapter will
-attach through `createOpencodeClient` rather than spawning another server.
+attach rather than spawning another server. OpenCode v2 requires HTTP Basic
+authentication, so also set `OPENCODE_PASSWORD` (the server password) when
+attaching; the adapter authenticates as user `opencode`.
 
 The adapter implements `GET /v1/models`, `POST /v1/responses`, and
 `GET /v1/responses/{id}`. Model IDs use OpenCode's `provider/model` convention.
@@ -282,10 +285,27 @@ for that provider registration it omits the ID, seeds the new session with any
 RIGA transcript history, then saves the returned ID. Deleting a RIGA session
 removes its local mappings but does not delete provider-side sessions.
 
-The adapter currently accepts text input and returns text; OpenCode tool
-execution remains inside its session. `stream: true` returns Responses SSE events
-after the SDK's completed prompt result (the SDK call itself is buffered, not
-token-streamed).
+The adapter accepts text input and returns text; OpenCode tool execution remains
+inside its session. `stream: true` now streams as OpenCode works: assistant text
+arrives as `response.output_text.delta`, reasoning as
+`response.riga.reasoning.delta`, and tool activity as
+`response.riga.tool_call.started` / `response.riga.tool_call.finished`, so a long
+tool-using turn is visible instead of arriving as one buffered blob.
+
+OpenCode's human-in-the-loop prompts are forwarded too. OpenCode's built-in
+`build` agent allows every tool by default, so when the adapter launches its own
+OpenCode server it ships a default `OPENCODE_CONFIG_CONTENT` that asks for
+`shell` and `edit`; RIGA's approval card is therefore the gate for those
+mutations instead of them running silently. When OpenCode asks, the stream emits
+`response.riga.approval.requested`; the client answers with
+`POST /v1/approvals/{id}` and a JSON body of `{"reply":"once"|"always"|"reject"}`,
+which resumes the waiting turn. OpenCode's `form` tool (its interactive-question
+mechanism) uses the same round trip: approving selects each field's first option
+or boolean default, and rejecting cancels the form.
+
+Set `OPENCODE_CONFIG_CONTENT` to override the default permission rules, and set
+`OPENCODE_BASE_URL` to attach to an existing server (the adapter cannot inject
+permissions into a server it did not start, so that server's own rules apply).
 
 Set `RIGA_OPENCODE_HOST` / `RIGA_OPENCODE_PORT` to change the API bind address;
 `OPENCODE_HOST` / `OPENCODE_PORT` configure the SDK-launched OpenCode server.

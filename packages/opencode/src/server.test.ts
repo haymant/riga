@@ -224,4 +224,157 @@ describe("OpenCode Responses API adapter", () => {
     expect(text).toContain("event: response.output_text.delta");
     expect(text).toContain("event: response.completed");
   });
+
+  it("streams incremental text and tool activity instead of buffering the turn", async () => {
+    const client = {
+      config: {
+        providers: async () => ({
+          providers: [{ id: "provider-a", name: "Provider A", models: { "model-x": { id: "model-x", name: "Model X" } } }],
+        }),
+      },
+      session: {
+        create: async () => ({ id: "session-stream" }),
+        prompt: async (args: Parameters<OpenCodeClient["session"]["prompt"]>[0]) => {
+          await args.onEvent?.({ type: "reasoning", delta: "thinking" });
+          await args.onEvent?.({ type: "tool_started", callId: "call-1", tool: "bash", input: { command: "ls" } });
+          await args.onEvent?.({ type: "tool_finished", callId: "call-1", tool: "bash", ok: true, output: "file.txt\n" });
+          await args.onEvent?.({ type: "text", delta: "Hello " });
+          await args.onEvent?.({ type: "text", delta: "world" });
+          return { info: { id: "message-1", tokens: { input: 3, output: 2 } }, parts: [{ type: "text", text: "Hello world" }] };
+        },
+      },
+    } as unknown as OpenCodeClient;
+    const { baseUrl } = await startServer(client);
+    const streamed = await postResponse(baseUrl, { model: "provider-a/model-x", input: "hi", stream: true });
+    expect(streamed.status).toBe(200);
+    const frames = await readSse(streamed);
+    const events = frames.map((frame) => frame.event);
+    expect(events).toContain("response.created");
+    expect(events).toContain("response.riga.reasoning.delta");
+    expect(events).toContain("response.riga.tool_call.started");
+    expect(events).toContain("response.riga.tool_call.finished");
+    expect(events.filter((event) => event === "response.output_text.delta")).toHaveLength(2);
+    expect(frames.find((frame) => frame.event === "response.riga.tool_call.started")?.data)
+      .toMatchObject({ call_id: "call-1", name: "bash" });
+    const completed = frames.find((frame) => frame.event === "response.completed")?.data as { response: { output_text: string } };
+    expect(completed.response.output_text).toBe("Hello world");
+  });
+
+  it("forwards an OpenCode permission request and resumes with the client's decision", async () => {
+    let decision: string | undefined;
+    const client = {
+      config: {
+        providers: async () => ({
+          providers: [{ id: "provider-a", name: "Provider A", models: { "model-x": { id: "model-x", name: "Model X" } } }],
+        }),
+      },
+      session: {
+        create: async () => ({ id: "session-approval" }),
+        prompt: async (args: Parameters<OpenCodeClient["session"]["prompt"]>[0]) => {
+          decision = await args.onApproval?.({ kind: "permission", requestId: "req-1", action: "bash", resources: ["rm -rf build"] });
+          return { info: { id: "message-1", tokens: {} }, parts: [{ type: "text", text: decision === "once" ? "approved" : "denied" }] };
+        },
+      },
+    } as unknown as OpenCodeClient;
+    const { baseUrl } = await startServer(client);
+    const streamed = await postResponse(baseUrl, { model: "provider-a/model-x", input: "clean", stream: true });
+    const reader = streamed.body!.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let approvalId: string | undefined;
+    let completedText: string | undefined;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const frame = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        boundary = buffer.indexOf("\n\n");
+        const parsed = parseSseFrame(frame);
+        if (parsed?.event === "response.riga.approval.requested") {
+          approvalId = (parsed.data as { approval_id: string }).approval_id;
+          const reply = await fetch(`${baseUrl}/v1/approvals/${encodeURIComponent(approvalId)}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ reply: "once" }),
+          });
+          expect(reply.status).toBe(204);
+        } else if (parsed?.event === "response.completed") {
+          completedText = (parsed.data as { response: { output_text: string } }).response.output_text;
+        }
+      }
+    }
+    expect(approvalId).toBeDefined();
+    expect(decision).toBe("once");
+    expect(completedText).toBe("approved");
+  });
+
+  it("retries a cold first catalog read instead of returning an empty response", async () => {
+    let calls = 0;
+    const providers = [{ id: "provider-a", name: "Provider A", models: { "model-x": { id: "model-x", name: "Model X" } } }];
+    const client = {
+      config: {
+        providers: async () => {
+          calls += 1;
+          // The first read triggers OpenCode's load and returns the pre-settlement snapshot.
+          return { providers: calls === 1 ? [] : providers };
+        },
+      },
+      session: {
+        create: async () => ({ id: "session-cold" }),
+        prompt: async () => ({ info: { id: "message-1", tokens: {} }, parts: [{ type: "text", text: "ok" }] }),
+      },
+    } as unknown as OpenCodeClient;
+    const { baseUrl } = await startServer(client);
+
+    const catalog = await fetch(`${baseUrl}/v1/models`);
+    expect(catalog.status).toBe(200);
+    expect((await catalog.json() as { data: Array<{ id: string }> }).data.map(({ id }) => id))
+      .toEqual(["provider-a/model-x"]);
+    expect(calls).toBeGreaterThan(1);
+
+    const response = await postResponse(baseUrl, { model: "provider-a/model-x", input: "hello" });
+    expect(response.status).toBe(200);
+    expect((await response.json() as { output_text: string }).output_text).toBe("ok");
+  });
+
+  it("surfaces a provider catalog error immediately instead of retrying it", async () => {
+    const { client: rawClient } = fakeClient();
+    let calls = 0;
+    const client = {
+      ...rawClient,
+      config: {
+        providers: async () => {
+          calls += 1;
+          return { data: undefined, error: { message: "OpenCode is unavailable" } };
+        },
+      },
+    } as unknown as OpenCodeClient;
+    const { baseUrl } = await startServer(client);
+    const response = await postResponse(baseUrl, { model: "provider-a/model-x", input: "hello" });
+    expect(response.status).toBe(502);
+    expect(calls).toBe(1);
+  });
 });
+
+type SseFrame = { event: string; data: unknown };
+
+function parseSseFrame(frame: string): SseFrame | undefined {
+  const eventLine = frame.split("\n").find((line) => line.startsWith("event: "));
+  const dataLine = frame.split("\n").find((line) => line.startsWith("data: "));
+  if (!eventLine || !dataLine) return undefined;
+  return {
+    event: eventLine.slice("event: ".length),
+    data: JSON.parse(dataLine.slice("data: ".length)) as unknown,
+  };
+}
+
+async function readSse(response: Response): Promise<SseFrame[]> {
+  const text = await response.text();
+  return text
+    .split("\n\n")
+    .map(parseSseFrame)
+    .filter((frame): frame is SseFrame => frame !== undefined);
+}

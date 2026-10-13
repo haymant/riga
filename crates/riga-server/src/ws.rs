@@ -102,6 +102,9 @@ struct RunEvidence {
     /// the loop that spawned it. Carrying it here rather than as another
     /// parameter keeps the dozens of loop call sites unchanged.
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Fires when `cancelled` is set, so a run blocked on an in-flight provider
+    /// request can observe the stop and drop the request.
+    cancel_notify: std::sync::Arc<tokio::sync::Notify>,
     graph: std::sync::Arc<tokio::sync::Mutex<GraphRuntime>>,
     /// Run-scoped local-model budget, adjusted by `set_model_budget`.
     budget: std::sync::Arc<tokio::sync::Mutex<crate::local_model::LocalBudget>>,
@@ -134,9 +137,13 @@ struct GraphRuntime {
 }
 
 impl RunEvidence {
-    fn with_cancel(cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+    fn with_cancel(
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        cancel_notify: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Self {
         Self {
             cancelled,
+            cancel_notify,
             ..Self::default()
         }
     }
@@ -176,6 +183,24 @@ impl RunEvidence {
 
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Resolves when the run is cancelled, including a cancel that already
+    /// happened. Used to race an in-flight provider request so a stop drops the
+    /// request instead of waiting for it to finish.
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.cancel_notify.notified();
+        tokio::pin!(notified);
+        // Register the waiter before re-checking, so a `notify_waiters` between
+        // the check and the await cannot be lost.
+        let _ = notified.as_mut().enable();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
     }
 
     fn graph(&self) -> std::sync::Arc<tokio::sync::Mutex<GraphRuntime>> {
@@ -317,6 +342,9 @@ pub(crate) struct RunHandle {
     pub(crate) events: tokio::sync::broadcast::Sender<RigaEventEnvelope>,
     /// Set on `CancelRun`; the event loops poll it, including mid-decode.
     pub(crate) cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Wakes the run when `cancel` is set, so a stop interrupts an in-flight
+    /// provider request instead of only being noticed between turns.
+    pub(crate) cancel_notify: std::sync::Arc<tokio::sync::Notify>,
     /// Whether this run uses the (single) local engine, so a second local run
     /// can be refused with a clear message instead of blocking on the mutex.
     pub(crate) local: bool,
@@ -665,6 +693,11 @@ fn claims_work(text: &str) -> bool {
 /// annotated instead. Two gives the model a chance to recover from a mistaken
 /// summary without letting it loop on one.
 const MAX_CLAIM_NUDGES: usize = 2;
+
+/// Total budget for one Responses API turn. OpenCode runs a multi-step tool loop
+/// behind a single request and can pause on a permission prompt, so this is much
+/// longer than a plain model call.
+const RESPONSES_REQUEST_TIMEOUT_SECS: u64 = 1800;
 
 const CLAIM_NUDGE: &str = "You reported changes, but no successful file write or command was recorded in this run. \
 Use the `write` or `bash` tool to actually make the change now, or correct your answer to state that nothing was changed. \
@@ -1056,6 +1089,7 @@ async fn forward_run<S>(
                                     handle
                                         .cancel
                                         .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    handle.cancel_notify.notify_waiters();
                                 }
                                 let _ = send(sender, ServerMessage::RunCancelled { run_id }).await;
                             }
@@ -1104,7 +1138,7 @@ pub(crate) async fn start_ipc_run(
         trim_history(guard.get(&session_id).map(Vec::as_slice).unwrap_or(&[]))
     };
     let run_root = crate::workspace::ensure_worktree(&workspace_root, &session_id).await?;
-    let (events, cancel) = {
+    let (events, cancel, cancel_notify) = {
         let mut guard = runs.lock().await;
         if guard.contains_key(&run_id) {
             return Err("That run is already in progress.".into());
@@ -1114,16 +1148,18 @@ pub(crate) async fn start_ipc_run(
         }
         let (events, _) = tokio::sync::broadcast::channel::<RigaEventEnvelope>(RUN_EVENT_BUFFER);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_notify = std::sync::Arc::new(tokio::sync::Notify::new());
         guard.insert(
             run_id.clone(),
             RunHandle {
                 session_id: session_id.clone(),
                 events: events.clone(),
                 cancel: cancel.clone(),
+                cancel_notify: cancel_notify.clone(),
                 local: config.is_local(),
             },
         );
-        (events, cancel)
+        (events, cancel, cancel_notify)
     };
     let receiver = events.subscribe();
     // Bring prior lessons from this session back into context, so a retry does
@@ -1153,7 +1189,7 @@ pub(crate) async fn start_ipc_run(
     let runs_task = runs.clone();
     let events_task = events.clone();
     tokio::spawn(async move {
-        let evidence = RunEvidence::with_cancel(cancel);
+        let evidence = RunEvidence::with_cancel(cancel, cancel_notify);
         let mut channel = RunChannel::new(&run_id_task, &session_id_task, events_task);
         let output = run_provider(
             &mut channel,
@@ -1366,6 +1402,7 @@ pub(crate) async fn upgrade(
                             handle
                                 .cancel
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
+                            handle.cancel_notify.notify_waiters();
                         }
                         let _ = send(&mut sender, ServerMessage::RunCancelled { run_id }).await;
                     }
@@ -1507,7 +1544,7 @@ pub(crate) async fn upgrade(
                         // races the first frame still finds it, and refuse a
                         // duplicate id or a second local run (there is one engine,
                         // so the second would only block on its mutex).
-                        let (events, cancel) = {
+                        let (events, cancel, cancel_notify) = {
                             let mut guard = runs.lock().await;
                             if guard.contains_key(&run_id) {
                                 drop(guard);
@@ -1538,16 +1575,18 @@ pub(crate) async fn upgrade(
                             );
                             let cancel =
                                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let cancel_notify = std::sync::Arc::new(tokio::sync::Notify::new());
                             guard.insert(
                                 run_id.clone(),
                                 RunHandle {
                                     session_id: session_id.clone(),
                                     events: events.clone(),
                                     cancel: cancel.clone(),
+                                    cancel_notify: cancel_notify.clone(),
                                     local: config.is_local(),
                                 },
                             );
-                            (events, cancel)
+                            (events, cancel, cancel_notify)
                         };
                         // Subscribe before spawning so the run's opening frames are
                         // buffered for this socket rather than lost.
@@ -1581,7 +1620,7 @@ pub(crate) async fn upgrade(
                             let runs_task = runs.clone();
                             let events_task = events.clone();
                             tokio::spawn(async move {
-                                let evidence = RunEvidence::with_cancel(cancel);
+                                let evidence = RunEvidence::with_cancel(cancel, cancel_notify);
                                 let mut channel =
                                     RunChannel::new(&run_id_task, &session_id_task, events_task);
                                 let output = run_provider(
@@ -2422,6 +2461,13 @@ async fn run_provider(
                     channel.emit_trace(trace);
                 }
             }
+            // A stop must interrupt an in-flight provider request, not just the
+            // next turn. Breaking drops `provider_call`, which closes the HTTP
+            // stream so an external agent host (for example the OpenCode adapter)
+            // interrupts its session instead of thinking on after the user stops.
+            _ = evidence.cancelled() => {
+                break Err("run cancelled".into());
+            }
             result = &mut provider_call => break result,
         }
     };
@@ -2582,6 +2628,7 @@ async fn call_openai_compatible(
                 mcp_runtime,
                 trace_sender,
                 history,
+                broker,
                 evidence,
             )
             .await
@@ -3203,6 +3250,7 @@ async fn dispatch_subagent(
                     mcp_runtime,
                     trace_sender.clone(),
                     &[],
+                    broker,
                     evidence,
                 ))
                 .await
@@ -4357,6 +4405,7 @@ async fn call_responses_api(
     mcp_runtime: &McpRuntime,
     trace_sender: mpsc::Sender<ToolTraceEvent>,
     history: &[ConversationTurn],
+    broker: &ApprovalBroker,
     evidence: &RunEvidence,
 ) -> Result<AgentResult, String> {
     let provider_registration_id = provider_registration_id(config);
@@ -4385,10 +4434,23 @@ async fn call_responses_api(
         "medium" | "high" => config.reasoning_effort.as_str(),
         _ => "low",
     };
+    // OpenCode can spend minutes on a multi-step tool loop and may also pause on
+    // a human-in-the-loop prompt, so the total request budget must cover a whole
+    // turn, not just a single model call.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(
+            RESPONSES_REQUEST_TIMEOUT_SECS,
+        ))
         .build()
         .map_err(|e| e.to_string())?;
+    // Approval replies go to `{base}/approvals/{id}` on the same adapter, where
+    // `base` is the provider endpoint without its `/responses` suffix.
+    let approvals_base = config
+        .endpoint
+        .trim_end_matches('/')
+        .strip_suffix("/responses")
+        .unwrap_or(config.endpoint.trim_end_matches('/'))
+        .to_string();
     // If this RIGA session already has a provider session, the provider owns
     // the earlier turns; send only this turn with previous_response_id. On a
     // fresh provider session, seed it with RIGA's stored transcript.
@@ -4439,7 +4501,15 @@ async fn call_responses_api(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.contains("text/event-stream"));
         let response: serde_json::Value = if streaming {
-            read_responses_stream(response, &trace_sender, evidence).await?
+            read_responses_stream(
+                response,
+                &trace_sender,
+                evidence,
+                broker,
+                &approvals_base,
+                &config.api_key,
+            )
+            .await?
         } else {
             let raw = response.text().await.map_err(|e| e.to_string())?;
             serde_json::from_str(&raw)
@@ -4542,6 +4612,9 @@ async fn read_responses_stream(
     response: reqwest::Response,
     trace_sender: &mpsc::Sender<ToolTraceEvent>,
     evidence: &RunEvidence,
+    broker: &ApprovalBroker,
+    approvals_base: &str,
+    api_key: &str,
 ) -> Result<serde_json::Value, String> {
     let mut chunks = response.bytes_stream();
     let mut buffer = String::new();
@@ -4578,6 +4651,97 @@ async fn read_responses_stream(
                             .await;
                     }
                 }
+                Some("response.riga.tool_call.started") => {
+                    let name = value
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("tool")
+                        .to_owned();
+                    let call = serde_json::json!({
+                        "call_id": value
+                            .get("call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("riga-tool"),
+                        "name": name,
+                        "arguments": value
+                            .get("arguments")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({})),
+                        "task_id": serde_json::Value::Null,
+                    });
+                    let _ = trace_sender.send(ToolTraceEvent::Started(call)).await;
+                }
+                Some("response.riga.tool_call.finished") => {
+                    let name = value
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("tool")
+                        .to_owned();
+                    let ok = value
+                        .get("ok")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let output = value
+                        .get("output")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    // Remote tools run inside the provider, but they still count
+                    // as this run's work: recording them keeps the verification
+                    // guard from flagging a reply that really did change files or
+                    // run commands.
+                    evidence.record(&name, ok);
+                    evidence
+                        .record_outcome(trace_sender, &name, ok, &output, None, false)
+                        .await;
+                    let call = serde_json::json!({
+                        "call_id": value
+                            .get("call_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("riga-tool"),
+                        "name": name,
+                        "arguments": serde_json::json!({}),
+                        "task_id": serde_json::Value::Null,
+                    });
+                    let trace = ToolTrace {
+                        call,
+                        name,
+                        output,
+                        ok,
+                    };
+                    let _ = trace_sender.send(ToolTraceEvent::Completed(trace)).await;
+                }
+                Some("response.riga.approval.requested") => {
+                    let approval_id = value
+                        .get("approval_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let tool = value
+                        .get("tool")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("tool")
+                        .to_owned();
+                    let summary = value
+                        .get("summary")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("The provider is waiting for approval")
+                        .to_owned();
+                    if approval_id.is_empty() {
+                        continue;
+                    }
+                    // Surface the provider's prompt through the same approval
+                    // card as a local tool, then hand the decision back to the
+                    // adapter so the pending OpenCode turn can resume.
+                    let reply =
+                        request_approval(broker, trace_sender, &approval_id, &tool, &summary).await;
+                    let decision = if reply.approved {
+                        if reply.always { "always" } else { "once" }
+                    } else {
+                        "reject"
+                    };
+                    post_approval_reply(approvals_base, api_key, &approval_id, decision).await;
+                }
                 Some("response.completed") => {
                     completed = value.get("response").cloned();
                     break 'stream;
@@ -4604,6 +4768,28 @@ async fn read_responses_stream(
         return Err(format!("provider Responses API failed: {message}"));
     }
     completed.ok_or_else(|| "provider Responses stream ended without a response".to_owned())
+}
+
+/// Hand a human's approval decision back to the Responses adapter so the
+/// OpenCode turn waiting on `POST .../approvals/{id}` can resume. Best effort:
+/// if the reply cannot be delivered, the adapter's own timeout rejects it.
+async fn post_approval_reply(base: &str, api_key: &str, approval_id: &str, reply: &str) {
+    let url = format!("{}/approvals/{}", base.trim_end_matches('/'), approval_id);
+    let Ok(client) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    else {
+        return;
+    };
+    let mut request = client
+        .post(&url)
+        .json(&serde_json::json!({ "reply": reply }));
+    if !api_key.trim().is_empty() {
+        request = request.bearer_auth(api_key);
+    }
+    if let Err(error) = request.send().await {
+        tracing::warn!(%error, %approval_id, "could not deliver provider approval reply");
+    }
 }
 
 fn extract_response_text(response: &serde_json::Value) -> Result<String, String> {
@@ -5049,9 +5235,10 @@ fn run_journal_path(run_id: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientMessage, ParsedToolCall, ProviderApi, ProviderConfig, ProviderKind, ProviderType,
-        ServerMessage, builtin_tool_definitions, is_record_only_tool, local_tool_instructions,
-        parse_local_tool_calls, provider_registration_id, resolve_run_provider, responses_input,
+        ApprovalBroker, ClientMessage, ParsedToolCall, ProviderApi, ProviderConfig, ProviderKind,
+        ProviderType, RunEvidence, ServerMessage, ToolTraceEvent, builtin_tool_definitions,
+        is_record_only_tool, local_tool_instructions, parse_local_tool_calls,
+        provider_registration_id, read_responses_stream, resolve_run_provider, responses_input,
         strip_reasoning,
     };
     use riga_kernel::events::RigaEvent;
@@ -6394,13 +6581,48 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let parent = super::RunEvidence::with_cancel(cancel.clone());
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let parent = super::RunEvidence::with_cancel(cancel.clone(), notify);
         // A subagent gets a clone; cancelling the run must reach it too.
         let child = parent.clone();
         assert!(!child.is_cancelled());
         cancel.store(true, Ordering::Relaxed);
         assert!(parent.is_cancelled());
         assert!(child.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_notification_wakes_an_awaiting_run() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let evidence = super::RunEvidence::with_cancel(cancel.clone(), notify.clone());
+        let waiter = evidence.clone();
+        let task = tokio::spawn(async move { waiter.cancelled().await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!task.is_finished(), "the run should still be waiting");
+
+        cancel.store(true, Ordering::Relaxed);
+        notify.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("cancel notification should wake the waiter")
+            .expect("waiter task panicked");
+    }
+
+    #[tokio::test]
+    async fn a_cancel_that_already_happened_does_not_block() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let cancel = Arc::new(AtomicBool::new(true));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let evidence = super::RunEvidence::with_cancel(cancel, notify);
+        tokio::time::timeout(std::time::Duration::from_secs(1), evidence.cancelled())
+            .await
+            .expect("an already-cancelled run must not wait");
     }
 
     #[test]
@@ -6803,5 +7025,85 @@ mod tests {
             lessons.iter().any(|(fact, _)| fact.contains("build")),
             "{lessons:?}"
         );
+    }
+
+    /// A minimal one-shot HTTP server that answers any request with a fixed SSE
+    /// body, so the Responses stream reader can be exercised without a provider.
+    fn spawn_sse_server(body: String) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{address}/responses")
+    }
+
+    #[tokio::test]
+    async fn responses_stream_forwards_remote_tool_activity_and_counts_it_as_work() {
+        let body = concat!(
+            "event: response.output_text.delta\r\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\r\n\r\n",
+            "event: response.riga.tool_call.started\r\n",
+            "data: {\"type\":\"response.riga.tool_call.started\",\"call_id\":\"c1\",\"name\":\"write\",\"arguments\":{\"path\":\"a.txt\"}}\r\n\r\n",
+            "event: response.riga.tool_call.finished\r\n",
+            "data: {\"type\":\"response.riga.tool_call.finished\",\"call_id\":\"c1\",\"name\":\"write\",\"ok\":true,\"output\":\"wrote a.txt\"}\r\n\r\n",
+            "event: response.completed\r\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output_text\":\"done\"}}\r\n\r\n",
+        )
+        .to_string();
+        let url = spawn_sse_server(body);
+        let response = reqwest::Client::new().get(url).send().await.unwrap();
+
+        let (sender, mut receiver) = mpsc::channel(16);
+        let evidence = RunEvidence::default();
+        let broker = ApprovalBroker::default();
+        let completed = read_responses_stream(
+            response,
+            &sender,
+            &evidence,
+            &broker,
+            "http://127.0.0.1:1",
+            "",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            completed
+                .get("output_text")
+                .and_then(|value| value.as_str()),
+            Some("done")
+        );
+        assert!(evidence.has_work(), "a remote write must count as run work");
+
+        drop(sender);
+        let mut started = 0;
+        let mut finished = 0;
+        let mut text = String::new();
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                ToolTraceEvent::Started(_) => started += 1,
+                ToolTraceEvent::Completed(trace) => {
+                    finished += 1;
+                    assert_eq!(trace.name, "write");
+                    assert!(trace.ok);
+                }
+                ToolTraceEvent::Ui(RigaEvent::TextDelta { delta }) => text.push_str(&delta),
+                _ => {}
+            }
+        }
+        assert_eq!(started, 1);
+        assert_eq!(finished, 1);
+        assert_eq!(text, "done");
     }
 }

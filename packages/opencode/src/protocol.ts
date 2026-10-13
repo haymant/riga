@@ -18,20 +18,47 @@ export type OpenCodeSdkResult<T> = T | {
   response?: unknown;
 };
 
+/**
+ * Incremental progress emitted while an OpenCode turn runs. The Responses
+ * adapter forwards these to its caller so a long tool-using turn is visible
+ * instead of arriving as one silent, buffered blob.
+ */
+export type OpenCodeStreamEvent =
+  | { type: "text"; delta: string }
+  | { type: "reasoning"; delta: string }
+  | { type: "tool_started"; callId: string; tool: string; input: unknown }
+  | { type: "tool_finished"; callId: string; tool: string; ok: boolean; output: string };
+
+/** A human-in-the-loop request OpenCode raised and is waiting on. */
+export type OpenCodeApprovalRequest =
+  | { kind: "permission"; requestId: string; action: string; resources: string[] }
+  | { kind: "question"; requestId: string; questions: unknown }
+  | { kind: "form"; requestId: string; form: unknown };
+
+/** The caller's decision for a permission request or a question. */
+export type OpenCodeApprovalReply = "once" | "always" | "reject";
+
+export type OpenCodePromptArgs = {
+  path: { id: string };
+  body: {
+    model: { providerID: string; modelID: string };
+    parts: Array<{ type: "text"; text: string }>;
+    system?: string;
+  };
+  signal?: AbortSignal;
+  /** Called as stream events arrive; awaited so ordering is preserved. */
+  onEvent?(event: OpenCodeStreamEvent): void | Promise<void>;
+  /** Called for a permission/question request; resolves once a client answers. */
+  onApproval?(request: OpenCodeApprovalRequest): Promise<OpenCodeApprovalReply>;
+};
+
 export type OpenCodeClient = {
   config: {
     providers(): Promise<OpenCodeSdkResult<{ providers: OpenCodeProvider[] }>>;
   };
   session: {
     create(args: { body: { title: string } }): Promise<OpenCodeSdkResult<{ id: string }>>;
-    prompt(args: {
-      path: { id: string };
-      body: {
-        model: { providerID: string; modelID: string };
-        parts: Array<{ type: "text"; text: string }>;
-        system?: string;
-      };
-    }): Promise<OpenCodeSdkResult<unknown>>;
+    prompt(args: OpenCodePromptArgs): Promise<OpenCodeSdkResult<unknown>>;
   };
 };
 

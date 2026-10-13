@@ -126,14 +126,14 @@ async fn load_provider_profiles() -> Result<Vec<StoredProviderProfile>, String> 
         .clone()
         .unwrap_or_else(|| "legacy-default".into());
     config.provider_id = Some(id.clone());
-    let profile = StoredProviderProfile {
+    let profiles = vec![StoredProviderProfile {
         id,
         name: "Default provider".into(),
         config: config.clone(),
-    };
-    secure_store::save_json("provider_profiles", &[profile.clone()]).await?;
+    }];
+    secure_store::save_json("provider_profiles", &profiles).await?;
     secure_store::save_json("provider", &config).await?;
-    Ok(vec![profile])
+    Ok(profiles)
 }
 
 /// Resolve a saved profile for one explicitly model-routed task. Provider
@@ -261,10 +261,10 @@ impl IpcService {
             let transcripts = self.state.transcripts.read().await;
             transcripts.get(session_id).cloned()
         };
-        if let Some(history) = live_history {
-            if !history.is_empty() {
-                return history;
-            }
+        if let Some(history) = live_history
+            && !history.is_empty()
+        {
+            return history;
         }
         let persisted = crate::secure_store::load_json::<
             std::collections::HashMap<String, Vec<ws::ConversationTurn>>,
@@ -728,6 +728,7 @@ impl IpcService {
     pub async fn cancel_run(&self, run_id: &str) -> bool {
         if let Some(handle) = self.state.runs.lock().await.get(run_id) {
             handle.cancel.store(true, Ordering::Relaxed);
+            handle.cancel_notify.notify_waiters();
             true
         } else {
             false
@@ -826,6 +827,7 @@ impl IpcService {
                 session_id: session_id.into(),
                 events: events.clone(),
                 cancel: cancel.clone(),
+                cancel_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
                 local: false,
             },
         );
