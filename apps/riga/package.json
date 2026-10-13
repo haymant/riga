@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "demo": "echo \"Demo React App\""
   },
   "dependencies": {
     "@haymant/assistant-ui": "file:../../packages/assistant-ui",
