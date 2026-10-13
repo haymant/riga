@@ -113,6 +113,27 @@ The desktop assistant path does **not** use `/ws`, `/health`, `/local-models`, l
 
 The Tauri host starts one `IpcService` around `ServerState`; it does not duplicate provider, tool, approval, MCP, attachment, session, or local-model logic. The same service powers the IPC commands and the HTTP/WebSocket routes.
 
+## 5. Android and iOS preview
+
+The Tauri shell already has the mobile entry point and Vite's `TAURI_DEV_HOST` handling. Initialize the generated native project from `demo/` on the relevant host. Android requires Android Studio's SDK, platform tools, NDK, and Java 17; iOS requires macOS with Xcode and CocoaPods.
+
+```bash
+cd demo
+npm ci
+npm run tauri -- android init       # Android, run once
+npm run tauri -- android dev        # deploy to an attached device or emulator
+npm run tauri -- android build --debug --apk
+
+# On macOS only:
+npm run tauri -- ios init           # run once
+npm run tauri -- ios dev            # deploy to an attached device or simulator
+npm run tauri -- ios build
+```
+
+The manually triggered **Publish Android preview APK** workflow initializes the Android project on its runner and creates a GitHub prerelease containing a debug APK. It is intended for hands-on testing and uses the runner's debug signing key, not a persistent release keystore. Reinstalling a later preview may require uninstalling the earlier one. The workflow does not publish to Google Play.
+
+Mobile is currently a **remote-provider chat preview**, not the full desktop coding-agent feature set. The mobile host stores RIGA data and the workspace inside the OS-managed app-data sandbox and skips desktop Git initialization. CUDA is desktop-only. Local GGUF inference, shell execution, Git operations, and MCP stdio servers depend on native libraries or executables that are not supplied in the mobile app; do not treat those features as supported on Android/iOS. The GitHub Actions build validates Android packaging, but device/emulator behavior still needs manual testing. iOS builds and testing require a Mac with Xcode.
+
 ### CUDA (NVIDIA) desktop
 
 To run the desktop shell against the GPU (llama.cpp offloads, and the server
@@ -127,7 +148,7 @@ npm run tauri:dev:cuda     # or: npm run tauri:build:cuda
 It defaults `CMAKE_CUDA_ARCHITECTURES` to the detected GPU; override it with
 `CMAKE_CUDA_ARCHITECTURES=89 npm run tauri:build:cuda`.
 
-## 5. Build and validate
+## 6. Build and validate
 
 ```bash
 npm run typecheck --prefix demo
@@ -137,7 +158,7 @@ cargo check --manifest-path demo/src-tauri/Cargo.toml --locked
 
 The verified build produces `demo/dist/` and compiles the Tauri host with the in-process IPC service.
 
-## 6. Generated-app baseline
+## 7. Generated-app baseline
 
 To recreate the initial shell used for this demo:
 
@@ -152,7 +173,7 @@ npm create tauri-app@latest demo -- \
 
 The generated shell was created by `create-tauri-app@4.7.4`; RIGA-specific integration is then added through the package and Rust dependencies described above.
 
-## 7. Publishing the RIGA dependencies
+## 8. Publishing the RIGA dependencies
 
 The published mode in [§2](#local-vs-published-dependencies-parity) resolves
 against releases, so publish the packages first. Crates go out in dependency

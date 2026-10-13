@@ -1,0 +1,82 @@
+name: Publish Android preview APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-preview-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  android:
+    name: Build and publish Android preview APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform and NDK
+        run: |
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" "ndk;29.0.13846066"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/29.0.13846066" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/29.0.13846066" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            demo/src-tauri
+
+      - name: Install JavaScript dependencies
+        run: |
+          npm ci
+          npm ci --prefix demo
+
+      - name: Initialize the generated Android project
+        working-directory: demo
+        run: npm run tauri -- android init --ci
+
+      - name: Build and publish the debug APK
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: demo
+          mobile: android
+          args: --debug --apk
+          tagName: riga-android-preview-${{ github.run_number }}
+          releaseName: "RIGA Android Preview #${{ github.run_number }}"
+          releaseBody: |
+            Android preview APK for manual testing of the remote-provider chat path.
+
+            This is a debug build signed with the runner's Android debug key. It is for testing only, not a production or Play Store release. Debug signing keys are temporary; uninstall an earlier preview before installing a later one if Android reports a signature mismatch.
+
+            Desktop workspace/Git/shell/MCP stdio and local GGUF features are not validated on mobile. Use remote providers for this preview.
+          releaseDraft: false
+          prerelease: true

@@ -5,7 +5,7 @@ use riga_server::{
     CreateSessionRequest, HealthResponse, ServerState,
 };
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Debug, Deserialize)]
 struct LocalModelActionRequest {
@@ -353,28 +353,28 @@ async fn riga_upload_attachment(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Prefer the repository the app was launched from, so the desktop browses
-    // the same per-session worktrees the agent runs in and matches browser mode.
-    // A packaged app launched outside a repository falls back to an isolated,
-    // git-initialized workspace (see `ensure_workspace`) so worktrees and
-    // uploads stay out of the source tree.
-    if let Some(root) = std::env::current_dir()
-        .ok()
-        .and_then(|dir| riga_server::catalog::git_toplevel(&dir))
+    #[cfg(not(mobile))]
     {
-        std::env::set_var("RIGA_WORKSPACE_ROOT", root);
+        // Prefer the repository the app was launched from, so the desktop browses
+        // the same per-session worktrees the agent runs in and matches browser mode.
+        // A packaged app launched outside a repository falls back to an isolated,
+        // git-initialized workspace (see `ensure_workspace`) so worktrees and
+        // uploads stay out of the source tree.
+        if let Some(root) = std::env::current_dir()
+            .ok()
+            .and_then(|dir| riga_server::catalog::git_toplevel(&dir))
+        {
+            std::env::set_var("RIGA_WORKSPACE_ROOT", root);
+        }
+        if let Err(error) =
+            riga_shell::ensure_workspace(&riga_shell::default_data_dir().join("workspace"))
+        {
+            eprintln!("RIGA: could not prepare the desktop workspace: {error}");
+        }
     }
-    if let Err(error) =
-        riga_shell::ensure_workspace(&riga_shell::default_data_dir().join("workspace"))
-    {
-        eprintln!("RIGA: could not prepare the desktop workspace: {error}");
-    }
-    let service = IpcService::new(ServerState::default());
-    let local_model_events = service.subscribe_local_models();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(Agent::new())
-        .manage(service)
         .invoke_handler(tauri::generate_handler![
             kernel_health,
             riga_transport_connect,
@@ -410,6 +410,23 @@ pub fn run() {
             riga_upload_attachment,
         ])
         .setup(move |app| {
+            #[cfg(mobile)]
+            {
+                let data_dir = app.path().app_data_dir()?;
+                std::fs::create_dir_all(&data_dir)?;
+                std::env::set_var("RIGA_DATA_DIR", &data_dir);
+
+                // Mobile apps do not ship the desktop `git` executable. Keep
+                // the workspace inside the OS-managed app sandbox and do not
+                // try to initialize a Git repository here.
+                let workspace = data_dir.join("workspace");
+                std::fs::create_dir_all(&workspace)?;
+                std::env::set_var("RIGA_WORKSPACE_ROOT", workspace);
+            }
+
+            let service = IpcService::new(ServerState::default());
+            let local_model_events = service.subscribe_local_models();
+            app.manage(service);
             tauri::async_runtime::spawn(forward_local_model_events(
                 app.handle().clone(),
                 local_model_events,
