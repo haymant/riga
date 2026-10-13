@@ -258,15 +258,23 @@ cargo check --manifest-path demo/src-tauri/Cargo.toml --locked
 
 ## Publishing
 
-Rust crates are published from the workspace in dependency order:
+Publish manually, in dependency order. Crates first — crates.io rejects a crate
+whose dependencies are not yet published:
 
 ```bash
-cargo publish --dry-run -p riga-kernel
-cargo publish --dry-run -p riga-server
-cargo publish --dry-run -p riga-cli
+cargo publish -p riga-kernel
+cargo publish -p riga-shell
+cargo publish -p riga-server   # depends on riga-kernel
+cargo publish -p riga-cli      # depends on riga-kernel and riga-server
+
+npm publish --workspace @rigai/assistant-ui --access public
 ```
 
-The release workflow publishes crates on `v*` tags when `CARGO_REGISTRY_TOKEN` is configured. Public npm packages use the `@rigai` scope and publish through the release workflow when `NPM_TOKEN` is configured. The assistant package’s `protocol`, `http`, and `tauri` exports are part of the published package.
+`cargo publish --dry-run -p <crate>` and
+`npm publish --workspace @rigai/assistant-ui --dry-run` preview without
+uploading. The assistant package’s `protocol`, `http`, and `tauri` exports are
+part of the published package. `demo/README.md` documents switching the demo
+between the local sources and these published releases.
 
 Create a release tag only after the validation workflow is green:
 

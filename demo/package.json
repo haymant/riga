@@ -14,7 +14,10 @@
     "tauri:build": "tauri build",
     "tauri:dev:cuda": "node scripts/tauri-cuda.mjs dev",
     "tauri:build:cuda": "node scripts/tauri-cuda.mjs build",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "deps:status": "node scripts/deps.mjs status",
+    "deps:local": "node scripts/deps.mjs local",
+    "deps:published": "node scripts/deps.mjs published"
   },
   "dependencies": {
     "react": "^19.1.0",

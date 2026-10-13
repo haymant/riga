@@ -19,19 +19,52 @@ From the repository root:
 npm install --prefix demo
 ```
 
-During development, the demo uses the current transport-injection source package:
+### Local vs published dependencies (parity)
 
-```json
-"@rigai/assistant-ui": "file:../packages/assistant-ui"
+The demo consumes RIGA over two channels, and both can point at either the
+in-repo sources or the published releases:
+
+| Dependency | Local (default) | Published |
+| --- | --- | --- |
+| `@rigai/assistant-ui` (npm) | `file:../packages/assistant-ui` | `^<version>` from npmjs |
+| `riga-kernel`, `riga-server`, `riga-shell` (Rust) | `path = "../../crates/*"` | `<version>` from crates.io |
+
+Switch modes with the helper — run it from `demo/`, or from the repository root
+with `--prefix demo`:
+
+```bash
+npm run deps:status      # show the current mode
+npm run deps:published   # use npmjs + crates.io
+npm run deps:local       # use the in-repo sources (default)
 ```
 
-After the next assistant-ui release containing the injection API, replace it with the published version, for example:
+`scripts/deps.mjs` rewrites `demo/package.json` and `demo/src-tauri/Cargo.toml`
+in place, taking the published versions from the workspace
+(`Cargo.toml` → `[workspace.package].version`) and
+`packages/assistant-ui/package.json`, so the switch always targets the release
+that matches the current source tree. A separate `package.json` alone is **not**
+enough — the Rust path dependencies and both lockfiles have to move too.
 
-```json
-"@rigai/assistant-ui": "^0.1.4"
+Because the dependency *sources* change, reinstall afterwards and let Cargo
+re-resolve:
+
+```bash
+npm install --prefix demo
+cargo update --manifest-path demo/src-tauri/Cargo.toml
 ```
 
-The Rust demo currently uses path dependencies for `riga-kernel`, `riga-server`, and `riga-shell`. Replace those paths with the corresponding published crate versions when the IPC surface is released.
+Both lockfiles (`demo/package-lock.json`, `demo/src-tauri/Cargo.lock`) are
+tracked. Keep the default **local** mode committed; switching is for local
+parity checks. To undo a switch without a reinstall, revert the manifests:
+
+```bash
+git checkout -- demo/package.json demo/src-tauri/Cargo.toml
+```
+
+Unlike the npm side, a standalone `package.json` cannot switch the Rust
+dependency graph on its own — hence the helper covers both files. See
+[§7](#7-publishing-the-riga-dependencies) for how to publish the releases that
+the published mode resolves against.
 
 `src-tauri/src/main.rs` calls `riga_shell::prepare_linux_display()` before the Tauri/GTK runtime starts. That helper (in `crates/riga-shell`) sets conservative cursor defaults and prefers XWayland when a `DISPLAY` is present, avoiding a Wayland cursor-theme assertion that otherwise aborts the app before the window appears. It is a native-shell concern, so it lives there rather than in `riga-kernel`, `riga-server`, or the web UI.
 
@@ -118,3 +151,43 @@ npm create tauri-app@latest demo -- \
 ```
 
 The generated shell was created by `create-tauri-app@4.7.4`; RIGA-specific integration is then added through the package and Rust dependencies described above.
+
+## 7. Publishing the RIGA dependencies
+
+The published mode in [§2](#local-vs-published-dependencies-parity) resolves
+against releases, so publish the packages first. Crates go out in dependency
+order — crates.io rejects a crate whose dependencies are not yet published:
+
+```bash
+# Rust crates, from the repository root, dependency order
+cargo publish -p riga-kernel
+cargo publish -p riga-shell
+cargo publish -p riga-server   # depends on riga-kernel
+cargo publish -p riga-cli      # depends on riga-kernel and riga-server
+
+# npm package; the @rigai scope needs --access public
+npm publish --workspace @rigai/assistant-ui --access public
+```
+
+Preview before publishing:
+
+```bash
+cargo publish --dry-run -p riga-kernel
+npm publish --workspace @rigai/assistant-ui --dry-run
+```
+
+If a version already exists, bump it first in `Cargo.toml`
+(`[workspace.package].version`) and `packages/assistant-ui/package.json`, then
+publish again. After publishing, verify parity end to end:
+
+```bash
+npm run deps:published --prefix demo
+npm install --prefix demo
+cargo build --manifest-path demo/src-tauri/Cargo.toml
+```
+
+Restore the default local mode when finished:
+
+```bash
+npm run deps:local --prefix demo && npm install --prefix demo
+```
