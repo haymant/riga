@@ -2538,7 +2538,7 @@ dependencies = [
 
 [[package]]
 name = "riga-cli"
-version = "0.1.0"
+version = "0.1.14"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -2553,7 +2553,7 @@ dependencies = [
 
 [[package]]
 name = "riga-kernel"
-version = "0.1.0"
+version = "0.1.14"
 dependencies = [
  "futures-util",
  "rig-agent",
@@ -2566,7 +2566,7 @@ dependencies = [
 
 [[package]]
 name = "riga-server"
-version = "0.1.0"
+version = "0.1.14"
 dependencies = [
  "aes-gcm",
  "async-stream",
@@ -2599,7 +2599,7 @@ dependencies = [
 
 [[package]]
 name = "riga-shell"
-version = "0.1.0"
+version = "0.1.14"
 dependencies = [
  "tempfile",
 ]

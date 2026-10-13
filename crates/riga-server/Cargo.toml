@@ -37,7 +37,7 @@ llama-cpp-2 = { version = "0.1.158", default-features = false, features = ["comm
 llama-cpp-sys-2 = "0.1.158"
 rig-agent = { version = "=0.43.0", features = ["test-utils"] }
 rig-core = "=0.43.0"
-riga-kernel = { version = "0.1.0", path = "../riga-kernel" }
+riga-kernel = { version = "0.1.14", path = "../riga-kernel" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rig-rmcp = "=0.43.0"
 rmcp = { version = "=2.0.0", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
