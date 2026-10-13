@@ -95,8 +95,9 @@ jobs:
             - `linux` / `windows` — CPU builds
             - `macos` — Apple Silicon with Metal (and CPU fallback)
             - `linux-cuda` — optional NVIDIA build, produced on demand and
-              published as a `RIGA-CUDA-…` asset (needs the NVIDIA driver and
-              the matching CUDA runtime libraries)
+              published as a `RIGA-CUDA-…` desktop bundle and a
+              `RIGA-CLI-CUDA-…` CLI tarball (both need the NVIDIA driver and the
+              matching CUDA runtime libraries)
           releaseDraft: false
           prerelease: false
 
@@ -160,21 +161,23 @@ jobs:
             - `linux` / `windows` — CPU builds
             - `macos` — Apple Silicon with Metal (and CPU fallback)
             - `linux-cuda` — optional NVIDIA build, produced on demand and
-              published as a `RIGA-CUDA-…` asset (needs the NVIDIA driver and
-              the matching CUDA runtime libraries)
+              published as a `RIGA-CUDA-…` desktop bundle and a
+              `RIGA-CLI-CUDA-…` CLI tarball (both need the NVIDIA driver and the
+              matching CUDA runtime libraries)
           releaseDraft: false
           prerelease: false
           args: --target aarch64-apple-darwin --features metal
 
   # ---------------------------------------------------------------------------
   # 3. Linux with CUDA — manual only. Built without a release upload, then
-  #    published under a `RIGA-CUDA-` prefixed name so it never replaces the CPU
-  #    installer (a CUDA binary needs `libcuda` plus the CUDA runtime libraries
-  #    at runtime). llama.cpp is linked dynamically, so the .deb also carries the
-  #    llama.cpp/ggml shared libraries under /usr/lib/riga.
+  #    published under `RIGA-CUDA-`/`RIGA-CLI-CUDA-` prefixed names so they never
+  #    replace the CPU installers (a CUDA binary needs `libcuda` plus the CUDA
+  #    runtime libraries at runtime). llama.cpp is linked dynamically, so the
+  #    desktop .deb carries the llama.cpp/ggml shared libraries under /usr/lib/riga
+  #    and the CLI tarball ships them next to the executable.
   # ---------------------------------------------------------------------------
   cuda:
-    name: Build desktop app (linux-cuda)
+    name: Build desktop app and CLI (linux-cuda)
     if: github.event_name == 'workflow_dispatch' && inputs.build_linux_cuda
     runs-on: ubuntu-22.04
     timeout-minutes: 90
@@ -256,6 +259,45 @@ jobs:
           # Only a .deb: the AppImage step downloads tooling and rpm packaging is
           # slow. The CPU Linux release already ships the rpm and AppImage.
           args: --features cuda --bundles deb
+
+      # The CLI links the same dynamic llama.cpp/ggml build. This runs in the
+      # root workspace target and `riga-server`'s build script stages the shared
+      # libraries next to the binary, so the tarball below only needs the user's
+      # CUDA runtime.
+      - name: Build RIGA CLI (CUDA)
+        run: cargo build --release -p riga-cli --features riga-server/cuda
+
+      - name: Package RIGA CLI (CUDA)
+        run: |
+          set -euo pipefail
+          out="dist/riga-cli-cuda"
+          rm -rf dist RIGA-CLI-CUDA-x86_64.tar.gz
+          mkdir -p "$out"
+          cp target/release/riga-cli "$out/"
+          cp target/release/riga-cuda-libs/*.so.* "$out/"
+          {
+            echo "RIGA CLI with NVIDIA CUDA offload (dynamically linked)."
+            echo
+            echo "Extract and run:  ./riga-cli --tui    (or --health, --catalog, ...)"
+            echo
+            echo "Runtime requirements:"
+            echo "  - the NVIDIA driver (libcuda.so.1)"
+            echo "  - the CUDA Toolkit's cuBLAS/cuBLASLt/cudart on the loader path"
+            echo "    (installing the toolkit configures this via ld.so.conf)"
+            echo
+            echo "The shared libraries are resolved relative to the executable"
+            echo "(DT_RPATH \$ORIGIN)."
+          } > "$out/README.txt"
+          tar -C dist -czf RIGA-CLI-CUDA-x86_64.tar.gz riga-cli-cuda
+          ls -la RIGA-CLI-CUDA-x86_64.tar.gz
+
+      - name: Publish CLI CUDA tarball to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ inputs.tag }}"
+          [ -n "$tag" ] || tag="${{ github.ref_name }}"
+          gh release upload "$tag" RIGA-CLI-CUDA-x86_64.tar.gz --clobber
 
       - name: Publish CUDA bundles to the release
         env:

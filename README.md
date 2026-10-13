@@ -194,6 +194,11 @@ its own Cargo workspace); it installs the llama.cpp shared libraries to
 Silicon Mac the same command with `--features metal` builds the Metal variant
 (no extra flags beyond Xcode's command-line tools).
 
+The same on-demand `linux-cuda` release job also publishes a
+`RIGA-CLI-CUDA-x86_64.tar.gz` — the `riga-cli` binary plus the llama.cpp/ggml
+shared libraries. Extract it and run `./riga-cli --tui`; it needs the same
+NVIDIA driver and CUDA runtime libraries as the desktop build.
+
 `CUDA_LIBRARY_PATH` matters when more than one CUDA toolkit is installed: it is
 the only variable the build script uses for the linker's library search order,
 so it pins `-lcuda`/`-lcudart` to that toolkit. Pass the CUDA **root**
