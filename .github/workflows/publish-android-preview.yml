@@ -62,23 +62,70 @@ jobs:
         working-directory: demo
         run: npm run tauri -- android init --ci
 
-      - name: Build and publish the debug APK
-        uses: tauri-apps/tauri-action@v1
+      - name: Build optimized release APKs
+        working-directory: demo
+        run: npm run tauri -- android build --apk --split-per-abi
+
+      - name: Sign and verify preview APKs
+        working-directory: demo
+        shell: bash
+        run: |
+          set -euo pipefail
+          keystore="$RUNNER_TEMP/riga-preview.jks"
+          password="riga-preview-only"
+          keytool -genkeypair -noprompt -v \
+            -keystore "$keystore" -storetype JKS \
+            -storepass "$password" -keypass "$password" \
+            -alias riga-preview -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=RIGA Preview"
+
+          version="$(node -e 'console.log(require("./src-tauri/tauri.conf.json").version)')"
+          apksigner="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+          mkdir -p dist/android-preview
+          mapfile -d '' apks < <(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' -print0)
+          if ((${#apks[@]} == 0)); then
+            echo "No release APKs were produced" >&2
+            exit 1
+          fi
+
+          for apk in "${apks[@]}"; do
+            abi="$(basename "$(dirname "$(dirname "$apk")")")"
+            case "$abi" in
+              arm64-v8a) abi=arm64 ;;
+              armeabi-v7a) abi=arm ;;
+              x86) abi=x86 ;;
+              x86_64) abi=x86_64 ;;
+            esac
+            output="dist/android-preview/RIGA_${version}_${abi}.apk"
+            if [[ -e "$output" ]]; then
+              echo "Duplicate ABI output: $output" >&2
+              exit 1
+            fi
+            cp "$apk" "$output"
+            "$apksigner" sign --ks "$keystore" --ks-key-alias riga-preview \
+              --ks-pass "pass:$password" --key-pass "pass:$password" "$output"
+            "$apksigner" verify --verbose "$output"
+            ls -lh "$output"
+          done
+
+      - name: Publish optimized preview release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          projectPath: demo
-          mobile: android
-          args: --debug --apk --split-per-abi
-          tagName: riga-android-preview-${{ github.run_number }}
-          releaseName: "RIGA Android Preview #${{ github.run_number }}"
-          releaseBody: |
-            Android preview APK for manual testing of the remote-provider chat path.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="riga-android-preview-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          cat > "$RUNNER_TEMP/release-notes.md" <<'EOF'
+          Optimized Android release-mode preview APKs for testing the remote-provider chat path.
 
-            This is a debug build signed with the runner's Android debug key. It is for testing only, not a production or Play Store release. Debug signing keys are temporary; uninstall an earlier preview before installing a later one if Android reports a signature mismatch.
+          These APKs are signed with a disposable CI test key, not a production or Play Store key. Uninstall any earlier RIGA preview before installing one signed with this temporary key.
 
-            The release contains one APK per Android ABI. Most physical Android phones use `arm64`; choose `x86_64` for a typical Android Studio emulator.
+          The release contains one APK per Android ABI. Choose `arm64` for most physical Android phones or `x86_64` for a typical Android Studio emulator.
 
-            Desktop workspace/Git/shell/MCP stdio and local GGUF features are not validated on mobile. Use remote providers for this preview.
-          releaseDraft: false
-          prerelease: true
+          Desktop workspace/Git/shell/MCP stdio and local GGUF features are not validated on mobile. Use remote providers for this preview.
+          EOF
+          gh release create "riga-android-preview-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}" \
+            demo/dist/android-preview/*.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "RIGA Android Optimized Preview #${GITHUB_RUN_NUMBER}" \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --prerelease
