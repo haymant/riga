@@ -130,7 +130,7 @@ npm run tauri -- ios dev            # deploy to an attached device or simulator
 npm run tauri -- ios build
 ```
 
-The manually triggered **Publish Android preview APK** workflow initializes the Android project on its runner and creates a GitHub prerelease containing ABI-specific debug APKs. Choose `aarch64` for most physical phones or `x86_64` for a typical Android Studio emulator. The APKs are intended for hands-on testing and use the runner's debug signing key, not a persistent release keystore. Reinstalling a later preview may require uninstalling the earlier one. The workflow does not publish to Google Play.
+The manually triggered **Publish Android preview APK** workflow initializes the Android project on its runner and creates a GitHub prerelease containing ABI-specific debug APKs. Choose `arm64` for most physical phones or `x86_64` for a typical Android Studio emulator. The APKs are intended for hands-on testing and use the runner's debug signing key, not a persistent release keystore. Reinstalling a later preview may require uninstalling the earlier one. The workflow does not publish to Google Play.
 
 Mobile is currently a **remote-provider chat preview**, not the full desktop coding-agent feature set. The mobile host stores RIGA data and the workspace inside the OS-managed app-data sandbox and skips desktop Git initialization. CUDA is desktop-only. Local GGUF inference, shell execution, Git operations, and MCP stdio servers depend on native libraries or executables that are not supplied in the mobile app; do not treat those features as supported on Android/iOS. The GitHub Actions build validates Android packaging, but device/emulator behavior still needs manual testing. iOS builds and testing require a Mac with Xcode.
 

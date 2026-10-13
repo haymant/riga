@@ -77,7 +77,7 @@ jobs:
 
             This is a debug build signed with the runner's Android debug key. It is for testing only, not a production or Play Store release. Debug signing keys are temporary; uninstall an earlier preview before installing a later one if Android reports a signature mismatch.
 
-            The release contains one APK per Android ABI. Most physical Android phones use `aarch64`; choose `x86_64` for a typical Android Studio emulator.
+            The release contains one APK per Android ABI. Most physical Android phones use `arm64`; choose `x86_64` for a typical Android Studio emulator.
 
             Desktop workspace/Git/shell/MCP stdio and local GGUF features are not validated on mobile. Use remote providers for this preview.
           releaseDraft: false
