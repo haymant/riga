@@ -7,6 +7,14 @@ repository.workspace = true
 
 description = "RIGA command-line adapter"
 
+[features]
+# GPU backend selection, e.g. `cargo install riga-cli --features cuda`. The
+# server owns the actual features; `cuda` builds llama.cpp/ggml as shared
+# libraries (see crates/riga-server/Cargo.toml).
+default = []
+cuda = ["riga-server/cuda"]
+metal = ["riga-server/metal"]
+
 [dependencies]
 riga-kernel = { version = "0.1.14", path = "../riga-kernel" }
 riga-server = { version = "0.1.14", path = "../riga-server" }

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -164,6 +165,49 @@ for (const profile of ["debug", "release"]) {
       fs.rmSync(out, { recursive: true, force: true });
     }
   }
+}
+
+// `--published` builds and runs the CLI from crates.io instead of the local
+// workspace, for parity with the released crates. Set `RIGA_CLI_FROM_PATH=1` to
+// install the path crate the same way before it is published, and
+// `RIGA_CLI_PREFIX` to change the install prefix (default: ~/.local).
+const publishedIndex = commandArgs.indexOf("--published");
+if (publishedIndex !== -1) {
+  commandArgs.splice(publishedIndex, 1);
+
+  const prefix = env.RIGA_CLI_PREFIX || path.join(os.homedir(), ".local");
+  const installTarget = path.join(targetRoot, "cli-published");
+  const installEnv = { ...env, CARGO_TARGET_DIR: installTarget };
+  const manifest = fs.readFileSync(path.join(root, "Cargo.toml"), "utf8");
+  const version = manifest.match(/^\[workspace\.package\][\s\S]*?^version\s*=\s*"([^"]+)"/m)?.[1];
+  if (!version) {
+    console.error("Could not read [workspace.package] version from Cargo.toml.");
+    process.exit(1);
+  }
+
+  const installArgs = ["install", "riga-cli", "--features", "cuda", "--root", prefix];
+  if (env.RIGA_CLI_FROM_PATH === "1") {
+    installArgs.push("--path", path.join(root, "crates", "riga-cli"));
+  } else {
+    installArgs.push("--version", version);
+  }
+  const install = spawnSync("cargo", installArgs, { cwd: root, env: installEnv, stdio: "inherit" });
+  if (install.status !== 0) process.exit(install.status ?? 1);
+
+  // The CUDA build links llama.cpp/ggml dynamically; stage the shared libraries
+  // next to the installed binary so its `$ORIGIN` rpath resolves them.
+  const libsDir = path.join(installTarget, "release", "riga-cuda-libs");
+  const binDir = path.join(prefix, "bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  if (fs.existsSync(libsDir)) {
+    for (const entry of fs.readdirSync(libsDir)) {
+      fs.copyFileSync(path.join(libsDir, entry), path.join(binDir, entry));
+    }
+  }
+  console.log(`Installed riga-cli (cuda) to ${binDir}`);
+
+  const run = spawnSync(path.join(binDir, "riga-cli"), commandArgs, { cwd: root, env, stdio: "inherit" });
+  process.exit(run.status ?? 1);
 }
 
 const result = spawnSync("cargo", ["run", "-p", "riga-cli", "--features", "riga-server/cuda", "--", ...commandArgs], {

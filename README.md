@@ -96,6 +96,25 @@ are staged next to it. A machine that *runs* a CUDA build therefore needs both
 the NVIDIA driver and the CUDA runtime libraries on its loader path; installing
 the CUDA Toolkit configures this via `ld.so.conf`.
 
+To run the **published** CLI (from crates.io) instead of this checkout, use the
+published wrapper. It installs `riga-cli` with the `cuda` feature, stages the
+llama.cpp/ggml shared libraries next to the installed binary (so its `$ORIGIN`
+rpath resolves them), then runs it:
+
+```bash
+npm run cli:cuda:published -- --tui
+```
+
+It installs to `~/.local/bin` by default (`RIGA_CLI_PREFIX` overrides it).
+Before the crate is published, exercise the same path against the local sources:
+
+```bash
+RIGA_CLI_FROM_PATH=1 npm run cli:cuda:published -- --health
+```
+
+The CPU CLI needs none of this — `cargo install riga-cli --version 0.1.14` is
+self-contained, because only the CUDA build links dynamically.
+
 CUDA is a compile-time backend choice; merely running the CPU binary on a
 CUDA-capable machine does not enable GPU offload. If a direct Cargo build was
 interrupted and reports `CMAKE = None` or `Makefile: No such file`, first run:
