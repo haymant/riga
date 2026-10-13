@@ -1,0 +1,17 @@
+{
+  "$schema": "https://example.com/schemas/sample-record.json",
+  "id": "1f0c2a7e-9b4d-4c1a-8f2e-7d6b5a4c3e21",
+  "name": "sample-record",
+  "createdAt": "2026-10-13T12:00:00Z",
+  "active": true,
+  "tags": ["demo", "sample", "json"],
+  "metrics": {
+    "requests": 128,
+    "errors": 3,
+    "p95Ms": 42.7
+  },
+  "items": [
+    { "sku": "A-100", "qty": 2, "price": 9.99 },
+    { "sku": "B-200", "qty": 1, "price": 19.5 }
+  ]
+}

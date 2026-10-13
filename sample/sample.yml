@@ -1,0 +1,29 @@
+# Sample YAML configuration.
+app:
+  name: sample-service
+  version: 1.0.0
+  environment: development
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  timeouts:
+    read: 30s
+    write: 30s
+
+features:
+  - id: health
+    enabled: true
+  - id: metrics
+    enabled: false
+
+database:
+  driver: postgres
+  dsn: ${DB_URL}
+  pool:
+    min: 1
+    max: 10
+
+logging:
+  level: info
+  format: json
