@@ -9,6 +9,7 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use std::{
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -49,6 +50,32 @@ pub enum UiCommand {
     DeleteSession {
         session_id: String,
         confirmation_name: String,
+    },
+    LoadWorkspaceEntries {
+        session_id: String,
+        path: String,
+    },
+    LoadWorkspaceFile {
+        session_id: String,
+        path: String,
+    },
+    RefreshGit {
+        session_id: String,
+    },
+    LoadGitDiff {
+        session_id: String,
+        path: String,
+    },
+    LoadGitCommitDiff {
+        session_id: String,
+        commit: String,
+    },
+    CommitGit {
+        session_id: String,
+        message: String,
+    },
+    PushGit {
+        session_id: String,
     },
     SaveProvider {
         config: riga_server::ws::ProviderConfig,
@@ -117,6 +144,22 @@ pub struct UiState {
     pub deleting_session: Option<String>,
     pub history_archived_view: bool,
     pub session_field: usize,
+    pub workspace_entries: BTreeMap<String, Vec<riga_server::files::WorkspaceEntry>>,
+    pub workspace_expanded: BTreeSet<String>,
+    pub workspace_loading: BTreeSet<String>,
+    pub workspace_selected_path: Option<String>,
+    pub workspace_file: Option<riga_server::files::WorkspaceFile>,
+    pub workspace_preview_open: bool,
+    pub workspace_preview_loading: bool,
+    pub workspace_preview_scroll: usize,
+    pub workspace_error: Option<String>,
+    pub git_changes: Vec<riga_server::files::GitChange>,
+    pub git_commits: Vec<riga_server::files::GitCommit>,
+    pub git_diff: Option<riga_server::files::WorkspaceDiff>,
+    pub git_refreshing: bool,
+    pub git_commit_message: TextBuffer,
+    pub git_commit_editing: bool,
+    pub git_confirm_push: bool,
     pub provider: ProviderForm,
     pub provider_field: usize,
     pub provider_profiles: Vec<riga_server::ipc::ProviderProfileSummary>,
@@ -180,6 +223,57 @@ enum BackgroundResult {
             String,
         >,
     ),
+    WorkspaceEntries {
+        session_id: String,
+        path: String,
+        result: Result<Vec<riga_server::files::WorkspaceEntry>, String>,
+    },
+    WorkspaceFile {
+        session_id: String,
+        path: String,
+        result: Result<riga_server::files::WorkspaceFile, String>,
+    },
+    GitRefresh {
+        session_id: String,
+        status: Result<Vec<riga_server::files::GitChange>, String>,
+        commits: Result<Vec<riga_server::files::GitCommit>, String>,
+    },
+    GitDiff {
+        session_id: String,
+        result: Result<riga_server::files::WorkspaceDiff, String>,
+    },
+    GitCommit {
+        session_id: String,
+        result: Result<riga_server::files::GitCommitResult, String>,
+    },
+    GitPush {
+        session_id: String,
+        result: Result<riga_server::files::GitPushResult, String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkspacePanelItem {
+    Entry {
+        path: String,
+        name: String,
+        depth: usize,
+        directory: bool,
+        expanded: bool,
+        loading: bool,
+    },
+    Change {
+        path: String,
+        status: String,
+        staged: bool,
+        untracked: bool,
+    },
+    Commit {
+        id: String,
+        short: String,
+        message: String,
+        timestamp: i64,
+    },
 }
 
 enum SlashCommandResult {
@@ -208,6 +302,96 @@ impl UiState {
             }
         }
         active_calls.pop()
+    }
+
+    pub(crate) fn workspace_panel_items(&self, panel: UiPanel) -> Vec<WorkspacePanelItem> {
+        match panel {
+            UiPanel::Files => {
+                let mut items = Vec::new();
+                let mut stack = self
+                    .workspace_entries
+                    .get("")
+                    .into_iter()
+                    .flatten()
+                    .rev()
+                    .map(|entry| (entry.clone(), 0usize))
+                    .collect::<Vec<_>>();
+                while let Some((entry, depth)) = stack.pop() {
+                    let directory = entry.kind == "dir";
+                    let expanded = directory && self.workspace_expanded.contains(&entry.path);
+                    items.push(WorkspacePanelItem::Entry {
+                        path: entry.path.clone(),
+                        name: entry.name.clone(),
+                        depth,
+                        directory,
+                        expanded,
+                        loading: self.workspace_loading.contains(&entry.path),
+                    });
+                    if expanded {
+                        if let Some(children) = self.workspace_entries.get(&entry.path) {
+                            stack.extend(
+                                children
+                                    .iter()
+                                    .rev()
+                                    .cloned()
+                                    .map(|child| (child, depth.saturating_add(1))),
+                            );
+                        }
+                    }
+                }
+                items
+            }
+            UiPanel::Git => {
+                let mut items = self
+                    .git_changes
+                    .iter()
+                    .filter(|change| change.staged)
+                    .chain(self.git_changes.iter().filter(|change| !change.staged))
+                    .map(|change| WorkspacePanelItem::Change {
+                        path: change.path.clone(),
+                        status: change.status.clone(),
+                        staged: change.staged,
+                        untracked: change.untracked,
+                    })
+                    .collect::<Vec<_>>();
+                items.extend(
+                    self.git_commits
+                        .iter()
+                        .map(|commit| WorkspacePanelItem::Commit {
+                            id: commit.id.clone(),
+                            short: commit.short.clone(),
+                            message: commit.message.clone(),
+                            timestamp: commit.timestamp,
+                        }),
+                );
+                items
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn active_workspace_session(&self) -> Option<String> {
+        self.state.selected_session.clone()
+    }
+
+    fn reset_workspace_state(&mut self) {
+        self.workspace_entries.clear();
+        self.workspace_expanded.clear();
+        self.workspace_loading.clear();
+        self.workspace_selected_path = None;
+        self.workspace_file = None;
+        self.workspace_preview_open = false;
+        self.workspace_preview_loading = false;
+        self.workspace_preview_scroll = 0;
+        self.workspace_error = None;
+        self.git_changes.clear();
+        self.git_commits.clear();
+        self.git_diff = None;
+        self.git_refreshing = false;
+        self.git_commit_editing = false;
+        self.git_commit_message.clear();
+        self.git_confirm_push = false;
+        self.panel_cursor = 0;
     }
 
     pub fn set_session_history(&mut self, turns: Vec<riga_server::ws::ConversationTurn>) {
@@ -401,6 +585,21 @@ impl UiState {
                     return self
                         .handle_panel_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                 }
+                if let Some((panel, index)) = crate::ui::workspace_panel_item_index_at(
+                    self,
+                    terminal_width,
+                    terminal_height,
+                    mouse.column,
+                    mouse.row,
+                ) {
+                    self.panel = panel;
+                    self.last_sidebar_panel = Some(panel);
+                    self.panel_cursor = index;
+                    self.transcript_focused = false;
+                    self.clear_selection();
+                    return self
+                        .handle_panel_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
                 let wide_sidebar = terminal_width >= 112 && terminal_height >= 12;
                 let sidebar_width = if self.sidebar_width == 0 {
                     34
@@ -408,16 +607,18 @@ impl UiState {
                     self.sidebar_width.clamp(24, 56)
                 };
                 if wide_sidebar && mouse.column >= terminal_width.saturating_sub(sidebar_width) {
-                    if (1..=5).contains(&mouse.row) {
+                    if (1..=7).contains(&mouse.row) {
                         let panel = match mouse.row {
                             1 => UiPanel::History,
-                            2 => UiPanel::Settings,
-                            3 => UiPanel::LocalModels,
-                            4 => UiPanel::Help,
-                            5 => UiPanel::RunDeck,
+                            2 => UiPanel::Files,
+                            3 => UiPanel::Git,
+                            4 => UiPanel::Settings,
+                            5 => UiPanel::LocalModels,
+                            6 => UiPanel::Help,
+                            7 => UiPanel::RunDeck,
                             _ => unreachable!(),
                         };
-                        self.show_sidebar_panel(panel);
+                        return self.activate_sidebar_panel(panel);
                     } else {
                         self.panel = self.last_sidebar_panel.unwrap_or(UiPanel::History);
                         self.transcript_focused = false;
@@ -466,14 +667,18 @@ impl UiState {
                 }
             }
             MouseEventKind::ScrollUp => {
-                if self.panel == UiPanel::Transcript {
+                if self.workspace_preview_open {
+                    self.workspace_preview_scroll = self.workspace_preview_scroll.saturating_add(3);
+                } else if self.panel == UiPanel::Transcript {
                     self.transcript_focused = true;
                     self.follow_output = false;
                     self.transcript_scroll = self.transcript_scroll.saturating_add(3);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if self.panel == UiPanel::Transcript {
+                if self.workspace_preview_open {
+                    self.workspace_preview_scroll = self.workspace_preview_scroll.saturating_sub(3);
+                } else if self.panel == UiPanel::Transcript {
                     self.transcript_focused = true;
                     self.transcript_scroll = self.transcript_scroll.saturating_sub(3);
                 }
@@ -485,6 +690,12 @@ impl UiState {
 
     fn show_sidebar_panel(&mut self, panel: UiPanel) {
         self.panel = panel;
+        self.workspace_preview_open = false;
+        self.workspace_preview_loading = false;
+        self.git_commit_editing = false;
+        self.git_commit_message.clear();
+        self.git_confirm_push = false;
+        self.workspace_error = None;
         self.model_picker_open = false;
         self.last_sidebar_panel = Some(panel);
         self.rundeck_open = panel == UiPanel::RunDeck;
@@ -492,8 +703,55 @@ impl UiState {
         self.clear_selection();
     }
 
+    fn activate_sidebar_panel(&mut self, panel: UiPanel) -> Option<UiCommand> {
+        let changed_panel = self.panel != panel;
+        self.show_sidebar_panel(panel);
+        if changed_panel {
+            self.panel_cursor = 0;
+        }
+        match panel {
+            UiPanel::Files => {
+                if self.workspace_entries.contains_key("") {
+                    None
+                } else {
+                    self.load_workspace_directory(String::new())
+                }
+            }
+            UiPanel::Git => self.refresh_git_panel(),
+            _ => None,
+        }
+    }
+
+    fn load_workspace_directory(&mut self, path: String) -> Option<UiCommand> {
+        let Some(session_id) = self.active_workspace_session() else {
+            self.notice = Some("Select or create a session with a workspace first.".into());
+            return None;
+        };
+        if self.workspace_loading.insert(path.clone()) {
+            Some(UiCommand::LoadWorkspaceEntries { session_id, path })
+        } else {
+            None
+        }
+    }
+
+    fn refresh_git_panel(&mut self) -> Option<UiCommand> {
+        let Some(session_id) = self.active_workspace_session() else {
+            self.notice = Some("Select or create a session with a workspace first.".into());
+            return None;
+        };
+        self.git_refreshing = true;
+        self.git_confirm_push = false;
+        Some(UiCommand::RefreshGit { session_id })
+    }
+
     fn focus_composer(&mut self) {
         self.model_picker_open = false;
+        self.workspace_preview_open = false;
+        self.workspace_preview_loading = false;
+        if self.git_commit_editing {
+            self.git_commit_editing = false;
+            self.git_commit_message.clear();
+        }
         if self.panel != UiPanel::Transcript {
             self.last_sidebar_panel = Some(self.panel);
         }
@@ -541,6 +799,7 @@ impl UiState {
             UiPanel::LocalModels if self.local_attachment_input => {
                 self.panel_input.insert_str(text)
             }
+            UiPanel::Git if self.git_commit_editing => self.git_commit_message.insert_str(text),
             _ => self.draft.insert_str(text),
         }
     }
@@ -780,6 +1039,8 @@ impl UiState {
                     self.panel_cursor = 0;
                     return None;
                 }
+                KeyCode::F(4) => return self.activate_sidebar_panel(UiPanel::Files),
+                KeyCode::F(5) => return self.activate_sidebar_panel(UiPanel::Git),
                 KeyCode::Char(',') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.panel = UiPanel::Settings;
                     self.provider_field = 0;
@@ -847,6 +1108,8 @@ impl UiState {
                 self.panel_cursor = 0;
                 return None;
             }
+            KeyCode::F(4) => return self.activate_sidebar_panel(UiPanel::Files),
+            KeyCode::F(5) => return self.activate_sidebar_panel(UiPanel::Git),
             KeyCode::Char(',') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.panel = UiPanel::Settings;
                 self.provider_field = 0;
@@ -1051,6 +1314,24 @@ impl UiState {
             self.panel = UiPanel::Transcript;
             self.last_sidebar_panel = Some(UiPanel::Settings);
             self.transcript_focused = false;
+            return None;
+        }
+        if key.code == KeyCode::Esc
+            && matches!(self.panel, UiPanel::Files | UiPanel::Git)
+            && self.workspace_preview_open
+        {
+            self.workspace_preview_open = false;
+            self.workspace_preview_loading = false;
+            return None;
+        }
+        if key.code == KeyCode::Esc && self.panel == UiPanel::Git && self.git_commit_editing {
+            self.git_commit_editing = false;
+            self.git_commit_message.clear();
+            return None;
+        }
+        if key.code == KeyCode::Esc && self.panel == UiPanel::Git && self.git_confirm_push {
+            self.git_confirm_push = false;
+            self.notice = Some("Push cancelled.".into());
             return None;
         }
         if key.code == KeyCode::Esc {
@@ -1428,6 +1709,246 @@ impl UiState {
                         let _ = self.panel_input.handle_key(key);
                         self.commit_provider_input();
                     }
+                }
+            }
+            UiPanel::Files => {
+                if self.workspace_preview_open {
+                    match key.code {
+                        KeyCode::PageUp => {
+                            self.workspace_preview_scroll =
+                                self.workspace_preview_scroll.saturating_sub(12);
+                            return None;
+                        }
+                        KeyCode::PageDown => {
+                            self.workspace_preview_scroll =
+                                self.workspace_preview_scroll.saturating_add(12);
+                            return None;
+                        }
+                        KeyCode::Home => {
+                            self.workspace_preview_scroll = 0;
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+                let items = self.workspace_panel_items(UiPanel::Files);
+                let selected = items.get(self.panel_cursor).cloned();
+                match key.code {
+                    KeyCode::Up => self.panel_cursor = self.panel_cursor.saturating_sub(1),
+                    KeyCode::Down => {
+                        self.panel_cursor = self
+                            .panel_cursor
+                            .saturating_add(1)
+                            .min(items.len().saturating_sub(1));
+                    }
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        if let Some(WorkspacePanelItem::Entry {
+                            path,
+                            directory: true,
+                            expanded,
+                            ..
+                        }) = selected
+                        {
+                            if expanded {
+                                self.workspace_expanded.remove(&path);
+                            } else {
+                                self.workspace_expanded.insert(path.clone());
+                                if !self.workspace_entries.contains_key(&path) {
+                                    return self.load_workspace_directory(path);
+                                }
+                            }
+                        } else if let Some(WorkspacePanelItem::Entry {
+                            path,
+                            directory: false,
+                            ..
+                        }) = selected
+                        {
+                            let Some(session_id) = self.active_workspace_session() else {
+                                self.notice = Some(
+                                    "Select or create a session with a workspace first.".into(),
+                                );
+                                return None;
+                            };
+                            self.workspace_selected_path = Some(path.clone());
+                            self.workspace_file = None;
+                            self.git_diff = None;
+                            self.workspace_preview_open = true;
+                            self.workspace_preview_loading = true;
+                            self.workspace_preview_scroll = 0;
+                            self.workspace_error = None;
+                            return Some(UiCommand::LoadWorkspaceFile { session_id, path });
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => {
+                        if let Some(WorkspacePanelItem::Entry {
+                            path,
+                            directory: true,
+                            expanded: true,
+                            ..
+                        }) = selected
+                        {
+                            self.workspace_expanded.remove(&path);
+                        } else if let Some(WorkspacePanelItem::Entry { path, .. }) = selected {
+                            if let Some((parent, _)) = path.rsplit_once('/') {
+                                if !parent.is_empty() {
+                                    self.workspace_expanded.remove(parent);
+                                    if let Some(index) = items.iter().position(|item| matches!(item, WorkspacePanelItem::Entry { path: row_path, .. } if row_path == parent)) {
+                                        self.panel_cursor = index;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('r') => {
+                        let path = match selected {
+                            Some(WorkspacePanelItem::Entry {
+                                path,
+                                directory: true,
+                                ..
+                            }) => path,
+                            Some(WorkspacePanelItem::Entry { path, .. }) => path
+                                .rsplit_once('/')
+                                .map(|(parent, _)| parent.to_owned())
+                                .unwrap_or_default(),
+                            _ => String::new(),
+                        };
+                        if path.is_empty() {
+                            self.workspace_entries.clear();
+                            self.workspace_expanded.clear();
+                            self.workspace_selected_path = None;
+                            self.panel_cursor = 0;
+                        } else {
+                            self.workspace_entries.remove(&path);
+                            let prefix = format!("{path}/");
+                            self.workspace_entries
+                                .retain(|entry_path, _| !entry_path.starts_with(&prefix));
+                            self.workspace_expanded.retain(|entry_path| {
+                                entry_path == &path || !entry_path.starts_with(&prefix)
+                            });
+                        }
+                        self.workspace_file = None;
+                        self.workspace_preview_open = false;
+                        self.workspace_preview_loading = false;
+                        self.workspace_error = None;
+                        return self.load_workspace_directory(path);
+                    }
+                    _ => {}
+                }
+            }
+            UiPanel::Git => {
+                if self.git_commit_editing {
+                    if key.code == KeyCode::Enter {
+                        let message = self.git_commit_message.text().trim().to_owned();
+                        if message.is_empty() {
+                            self.notice = Some("Enter a commit message first.".into());
+                            return None;
+                        }
+                        let Some(session_id) = self.active_workspace_session() else {
+                            self.git_commit_editing = false;
+                            return None;
+                        };
+                        self.git_commit_editing = false;
+                        self.notice = Some("Committing workspace changes…".into());
+                        return Some(UiCommand::CommitGit {
+                            session_id,
+                            message,
+                        });
+                    }
+                    let _ = self.git_commit_message.handle_key(key);
+                    return None;
+                }
+                if self.git_confirm_push {
+                    match key.code {
+                        KeyCode::Char('y' | 'Y') => {
+                            self.git_confirm_push = false;
+                            if let Some(session_id) = self.active_workspace_session() {
+                                self.notice = Some("Pushing current branch…".into());
+                                return Some(UiCommand::PushGit { session_id });
+                            }
+                        }
+                        KeyCode::Char('n' | 'N') => {
+                            self.git_confirm_push = false;
+                            self.notice = Some("Push cancelled.".into());
+                        }
+                        _ => {}
+                    }
+                    return None;
+                }
+                if self.workspace_preview_open {
+                    match key.code {
+                        KeyCode::PageUp => {
+                            self.workspace_preview_scroll =
+                                self.workspace_preview_scroll.saturating_sub(12);
+                            return None;
+                        }
+                        KeyCode::PageDown => {
+                            self.workspace_preview_scroll =
+                                self.workspace_preview_scroll.saturating_add(12);
+                            return None;
+                        }
+                        KeyCode::Home => {
+                            self.workspace_preview_scroll = 0;
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+                let items = self.workspace_panel_items(UiPanel::Git);
+                let selected = items.get(self.panel_cursor).cloned();
+                match key.code {
+                    KeyCode::Up => self.panel_cursor = self.panel_cursor.saturating_sub(1),
+                    KeyCode::Down => {
+                        self.panel_cursor = self
+                            .panel_cursor
+                            .saturating_add(1)
+                            .min(items.len().saturating_sub(1));
+                    }
+                    KeyCode::Enter => match selected {
+                        Some(WorkspacePanelItem::Change { path, .. }) => {
+                            let Some(session_id) = self.active_workspace_session() else {
+                                return None;
+                            };
+                            self.workspace_selected_path = Some(path.clone());
+                            self.workspace_file = None;
+                            self.workspace_preview_open = true;
+                            self.workspace_preview_loading = true;
+                            self.workspace_preview_scroll = 0;
+                            self.workspace_error = None;
+                            return Some(UiCommand::LoadGitDiff { session_id, path });
+                        }
+                        Some(WorkspacePanelItem::Commit { id, .. }) => {
+                            let Some(session_id) = self.active_workspace_session() else {
+                                return None;
+                            };
+                            self.workspace_selected_path = Some(id.clone());
+                            self.workspace_preview_open = true;
+                            self.workspace_preview_loading = true;
+                            self.workspace_preview_scroll = 0;
+                            self.workspace_error = None;
+                            return Some(UiCommand::LoadGitCommitDiff {
+                                session_id,
+                                commit: id,
+                            });
+                        }
+                        _ => {}
+                    },
+                    KeyCode::Char('r') => return self.refresh_git_panel(),
+                    KeyCode::Char('c') if self.git_refreshing => {
+                        self.notice = Some("Wait for the current Git operation to finish.".into());
+                    }
+                    KeyCode::Char('c') => {
+                        self.git_commit_message.clear();
+                        self.git_commit_editing = true;
+                    }
+                    KeyCode::Char('p') if self.git_refreshing => {
+                        self.notice = Some("Wait for the current Git operation to finish.".into());
+                    }
+                    KeyCode::Char('p') => {
+                        self.git_confirm_push = true;
+                        self.notice =
+                            Some("Push current branch? Press y to confirm, n to cancel.".into());
+                    }
+                    _ => {}
                 }
             }
             UiPanel::Catalog => match key.code {
@@ -2178,6 +2699,161 @@ pub async fn run_with_transport<T: RigaTransport>(
                         }
                     }
                 }
+                BackgroundResult::WorkspaceEntries {
+                    session_id,
+                    path,
+                    result,
+                } => {
+                    if app.state.selected_session.as_deref() == Some(session_id.as_str()) {
+                        app.workspace_loading.remove(&path);
+                        match result {
+                            Ok(entries) => {
+                                app.workspace_entries.insert(path, entries);
+                                app.workspace_error = None;
+                            }
+                            Err(error) => {
+                                app.workspace_error = Some(error.clone());
+                                app.notice =
+                                    Some(format!("Could not list workspace path: {error}"));
+                            }
+                        }
+                    }
+                }
+                BackgroundResult::WorkspaceFile {
+                    session_id,
+                    path,
+                    result,
+                } => {
+                    if app.state.selected_session.as_deref() == Some(session_id.as_str())
+                        && app.workspace_selected_path.as_deref() == Some(path.as_str())
+                    {
+                        app.workspace_preview_loading = false;
+                        match result {
+                            Ok(file) => {
+                                app.workspace_file = Some(file);
+                                app.workspace_error = None;
+                            }
+                            Err(error) => {
+                                app.workspace_file = None;
+                                app.workspace_error = Some(error.clone());
+                                app.notice = Some(format!("Could not preview {path}: {error}"));
+                            }
+                        }
+                    }
+                }
+                BackgroundResult::GitRefresh {
+                    session_id,
+                    status,
+                    commits,
+                } => {
+                    if app.state.selected_session.as_deref() == Some(session_id.as_str()) {
+                        app.git_refreshing = false;
+                        let mut errors = Vec::new();
+                        match status {
+                            Ok(changes) => app.git_changes = changes,
+                            Err(error) => errors.push(format!("status: {error}")),
+                        }
+                        match commits {
+                            Ok(history) => app.git_commits = history,
+                            Err(error) => errors.push(format!("history: {error}")),
+                        }
+                        app.panel_cursor = app.panel_cursor.min(
+                            app.workspace_panel_items(UiPanel::Git)
+                                .len()
+                                .saturating_sub(1),
+                        );
+                        app.workspace_error = if errors.is_empty() {
+                            None
+                        } else {
+                            Some(errors.join(" · "))
+                        };
+                        if let Some(error) = &app.workspace_error {
+                            app.notice = Some(format!("Could not fully refresh Git: {error}"));
+                        }
+                    }
+                }
+                BackgroundResult::GitDiff { session_id, result } => {
+                    if app.state.selected_session.as_deref() == Some(session_id.as_str()) {
+                        app.workspace_preview_loading = false;
+                        match result {
+                            Ok(diff)
+                                if app.workspace_selected_path.as_deref()
+                                    == Some(diff.path.as_str()) =>
+                            {
+                                app.git_diff = Some(diff);
+                                app.workspace_error = None;
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                app.git_diff = None;
+                                app.workspace_error = Some(error.clone());
+                                app.notice = Some(format!("Could not load Git preview: {error}"));
+                            }
+                        }
+                    }
+                }
+                BackgroundResult::GitCommit { session_id, result } => {
+                    let active_session =
+                        app.state.selected_session.as_deref() == Some(session_id.as_str());
+                    if active_session {
+                        app.git_refreshing = false;
+                    }
+                    match result {
+                        Ok(result) => {
+                            app.notice = Some(result.message);
+                            if active_session {
+                                app.workspace_error = None;
+                                app.git_commit_message.clear();
+                                if let Ok(changes) = transport.git_status(session_id.clone()).await
+                                {
+                                    app.git_changes = changes;
+                                }
+                                if let Ok(commits) = transport.git_log(session_id, 60).await {
+                                    app.git_commits = commits;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if active_session {
+                                app.workspace_error = Some(error.clone());
+                                if app.panel == UiPanel::Git {
+                                    app.git_commit_editing = true;
+                                }
+                            }
+                            app.notice = Some(format!("Git commit failed: {error}"));
+                        }
+                    }
+                }
+                BackgroundResult::GitPush { session_id, result } => {
+                    let active_session =
+                        app.state.selected_session.as_deref() == Some(session_id.as_str());
+                    if active_session {
+                        app.git_refreshing = false;
+                    }
+                    match result {
+                        Ok(result) => {
+                            app.notice = Some(result.message);
+                            if active_session {
+                                app.workspace_error = None;
+                            }
+                            if result.pushed && active_session {
+                                if let Ok(changes) = transport.git_status(session_id.clone()).await
+                                {
+                                    app.git_changes = changes;
+                                }
+                                if let Ok(commits) = transport.git_log(session_id, 60).await {
+                                    app.git_commits = commits;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            if active_session {
+                                app.workspace_error = Some(error.clone());
+                            }
+                            app.notice = Some(format!("Git push failed: {error}"));
+                        }
+                    }
+                }
             }
         }
         while let Ok(event) = local_events.try_recv() {
@@ -2400,6 +3076,7 @@ pub async fn run_with_transport<T: RigaTransport>(
                             }
                         }
                         UiCommand::SelectSession { session_id } => {
+                            app.reset_workspace_state();
                             app.set_session_history(
                                 transport.session_history(session_id.clone()).await,
                             );
@@ -2419,6 +3096,7 @@ pub async fn run_with_transport<T: RigaTransport>(
                                 app.set_session_history(Vec::new());
                                 app.current_prompt = None;
                             }
+                            app.reset_workspace_state();
                             app.state.selected_session = Some(session.id.clone());
                             app.state.sessions.push(session);
                         }
@@ -2496,6 +3174,7 @@ pub async fn run_with_transport<T: RigaTransport>(
                                     if app.state.selected_session.as_deref()
                                         == Some(session_id.as_str())
                                     {
+                                        app.reset_workspace_state();
                                         let replacement = app
                                             .state
                                             .sessions
@@ -2535,6 +3214,90 @@ pub async fn run_with_transport<T: RigaTransport>(
                                     app.notice = Some(format!("Could not delete session: {error}"));
                                 }
                             }
+                        }
+                        UiCommand::LoadWorkspaceEntries { session_id, path } => {
+                            let tx = completion_tx.clone();
+                            let transport = transport.clone();
+                            tokio::spawn(async move {
+                                let result = transport
+                                    .workspace_entries(session_id.clone(), path.clone())
+                                    .await;
+                                let _ = tx.send(BackgroundResult::WorkspaceEntries {
+                                    session_id,
+                                    path,
+                                    result,
+                                });
+                            });
+                        }
+                        UiCommand::LoadWorkspaceFile { session_id, path } => {
+                            let tx = completion_tx.clone();
+                            let transport = transport.clone();
+                            tokio::spawn(async move {
+                                let result = transport
+                                    .workspace_file(session_id.clone(), path.clone())
+                                    .await;
+                                let _ = tx.send(BackgroundResult::WorkspaceFile {
+                                    session_id,
+                                    path,
+                                    result,
+                                });
+                            });
+                        }
+                        UiCommand::RefreshGit { session_id } => {
+                            app.git_refreshing = true;
+                            app.workspace_error = None;
+                            let tx = completion_tx.clone();
+                            let transport = transport.clone();
+                            tokio::spawn(async move {
+                                let (status, commits) = tokio::join!(
+                                    transport.git_status(session_id.clone()),
+                                    transport.git_log(session_id.clone(), 60),
+                                );
+                                let _ = tx.send(BackgroundResult::GitRefresh {
+                                    session_id,
+                                    status,
+                                    commits,
+                                });
+                            });
+                        }
+                        UiCommand::LoadGitDiff { session_id, path } => {
+                            let tx = completion_tx.clone();
+                            let transport = transport.clone();
+                            tokio::spawn(async move {
+                                let result = transport.git_diff(session_id.clone(), path).await;
+                                let _ = tx.send(BackgroundResult::GitDiff { session_id, result });
+                            });
+                        }
+                        UiCommand::LoadGitCommitDiff { session_id, commit } => {
+                            let tx = completion_tx.clone();
+                            let transport = transport.clone();
+                            tokio::spawn(async move {
+                                let result =
+                                    transport.git_commit_diff(session_id.clone(), commit).await;
+                                let _ = tx.send(BackgroundResult::GitDiff { session_id, result });
+                            });
+                        }
+                        UiCommand::CommitGit {
+                            session_id,
+                            message,
+                        } => {
+                            app.git_refreshing = true;
+                            let tx = completion_tx.clone();
+                            let transport = transport.clone();
+                            tokio::spawn(async move {
+                                let result =
+                                    transport.git_commit(session_id.clone(), message).await;
+                                let _ = tx.send(BackgroundResult::GitCommit { session_id, result });
+                            });
+                        }
+                        UiCommand::PushGit { session_id } => {
+                            app.git_refreshing = true;
+                            let tx = completion_tx.clone();
+                            let transport = transport.clone();
+                            tokio::spawn(async move {
+                                let result = transport.git_push(session_id.clone()).await;
+                                let _ = tx.send(BackgroundResult::GitPush { session_id, result });
+                            });
                         }
                         UiCommand::SaveProvider { config } => {
                             let selected_model = config.model.clone();
@@ -3543,7 +4306,7 @@ mod tests {
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: 90,
-                row: 4,
+                row: 6,
                 modifiers: KeyModifiers::NONE,
             },
             120,
@@ -3565,6 +4328,82 @@ mod tests {
     }
 
     #[test]
+    fn mouse_nav_opens_explorer_and_git_panels() {
+        let mut app = UiState::default();
+        app.state.selected_session = Some("session-workspace".into());
+        assert_eq!(
+            app.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 90,
+                    row: 2,
+                    modifiers: KeyModifiers::NONE,
+                },
+                120,
+                40,
+            ),
+            Some(UiCommand::LoadWorkspaceEntries {
+                session_id: "session-workspace".into(),
+                path: String::new(),
+            })
+        );
+        assert_eq!(app.panel, UiPanel::Files);
+        assert_eq!(
+            app.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 90,
+                    row: 3,
+                    modifiers: KeyModifiers::NONE,
+                },
+                120,
+                40,
+            ),
+            Some(UiCommand::RefreshGit {
+                session_id: "session-workspace".into(),
+            })
+        );
+        assert_eq!(app.panel, UiPanel::Git);
+    }
+
+    #[test]
+    fn mouse_clicking_a_file_opens_its_preview_on_wide_and_narrow_layouts() {
+        for (width, height, x, y) in [(120, 40, 90, 9), (80, 24, 10, 2)] {
+            let mut app = UiState {
+                panel: UiPanel::Files,
+                ..UiState::default()
+            };
+            app.state.selected_session = Some("session-files".into());
+            app.workspace_entries.insert(
+                String::new(),
+                vec![riga_server::files::WorkspaceEntry {
+                    name: "main.rs".into(),
+                    path: "main.rs".into(),
+                    kind: "file",
+                }],
+            );
+            assert_eq!(
+                app.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: x,
+                        row: y,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    width,
+                    height,
+                ),
+                Some(UiCommand::LoadWorkspaceFile {
+                    session_id: "session-files".into(),
+                    path: "main.rs".into(),
+                }),
+                "file click failed at {width} columns"
+            );
+            assert!(app.workspace_preview_open);
+        }
+    }
+
+    #[test]
     fn mouse_clicking_a_history_session_opens_it() {
         let mut app = UiState::default();
         app.state.sessions.push(riga_kernel::state::Session {
@@ -3581,7 +4420,7 @@ mod tests {
                 MouseEvent {
                     kind: MouseEventKind::Down(MouseButton::Left),
                     column: 90,
-                    row: 9,
+                    row: 10,
                     modifiers: KeyModifiers::NONE,
                 },
                 120,
@@ -3949,5 +4788,127 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn f4_lazily_loads_workspace_and_enter_expands_directories() {
+        let mut app = UiState::default();
+        app.state.selected_session = Some("session-files".into());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE)),
+            Some(UiCommand::LoadWorkspaceEntries {
+                session_id: "session-files".into(),
+                path: String::new(),
+            })
+        );
+        assert!(app.workspace_loading.contains(""));
+        app.workspace_loading.clear();
+        app.workspace_entries.insert(
+            String::new(),
+            vec![riga_server::files::WorkspaceEntry {
+                name: "src".into(),
+                path: "src".into(),
+                kind: "dir",
+            }],
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(UiCommand::LoadWorkspaceEntries {
+                session_id: "session-files".into(),
+                path: "src".into(),
+            })
+        );
+        assert!(app.workspace_expanded.contains("src"));
+    }
+
+    #[test]
+    fn file_preview_uses_escape_without_leaving_explorer() {
+        let mut app = UiState {
+            panel: UiPanel::Files,
+            ..UiState::default()
+        };
+        app.state.selected_session = Some("session-files".into());
+        app.workspace_entries.insert(
+            String::new(),
+            vec![riga_server::files::WorkspaceEntry {
+                name: "README.md".into(),
+                path: "README.md".into(),
+                kind: "file",
+            }],
+        );
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(UiCommand::LoadWorkspaceFile {
+                session_id: "session-files".into(),
+                path: "README.md".into(),
+            })
+        );
+        assert!(app.workspace_preview_open);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.workspace_preview_open);
+        assert_eq!(app.panel, UiPanel::Files);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::Transcript);
+    }
+
+    #[test]
+    fn git_panel_previews_changes_and_requires_confirmation_before_push() {
+        let mut app = UiState {
+            panel: UiPanel::Git,
+            ..UiState::default()
+        };
+        app.state.selected_session = Some("session-git".into());
+        app.git_changes.push(riga_server::files::GitChange {
+            path: "src/main.rs".into(),
+            status: "modified".into(),
+            staged: false,
+            untracked: false,
+        });
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(UiCommand::LoadGitDiff {
+                session_id: "session-git".into(),
+                path: "src/main.rs".into(),
+            })
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.panel, UiPanel::Git);
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert!(app.git_confirm_push);
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            None
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Some(UiCommand::PushGit {
+                session_id: "session-git".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn git_commit_editor_emits_only_a_non_empty_message() {
+        let mut app = UiState {
+            panel: UiPanel::Git,
+            ..UiState::default()
+        };
+        app.state.selected_session = Some("session-git".into());
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            None
+        );
+        for character in "release checkpoint".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some(UiCommand::CommitGit {
+                session_id: "session-git".into(),
+                message: "release checkpoint".into(),
+            })
+        );
     }
 }

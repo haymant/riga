@@ -14,7 +14,7 @@ const MAX_FILE_BYTES: u64 = 512 * 1024;
 /// Cap on the entries returned for one directory listing.
 const MAX_DIR_ENTRIES: usize = 2_000;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkspaceEntry {
     pub name: String,
     /// Forward-slash path relative to the worktree root.
@@ -23,7 +23,7 @@ pub struct WorkspaceEntry {
     pub kind: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkspaceFile {
     pub path: String,
     pub text: String,
@@ -32,7 +32,7 @@ pub struct WorkspaceFile {
     pub binary: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitChange {
     pub path: String,
     /// `modified`, `added`, `deleted`, `renamed`, `untracked`, or `conflicted`.
@@ -41,7 +41,7 @@ pub struct GitChange {
     pub untracked: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkspaceDiff {
     pub path: String,
     pub status: String,
@@ -49,13 +49,13 @@ pub struct WorkspaceDiff {
     pub binary: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitCommitResult {
     pub committed: bool,
     pub message: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitPushResult {
     pub pushed: bool,
     pub message: String,
@@ -286,7 +286,7 @@ pub async fn git_diff(root: &Path, relative: &str) -> Result<WorkspaceDiff, Stri
 }
 
 /// One commit from `git log`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitCommit {
     pub id: String,
     pub short: String,

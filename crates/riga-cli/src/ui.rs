@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Block, Borders, Gauge, Paragraph, Wrap},
 };
 
-use crate::app::UiState;
+use crate::app::{UiState, WorkspacePanelItem};
 use crate::{
     markdown::render_markdown,
     model::{ConnectionState, RunStatus, TranscriptItem, UiPanel},
@@ -212,9 +212,9 @@ pub(crate) fn history_session_index_at(
         (
             Rect {
                 x: sidebar_x,
-                y: 7,
+                y: 8,
                 width: sidebar_width,
-                height: terminal_height.saturating_sub(7),
+                height: terminal_height.saturating_sub(8),
             },
             true,
         )
@@ -273,6 +273,106 @@ pub(crate) fn history_session_index_at(
     (index < visible_count).then_some(index)
 }
 
+pub(crate) fn workspace_panel_item_index_at(
+    app: &UiState,
+    terminal_width: u16,
+    terminal_height: u16,
+    x: u16,
+    y: u16,
+) -> Option<(UiPanel, usize)> {
+    let panel = active_sidebar_panel(app);
+    if !matches!(panel, UiPanel::Files | UiPanel::Git) {
+        return None;
+    }
+    let screen = Rect::new(0, 0, terminal_width, terminal_height);
+    let wide_sidebar = has_wide_sidebar(screen);
+    if !wide_sidebar && app.workspace_preview_open {
+        return None;
+    }
+    let (content, show_title) = if wide_sidebar {
+        let sidebar_width = if app.sidebar_width == 0 {
+            34
+        } else {
+            app.sidebar_width.clamp(24, 56)
+        };
+        let sidebar_x = terminal_width.saturating_sub(sidebar_width);
+        if x < sidebar_x {
+            return None;
+        }
+        (
+            Rect {
+                x: sidebar_x,
+                y: 8,
+                width: sidebar_width,
+                height: terminal_height.saturating_sub(8),
+            },
+            true,
+        )
+    } else {
+        if app.panel != panel {
+            return None;
+        }
+        let composer = composer_height(app, screen);
+        let height = terminal_height
+            .saturating_sub(composer.saturating_add(3))
+            .min(14);
+        if height < 3 || terminal_width < 8 {
+            return None;
+        }
+        let popup = Rect {
+            x: 1,
+            y: 1,
+            width: terminal_width.saturating_sub(2),
+            height,
+        };
+        let content = Rect {
+            x: popup.x.saturating_add(1),
+            y: popup.y.saturating_add(1),
+            width: popup.width.saturating_sub(2),
+            height: popup.height.saturating_sub(2),
+        };
+        if x < content.x || x >= content.x.saturating_add(content.width) {
+            return None;
+        }
+        (content, false)
+    };
+    let footer_height = sidebar_footer_height(app, panel, content.height);
+    let body_height = content.height.saturating_sub(footer_height);
+    let max_lines = body_height.saturating_sub(u16::from(show_title)) as usize;
+    let mut prefix_lines = 0usize;
+    if app.state.selected_session.is_none() {
+        prefix_lines = 1;
+    } else {
+        if panel == UiPanel::Files && app.workspace_error.is_some() {
+            prefix_lines += 1;
+        }
+        if panel == UiPanel::Files && !app.workspace_entries.contains_key("") {
+            prefix_lines += 1;
+        }
+        if panel == UiPanel::Git {
+            prefix_lines += 1 + usize::from(app.workspace_error.is_some());
+            prefix_lines += usize::from(app.git_refreshing);
+        }
+    }
+    let list_capacity = max_lines.saturating_sub(prefix_lines);
+    let items = app.workspace_panel_items(panel);
+    if list_capacity == 0 || items.is_empty() {
+        return None;
+    }
+    let start = app
+        .panel_cursor
+        .saturating_sub(list_capacity.saturating_sub(1));
+    let first_row = content
+        .y
+        .saturating_add(u16::from(show_title))
+        .saturating_add(prefix_lines as u16);
+    if y < first_row || y >= first_row.saturating_add(list_capacity as u16) {
+        return None;
+    }
+    let index = start.saturating_add(y.saturating_sub(first_row) as usize);
+    (index < items.len()).then_some((panel, index))
+}
+
 fn active_sidebar_panel(app: &UiState) -> UiPanel {
     if app.panel != UiPanel::Transcript {
         app.panel
@@ -287,6 +387,8 @@ fn sidebar_panel_title(panel: UiPanel, model_picker_open: bool) -> &'static str 
     }
     match panel {
         UiPanel::History => "History",
+        UiPanel::Files => "Explorer",
+        UiPanel::Git => "Source control",
         UiPanel::Settings => "Settings",
         UiPanel::Catalog => "Catalog",
         UiPanel::RunDeck => "RunDeck",
@@ -419,6 +521,12 @@ fn sidebar_panel_lines(
                     )));
                 }
             }
+        }
+        UiPanel::Files => {
+            lines.extend(render_workspace_sidebar(app, panel, max_lines, max_width));
+        }
+        UiPanel::Git => {
+            lines.extend(render_workspace_sidebar(app, panel, max_lines, max_width));
         }
         UiPanel::Settings if app.model_picker_open => {
             lines.extend(render_remote_models_sidebar(app, max_lines, max_width));
@@ -595,11 +703,166 @@ fn sidebar_panel_lines(
     lines
 }
 
+fn render_workspace_sidebar(
+    app: &UiState,
+    panel: UiPanel,
+    max_lines: usize,
+    max_width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if app.state.selected_session.is_none() {
+        lines.push(Line::from("Select a session to browse its workspace."));
+        return lines;
+    }
+    match panel {
+        UiPanel::Files => {
+            if let Some(error) = &app.workspace_error {
+                lines.push(Line::from(Span::styled(
+                    fit_sidebar_text(error, max_width),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            if !app.workspace_entries.contains_key("") {
+                lines.push(Line::from(if app.workspace_loading.contains("") {
+                    "Loading workspace…"
+                } else {
+                    "Workspace not loaded · r refresh"
+                }));
+                return lines;
+            }
+        }
+        UiPanel::Git => {
+            if let Some(error) = &app.workspace_error {
+                lines.push(Line::from(Span::styled(
+                    fit_sidebar_text(error, max_width),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+            lines.push(sidebar_field(
+                "Changes / commits",
+                &format!("{} / {}", app.git_changes.len(), app.git_commits.len()),
+                max_width,
+            ));
+            if app.git_refreshing {
+                lines.push(Line::from("Refreshing Git status…"));
+            }
+        }
+        _ => return lines,
+    }
+
+    let items = app.workspace_panel_items(panel);
+    if items.is_empty() {
+        lines.push(Line::from(match panel {
+            UiPanel::Files => "No files in this workspace.",
+            UiPanel::Git => "Clean worktree · no recent commits.",
+            _ => "",
+        }));
+        return lines;
+    }
+    let available = max_lines.saturating_sub(lines.len()).max(1);
+    let start = app.panel_cursor.saturating_sub(available.saturating_sub(1));
+    for (index, item) in items.iter().enumerate().skip(start).take(available) {
+        let (marker, label) = match item {
+            WorkspacePanelItem::Entry {
+                path,
+                name,
+                depth,
+                directory,
+                expanded,
+                loading,
+            } => {
+                let indent = "  ".repeat(*depth);
+                let icon = if *loading {
+                    "…"
+                } else if *directory && *expanded {
+                    "▾"
+                } else if *directory {
+                    "▸"
+                } else {
+                    " "
+                };
+                let selected = app.workspace_selected_path.as_deref() == Some(path.as_str());
+                let label = fit_sidebar_text(
+                    &format!("{indent}{icon} {name}"),
+                    max_width.saturating_sub(3),
+                );
+                (
+                    if index == app.panel_cursor || selected {
+                        "›"
+                    } else {
+                        " "
+                    },
+                    label,
+                )
+            }
+            WorkspacePanelItem::Change {
+                path,
+                status,
+                staged,
+                untracked,
+            } => {
+                let code = match status.as_str() {
+                    "added" => "A",
+                    "deleted" => "D",
+                    "renamed" => "R",
+                    "conflicted" => "!",
+                    "untracked" if *untracked => "U",
+                    _ => "M",
+                };
+                let label = fit_sidebar_text(
+                    &format!("{} {code} {path}", if *staged { "staged" } else { "work" }),
+                    max_width.saturating_sub(3),
+                );
+                (
+                    if index == app.panel_cursor
+                        || app.workspace_selected_path.as_deref() == Some(path.as_str())
+                    {
+                        "›"
+                    } else {
+                        " "
+                    },
+                    label,
+                )
+            }
+            WorkspacePanelItem::Commit { short, message, .. } => (
+                if index == app.panel_cursor {
+                    "›"
+                } else {
+                    " "
+                },
+                fit_sidebar_text(
+                    &format!("commit {short} {message}"),
+                    max_width.saturating_sub(3),
+                ),
+            ),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{marker} "),
+                Style::default().fg(if marker == "›" {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::styled(
+                label,
+                Style::default().fg(if index == app.panel_cursor {
+                    Color::White
+                } else {
+                    Color::Gray
+                }),
+            ),
+        ]));
+    }
+    lines
+}
+
 fn sidebar_footer_hints(app: &UiState, panel: UiPanel) -> Vec<String> {
     if app.panel != panel {
         return vec![
             "Tab focus · +/- resize".into(),
-            "F3 history · Ctrl+I info".into(),
+            "F3 history · F4 files · F5 Git".into(),
         ];
     }
     match panel {
@@ -621,6 +884,26 @@ fn sidebar_footer_hints(app: &UiState, panel: UiPanel) -> Vec<String> {
             } else {
                 "a archive · x delete · v archived".into()
             },
+        ],
+        UiPanel::Files => vec![
+            "↑/↓ select · Enter open/expand".into(),
+            "←/h collapse · PgUp/PgDn preview".into(),
+            "r refresh · Esc back · F5 Git".into(),
+        ],
+        UiPanel::Git if app.git_commit_editing => [
+            "Enter commit · Esc cancel".into(),
+            "Tab returns to chat".into(),
+        ]
+        .into(),
+        UiPanel::Git if app.git_confirm_push => [
+            "Press y to confirm push".into(),
+            "n/Esc cancel · no push yet".into(),
+        ]
+        .into(),
+        UiPanel::Git => vec![
+            "↑/↓ select · Enter inspect diff".into(),
+            "c commit · p confirm push · r refresh".into(),
+            "PgUp/PgDn preview · Esc back".into(),
         ],
         UiPanel::Transcript => [
             "↑/↓ select · Enter open".into(),
@@ -1214,6 +1497,9 @@ fn active_panel_editor(app: &UiState, panel: UiPanel) -> Option<(&'static str, S
             _ => return None,
         },
         UiPanel::Catalog => ("Filter", &app.catalog_query, false),
+        UiPanel::Git if app.git_commit_editing => {
+            ("Commit message", &app.git_commit_message, false)
+        }
         UiPanel::LocalModels if app.local_attachment_input => {
             ("Model path", &app.panel_input, false)
         }
@@ -1250,30 +1536,34 @@ fn render_panel_surface_body(
             .saturating_sub(footer_height),
         ..area
     };
-    let mut lines = Vec::new();
-    if show_title {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  {}",
-                sidebar_panel_title(panel, app.model_picker_open).to_uppercase()
-            ),
-            Style::default()
-                .fg(Color::Gray)
-                .add_modifier(Modifier::BOLD),
-        )));
+    if !show_title && app.workspace_preview_open && matches!(panel, UiPanel::Files | UiPanel::Git) {
+        render_workspace_preview(frame, body_area, app);
+    } else {
+        let mut lines = Vec::new();
+        if show_title {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {}",
+                    sidebar_panel_title(panel, app.model_picker_open).to_uppercase()
+                ),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+        lines.extend(sidebar_panel_lines(
+            app,
+            panel,
+            body_area.height.saturating_sub(u16::from(show_title)) as usize,
+            body_area.width as usize,
+        ));
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().fg(Color::Gray).bg(background))
+                .wrap(Wrap { trim: true }),
+            body_area,
+        );
     }
-    lines.extend(sidebar_panel_lines(
-        app,
-        panel,
-        body_area.height.saturating_sub(u16::from(show_title)) as usize,
-        body_area.width as usize,
-    ));
-    frame.render_widget(
-        Paragraph::new(Text::from(lines))
-            .style(Style::default().fg(Color::Gray).bg(background))
-            .wrap(Wrap { trim: true }),
-        body_area,
-    );
 
     if let Some((label, value, cursor)) = editor {
         if editor_height == 0 {
@@ -1342,7 +1632,7 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Min(1),
         ])
         .split(area);
@@ -1358,6 +1648,8 @@ fn render_sidebar(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
     let selected = active_sidebar_panel(app);
     let entries = [
         (UiPanel::History, "History     F3"),
+        (UiPanel::Files, "Explorer    F4"),
+        (UiPanel::Git, "Git         F5"),
         (UiPanel::Settings, "Settings    ^,"),
         (UiPanel::LocalModels, "Local models ^L"),
         (UiPanel::Help, "Info        ^I"),
@@ -1412,10 +1704,19 @@ fn render_compact_panel_overlay(frame: &mut Frame<'_>, area: Rect, app: &UiState
     let background = Color::Rgb(31, 31, 34);
     frame.render_widget(
         Block::default()
-            .title(format!(
-                " {} · Esc close ",
-                sidebar_panel_title(panel, app.model_picker_open)
-            ))
+            .title(
+                if app.workspace_preview_open && matches!(panel, UiPanel::Files | UiPanel::Git) {
+                    format!(
+                        " {} · Esc back ",
+                        app.workspace_selected_path.as_deref().unwrap_or("Preview")
+                    )
+                } else {
+                    format!(
+                        " {} · Esc close ",
+                        sidebar_panel_title(panel, app.model_picker_open)
+                    )
+                },
+            )
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .style(Style::default().fg(Color::Gray).bg(background)),
@@ -1442,7 +1743,11 @@ fn render_transcript_column(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
         .split(area);
 
     render_topbar(frame, chunks[0], app);
-    render_transcript(frame, chunks[1], app);
+    if app.workspace_preview_open && matches!(app.panel, UiPanel::Files | UiPanel::Git) {
+        render_workspace_preview(frame, chunks[1], app);
+    } else {
+        render_transcript(frame, chunks[1], app);
+    }
     render_composer(frame, chunks[2], app);
     render_completion_popup(frame, chunks[2], app);
     render_footer(frame, chunks[3], app);
@@ -1510,6 +1815,139 @@ fn render_completion_popup(frame: &mut Frame<'_>, composer: Rect, app: &UiState)
     );
 }
 
+fn render_workspace_preview(frame: &mut Frame<'_>, area: Rect, app: &UiState) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let background = Color::Rgb(24, 24, 26);
+    let title = app
+        .workspace_selected_path
+        .as_deref()
+        .unwrap_or("Workspace preview");
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "  PREVIEW  ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(title.to_owned(), Style::default().fg(Color::Gray)),
+    ])];
+    if app.workspace_preview_loading {
+        lines.push(Line::from(Span::styled(
+            "Loading preview…",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if let Some(error) = &app.workspace_error {
+        lines.push(Line::from(Span::styled(
+            error.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    } else if app.panel == UiPanel::Files {
+        if let Some(file) = &app.workspace_file {
+            if file.binary {
+                lines.push(Line::from(Span::styled(
+                    format!("Binary file · {} bytes · no text preview", file.size),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                let lower_path = file.path.to_ascii_lowercase();
+                let language = lower_path
+                    .rsplit_once('.')
+                    .map(|(_, extension)| extension)
+                    .unwrap_or("text");
+                lines.push(Line::from(Span::styled(
+                    format!("{language} · {} bytes", file.size),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                if lower_path.ends_with(".md") || lower_path.ends_with(".mdx") {
+                    lines.extend(render_markdown(&file.text));
+                } else {
+                    let display_text = if lower_path.ends_with(".json") {
+                        serde_json::from_str::<serde_json::Value>(&file.text)
+                            .ok()
+                            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+                            .unwrap_or_else(|| file.text.clone())
+                    } else {
+                        file.text.clone()
+                    };
+                    if display_text.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            "(empty file)",
+                            Style::default().fg(Color::DarkGray),
+                        )));
+                    } else {
+                        let gutter_width = display_text.lines().count().to_string().len().max(3);
+                        for (index, text) in display_text.lines().enumerate() {
+                            lines.push(Line::from(vec![
+                                Span::styled(
+                                    format!("{:>gutter_width$} │ ", index + 1),
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                                Span::styled(text.to_owned(), Style::default().fg(Color::Gray)),
+                            ]));
+                        }
+                    }
+                }
+            }
+            if file.truncated {
+                lines.push(Line::from(Span::styled(
+                    format!("Preview truncated · {} bytes total", file.size),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+        }
+    } else if let Some(diff) = &app.git_diff {
+        if diff.binary {
+            lines.push(Line::from(Span::styled(
+                "Binary file · no text diff",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else if diff.diff.trim().is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No diff available",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for text in diff.diff.lines() {
+                let color = if text.starts_with("@@") {
+                    Color::Cyan
+                } else if text.starts_with("+++") || text.starts_with("---") {
+                    Color::DarkGray
+                } else if text.starts_with('+') {
+                    Color::Green
+                } else if text.starts_with('-') {
+                    Color::Red
+                } else if text.starts_with("diff ") || text.starts_with("index ") {
+                    Color::DarkGray
+                } else {
+                    Color::Gray
+                };
+                lines.push(Line::from(Span::styled(
+                    text.to_owned(),
+                    Style::default().fg(color),
+                )));
+            }
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().fg(Color::Gray).bg(background))
+            .scroll((
+                app.workspace_preview_scroll.min(u16::MAX as usize) as u16,
+                0,
+            ))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(Color::Rgb(48, 48, 52)))
+                    .style(Style::default().bg(background)),
+            ),
+        area,
+    );
+}
+
 fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
     let area = frame.area();
     let (title, lines) = match app.panel {
@@ -1553,6 +1991,24 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
             }
             ("Session history", lines)
         }
+        crate::model::UiPanel::Files => (
+            "Workspace explorer",
+            render_workspace_sidebar(
+                app,
+                UiPanel::Files,
+                area.height.saturating_sub(2) as usize,
+                area.width.saturating_sub(2) as usize,
+            ),
+        ),
+        crate::model::UiPanel::Git => (
+            "Source control",
+            render_workspace_sidebar(
+                app,
+                UiPanel::Git,
+                area.height.saturating_sub(2) as usize,
+                area.width.saturating_sub(2) as usize,
+            ),
+        ),
         crate::model::UiPanel::Settings => {
             let p = &app.provider;
             let masked = if p.api_key.is_empty() {
@@ -1626,7 +2082,7 @@ fn render_panel(frame: &mut Frame<'_>, app: &UiState) {
         crate::model::UiPanel::Help => (
             "Help",
             vec![Line::from(
-                "Ctrl+I info · F3 history · Ctrl+,/F2 settings · Ctrl+K catalog · Ctrl+J newline · Ctrl+D RunDeck · Ctrl+L models · Ctrl+O shell stdin · Ctrl+R reasoning · Ctrl+T tools · Ctrl+C stop · Ctrl+Shift+C copy · Ctrl+Shift+V paste · /export [path] JSONL · +/- sidebar · y/a/n approvals · Esc close/cancel · q quit",
+                "Ctrl+I info · F3 history · F4 explorer · F5 Git · Ctrl+,/F2 settings · Ctrl+K catalog · Ctrl+J newline · Ctrl+D RunDeck · Ctrl+L models · Ctrl+O shell stdin · Ctrl+R reasoning · Ctrl+T tools · Ctrl+C stop · Ctrl+Shift+C copy · Ctrl+Shift+V paste · /export [path] JSONL · +/- sidebar · y/a/n approvals · Esc close/cancel · q quit",
             )],
         ),
         crate::model::UiPanel::Transcript => unreachable!(),
@@ -3103,5 +3559,98 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
             assert_eq!(app.panel, UiPanel::Transcript);
         }
+    }
+
+    #[test]
+    fn explorer_preview_renders_at_desktop_and_compact_widths() {
+        for (width, height) in [(120, 40), (80, 24)] {
+            let backend = TestBackend::new(width, height);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut app = UiState {
+                panel: UiPanel::Files,
+                ..UiState::default()
+            };
+            app.state.selected_session = Some("session-files".into());
+            app.draft.replace("composer remains visible");
+            app.workspace_entries.insert(
+                String::new(),
+                vec![riga_server::files::WorkspaceEntry {
+                    name: "main.rs".into(),
+                    path: "main.rs".into(),
+                    kind: "file",
+                }],
+            );
+            app.workspace_selected_path = Some("main.rs".into());
+            app.workspace_file = Some(riga_server::files::WorkspaceFile {
+                path: "main.rs".into(),
+                text: "fn main() {}".into(),
+                size: 12,
+                truncated: false,
+                binary: false,
+            });
+            app.workspace_preview_open = true;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                text.contains("main.rs"),
+                "file name missing at {width} columns"
+            );
+            assert!(
+                text.contains("fn main() {}"),
+                "preview missing at {width} columns"
+            );
+            assert!(text.contains("composer remains visible"));
+            if width >= 112 {
+                assert!(text.contains("EXPLORER"));
+                assert!(text.contains("F5"));
+            } else {
+                assert!(text.contains("Esc back"));
+            }
+        }
+    }
+
+    #[test]
+    fn git_sidebar_groups_staged_and_worktree_changes_before_commits() {
+        let mut app = UiState {
+            panel: UiPanel::Git,
+            ..UiState::default()
+        };
+        app.state.selected_session = Some("session-git".into());
+        app.git_changes.extend([
+            riga_server::files::GitChange {
+                path: "staged.rs".into(),
+                status: "added".into(),
+                staged: true,
+                untracked: false,
+            },
+            riga_server::files::GitChange {
+                path: "working.rs".into(),
+                status: "modified".into(),
+                staged: false,
+                untracked: false,
+            },
+        ]);
+        app.git_commits.push(riga_server::files::GitCommit {
+            id: "abcdef012345".into(),
+            short: "abcdef0".into(),
+            message: "Recent change".into(),
+            author: "RIGA".into(),
+            timestamp: 1,
+        });
+        let text = sidebar_panel_lines(&app, UiPanel::Git, 20, 40)
+            .iter()
+            .map(line_plain_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("staged.rs"));
+        assert!(text.contains("working.rs"));
+        assert!(text.contains("commit abcdef0 Recent change"));
+        assert!(sidebar_footer_hints(&app, UiPanel::Git)[0].contains("Enter inspect diff"));
     }
 }

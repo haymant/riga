@@ -40,6 +40,8 @@ pub enum UiPanel {
     #[default]
     Transcript,
     History,
+    Files,
+    Git,
     Settings,
     Catalog,
     RunDeck,

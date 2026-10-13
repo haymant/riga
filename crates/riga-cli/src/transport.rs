@@ -59,6 +59,45 @@ pub trait RigaTransport: Clone + Send + Sync + 'static {
         confirmation_name: String,
     ) -> TransportFuture<Result<(), String>>;
 
+    fn workspace_entries(
+        &self,
+        session_id: String,
+        path: String,
+    ) -> TransportFuture<Result<Vec<riga_server::files::WorkspaceEntry>, String>>;
+    fn workspace_file(
+        &self,
+        session_id: String,
+        path: String,
+    ) -> TransportFuture<Result<riga_server::files::WorkspaceFile, String>>;
+    fn git_status(
+        &self,
+        session_id: String,
+    ) -> TransportFuture<Result<Vec<riga_server::files::GitChange>, String>>;
+    fn git_diff(
+        &self,
+        session_id: String,
+        path: String,
+    ) -> TransportFuture<Result<riga_server::files::WorkspaceDiff, String>>;
+    fn git_log(
+        &self,
+        session_id: String,
+        limit: usize,
+    ) -> TransportFuture<Result<Vec<riga_server::files::GitCommit>, String>>;
+    fn git_commit_diff(
+        &self,
+        session_id: String,
+        commit: String,
+    ) -> TransportFuture<Result<riga_server::files::WorkspaceDiff, String>>;
+    fn git_commit(
+        &self,
+        session_id: String,
+        message: String,
+    ) -> TransportFuture<Result<riga_server::files::GitCommitResult, String>>;
+    fn git_push(
+        &self,
+        session_id: String,
+    ) -> TransportFuture<Result<riga_server::files::GitPushResult, String>>;
+
     fn configure_provider(
         &self,
         config: ProviderConfig,
@@ -160,6 +199,68 @@ impl IpcTransport {
         self.service
             .delete_session(session_id, confirmation_name)
             .await
+    }
+
+    pub async fn workspace_entries(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<Vec<riga_server::files::WorkspaceEntry>, String> {
+        self.service.workspace_dir(session_id, path).await
+    }
+
+    pub async fn workspace_file(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<riga_server::files::WorkspaceFile, String> {
+        self.service.workspace_file(session_id, path).await
+    }
+
+    pub async fn git_status(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<riga_server::files::GitChange>, String> {
+        self.service.git_status(session_id).await
+    }
+
+    pub async fn git_diff(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<riga_server::files::WorkspaceDiff, String> {
+        self.service.git_diff(session_id, path).await
+    }
+
+    pub async fn git_log(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<riga_server::files::GitCommit>, String> {
+        self.service.git_log(session_id, limit).await
+    }
+
+    pub async fn git_commit_diff(
+        &self,
+        session_id: &str,
+        commit: &str,
+    ) -> Result<riga_server::files::WorkspaceDiff, String> {
+        self.service.git_commit_diff(session_id, commit).await
+    }
+
+    pub async fn git_commit(
+        &self,
+        session_id: &str,
+        message: &str,
+    ) -> Result<riga_server::files::GitCommitResult, String> {
+        self.service.git_commit(session_id, message).await
+    }
+
+    pub async fn git_push(
+        &self,
+        session_id: &str,
+    ) -> Result<riga_server::files::GitPushResult, String> {
+        self.service.git_push(session_id).await
     }
 
     pub async fn provider(&self) -> Result<Option<ProviderConfigured>, String> {
@@ -335,6 +436,76 @@ impl RigaTransport for IpcTransport {
                 .delete_session(&session_id, &confirmation_name)
                 .await
         })
+    }
+
+    fn workspace_entries(
+        &self,
+        session_id: String,
+        path: String,
+    ) -> TransportFuture<Result<Vec<riga_server::files::WorkspaceEntry>, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.workspace_entries(&session_id, &path).await })
+    }
+
+    fn workspace_file(
+        &self,
+        session_id: String,
+        path: String,
+    ) -> TransportFuture<Result<riga_server::files::WorkspaceFile, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.workspace_file(&session_id, &path).await })
+    }
+
+    fn git_status(
+        &self,
+        session_id: String,
+    ) -> TransportFuture<Result<Vec<riga_server::files::GitChange>, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.git_status(&session_id).await })
+    }
+
+    fn git_diff(
+        &self,
+        session_id: String,
+        path: String,
+    ) -> TransportFuture<Result<riga_server::files::WorkspaceDiff, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.git_diff(&session_id, &path).await })
+    }
+
+    fn git_log(
+        &self,
+        session_id: String,
+        limit: usize,
+    ) -> TransportFuture<Result<Vec<riga_server::files::GitCommit>, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.git_log(&session_id, limit).await })
+    }
+
+    fn git_commit_diff(
+        &self,
+        session_id: String,
+        commit: String,
+    ) -> TransportFuture<Result<riga_server::files::WorkspaceDiff, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.git_commit_diff(&session_id, &commit).await })
+    }
+
+    fn git_commit(
+        &self,
+        session_id: String,
+        message: String,
+    ) -> TransportFuture<Result<riga_server::files::GitCommitResult, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.git_commit(&session_id, &message).await })
+    }
+
+    fn git_push(
+        &self,
+        session_id: String,
+    ) -> TransportFuture<Result<riga_server::files::GitPushResult, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.git_push(&session_id).await })
     }
 
     fn configure_provider(
