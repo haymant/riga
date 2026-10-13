@@ -1,0 +1,3 @@
+[submodule "demo1"]
+	path = demo1
+	url = file:///home/data/git/haymant/riga/.riga/submodule-origins/demo1.git
