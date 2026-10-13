@@ -52,6 +52,14 @@ const REQUEST_METHODS = [
   "listMcpRegistry",
   "saveMcpRegistry",
   "uploadAttachment",
+  "workspaceEntries",
+  "workspaceFile",
+  "gitStatus",
+  "gitDiff",
+  "gitLog",
+  "gitCommitDiff",
+  "gitCommit",
+  "gitPush",
   "listLocalModels",
   "downloadModel",
   "cancelDownload",
@@ -80,6 +88,14 @@ function callRequest(transport: RigaTransport, method: RequestMethod): Promise<u
     case "listMcpRegistry": return transport.listMcpRegistry();
     case "saveMcpRegistry": return transport.saveMcpRegistry({ name: "health", transport: "stdio", command: "health-mcp" });
     case "uploadAttachment": return transport.uploadAttachment(new File(["hello"], "note.txt"), "session");
+    case "workspaceEntries": return transport.workspaceEntries("session", "src");
+    case "workspaceFile": return transport.workspaceFile("session", "src/app.tsx");
+    case "gitStatus": return transport.gitStatus("session");
+    case "gitDiff": return transport.gitDiff("session", "src/app.tsx");
+    case "gitCommit": return transport.gitCommit("session", "message");
+    case "gitPush": return transport.gitPush("session");
+    case "gitLog": return transport.gitLog("session");
+    case "gitCommitDiff": return transport.gitCommitDiff("session", "abc123");
     case "listLocalModels": return transport.listLocalModels();
     case "downloadModel": return transport.downloadModel("model");
     case "cancelDownload": return transport.cancelDownload("model");

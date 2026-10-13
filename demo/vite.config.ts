@@ -51,6 +51,8 @@ export default defineConfig(() => ({
       "/mcp": { target: "http://127.0.0.1:8787" },
       "/attachments": { target: "http://127.0.0.1:8787" },
       "/sessions": { target: "http://127.0.0.1:8787" },
+      "/workspace": { target: "http://127.0.0.1:8787" },
+      "/git": { target: "http://127.0.0.1:8787" },
       "/local-models": { target: "http://127.0.0.1:8787" },
     },
   },

@@ -85,6 +85,37 @@ export type ProviderProfile = {
 export type ProviderProfileInput = Omit<ProviderProfile, "id" | "api_key_configured"> & { id?: string; api_key: string };
 
 export type Attachment = { name: string; path: string; size: number };
+
+export type WorkspaceEntry = { name: string; path: string; kind: "dir" | "file" };
+export type WorkspaceFile = {
+  path: string;
+  text: string;
+  size: number;
+  truncated: boolean;
+  binary: boolean;
+};
+export type GitChange = {
+  path: string;
+  status: string;
+  staged: boolean;
+  untracked: boolean;
+};
+export type WorkspaceDiff = {
+  path: string;
+  status: string;
+  diff: string;
+  binary: boolean;
+};
+export type GitCommitResult = { committed: boolean; message: string };
+export type GitPushResult = { pushed: boolean; message: string };
+export type GitCommit = {
+  id: string;
+  short: string;
+  message: string;
+  author: string;
+  timestamp: number;
+};
+
 export type McpRegistryRequest = {
   name: string;
   transport: "stdio" | "http";
@@ -184,6 +215,14 @@ export interface RigaTransport {
   listMcpRegistry(): Promise<McpServerSummary[]>;
   saveMcpRegistry(request: McpRegistryRequest): Promise<McpServerSummary[]>;
   uploadAttachment(file: File, sessionId: string): Promise<Attachment>;
+  workspaceEntries(sessionId: string, path: string): Promise<WorkspaceEntry[]>;
+  workspaceFile(sessionId: string, path: string): Promise<WorkspaceFile>;
+  gitStatus(sessionId: string): Promise<GitChange[]>;
+  gitDiff(sessionId: string, path: string): Promise<WorkspaceDiff>;
+  gitLog(sessionId: string, limit?: number): Promise<GitCommit[]>;
+  gitCommitDiff(sessionId: string, commit: string): Promise<WorkspaceDiff>;
+  gitCommit(sessionId: string, message: string): Promise<GitCommitResult>;
+  gitPush(sessionId: string): Promise<GitPushResult>;
   listLocalModels(): Promise<LocalModelOverview>;
   subscribeLocalModels(): () => void;
   downloadModel(modelId: string): Promise<void>;
@@ -226,6 +265,14 @@ export const RIGA_TRANSPORT_METHODS = [
   "listMcpRegistry",
   "saveMcpRegistry",
   "uploadAttachment",
+  "workspaceEntries",
+  "workspaceFile",
+  "gitStatus",
+  "gitDiff",
+  "gitLog",
+  "gitCommitDiff",
+  "gitCommit",
+  "gitPush",
   "listLocalModels",
   "subscribeLocalModels",
   "downloadModel",

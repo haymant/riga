@@ -27,6 +27,7 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
 pub mod catalog;
+pub mod files;
 pub mod health_stdio;
 pub mod ipc;
 pub mod local_model;
@@ -234,6 +235,14 @@ pub fn router(state: ServerState) -> Router {
             patch(set_session_archived),
         )
         .route("/sessions/{session_id}/history", get(session_history))
+        .route("/workspace/entries", get(workspace_entries))
+        .route("/workspace/file", get(workspace_file))
+        .route("/git/status", get(git_status))
+        .route("/git/diff", get(git_diff))
+        .route("/git/log", get(git_log))
+        .route("/git/commit-diff", get(git_commit_diff))
+        .route("/git/commit", post(git_commit))
+        .route("/git/push", post(git_push))
         .route("/runs/{run_id}/events", get(stream_events))
         .route("/ws", get(ws_upgrade))
         .route(
@@ -869,6 +878,132 @@ async fn session_history(
             .session_history(&session_id)
             .await,
     )
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceQuery {
+    session: String,
+    #[serde(default)]
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitQuery {
+    session: String,
+    #[serde(default)]
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitCommitRequest {
+    session: String,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitPushRequest {
+    session: String,
+}
+
+async fn workspace_entries(
+    State(state): State<ServerState>,
+    Query(query): Query<WorkspaceQuery>,
+) -> Result<Json<Vec<files::WorkspaceEntry>>, (StatusCode, String)> {
+    ipc::IpcService::new(state)
+        .workspace_dir(&query.session, &query.path)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+async fn workspace_file(
+    State(state): State<ServerState>,
+    Query(query): Query<WorkspaceQuery>,
+) -> Result<Json<files::WorkspaceFile>, (StatusCode, String)> {
+    ipc::IpcService::new(state)
+        .workspace_file(&query.session, &query.path)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+async fn git_status(
+    State(state): State<ServerState>,
+    Query(query): Query<GitQuery>,
+) -> Result<Json<Vec<files::GitChange>>, (StatusCode, String)> {
+    ipc::IpcService::new(state)
+        .git_status(&query.session)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+async fn git_diff(
+    State(state): State<ServerState>,
+    Query(query): Query<GitQuery>,
+) -> Result<Json<files::WorkspaceDiff>, (StatusCode, String)> {
+    ipc::IpcService::new(state)
+        .git_diff(&query.session, &query.path)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+#[derive(Debug, Deserialize)]
+struct GitLogQuery {
+    session: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitCommitQuery {
+    session: String,
+    commit: String,
+}
+
+async fn git_log(
+    State(state): State<ServerState>,
+    Query(query): Query<GitLogQuery>,
+) -> Result<Json<Vec<files::GitCommit>>, (StatusCode, String)> {
+    ipc::IpcService::new(state)
+        .git_log(&query.session, query.limit.unwrap_or(50))
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+async fn git_commit_diff(
+    State(state): State<ServerState>,
+    Query(query): Query<GitCommitQuery>,
+) -> Result<Json<files::WorkspaceDiff>, (StatusCode, String)> {
+    ipc::IpcService::new(state)
+        .git_commit_diff(&query.session, &query.commit)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+async fn git_commit(
+    State(state): State<ServerState>,
+    Json(request): Json<GitCommitRequest>,
+) -> Result<Json<files::GitCommitResult>, (StatusCode, String)> {
+    ipc::IpcService::new(state)
+        .git_commit(&request.session, &request.message)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+async fn git_push(
+    State(state): State<ServerState>,
+    Json(request): Json<GitPushRequest>,
+) -> Result<Json<files::GitPushResult>, (StatusCode, String)> {
+    ipc::IpcService::new(state)
+        .git_push(&request.session)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
 }
 
 async fn stream_events(

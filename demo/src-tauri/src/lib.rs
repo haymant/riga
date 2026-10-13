@@ -86,6 +86,76 @@ async fn riga_session_history(
 }
 
 #[tauri::command]
+async fn riga_workspace_entries(
+    service: State<'_, IpcService>,
+    session_id: String,
+    path: String,
+) -> Result<Vec<riga_server::files::WorkspaceEntry>, String> {
+    service.workspace_dir(&session_id, &path).await
+}
+
+#[tauri::command]
+async fn riga_workspace_file(
+    service: State<'_, IpcService>,
+    session_id: String,
+    path: String,
+) -> Result<riga_server::files::WorkspaceFile, String> {
+    service.workspace_file(&session_id, &path).await
+}
+
+#[tauri::command]
+async fn riga_git_status(
+    service: State<'_, IpcService>,
+    session_id: String,
+) -> Result<Vec<riga_server::files::GitChange>, String> {
+    service.git_status(&session_id).await
+}
+
+#[tauri::command]
+async fn riga_git_diff(
+    service: State<'_, IpcService>,
+    session_id: String,
+    path: String,
+) -> Result<riga_server::files::WorkspaceDiff, String> {
+    service.git_diff(&session_id, &path).await
+}
+
+#[tauri::command]
+async fn riga_git_commit(
+    service: State<'_, IpcService>,
+    session_id: String,
+    message: String,
+) -> Result<riga_server::files::GitCommitResult, String> {
+    service.git_commit(&session_id, &message).await
+}
+
+#[tauri::command]
+async fn riga_git_push(
+    service: State<'_, IpcService>,
+    session_id: String,
+) -> Result<riga_server::files::GitPushResult, String> {
+    service.git_push(&session_id).await
+}
+
+#[tauri::command]
+async fn riga_git_log(
+    service: State<'_, IpcService>,
+    session_id: String,
+    limit: Option<usize>,
+) -> Result<Vec<riga_server::files::GitCommit>, String> {
+    service.git_log(&session_id, limit.unwrap_or(50)).await
+}
+
+#[tauri::command]
+async fn riga_git_commit_diff(
+    service: State<'_, IpcService>,
+    session_id: String,
+    commit: String,
+) -> Result<riga_server::files::WorkspaceDiff, String> {
+    service.git_commit_diff(&session_id, &commit).await
+}
+
+#[tauri::command]
 async fn riga_rename_session(
     service: State<'_, IpcService>,
     session_id: String,
@@ -283,9 +353,17 @@ async fn riga_upload_attachment(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Give the agent a deliberate, git-initialized workspace instead of the
-    // launcher's working directory (or `src-tauri` under `tauri dev`), so
-    // per-session worktrees engage and uploads stay out of the source tree.
+    // Prefer the repository the app was launched from, so the desktop browses
+    // the same per-session worktrees the agent runs in and matches browser mode.
+    // A packaged app launched outside a repository falls back to an isolated,
+    // git-initialized workspace (see `ensure_workspace`) so worktrees and
+    // uploads stay out of the source tree.
+    if let Some(root) = std::env::current_dir()
+        .ok()
+        .and_then(|dir| riga_server::catalog::git_toplevel(&dir))
+    {
+        std::env::set_var("RIGA_WORKSPACE_ROOT", root);
+    }
     if let Err(error) =
         riga_shell::ensure_workspace(&riga_shell::default_data_dir().join("workspace"))
     {
@@ -307,6 +385,14 @@ pub fn run() {
             riga_create_session,
             riga_session_history,
             riga_rename_session,
+            riga_workspace_entries,
+            riga_workspace_file,
+            riga_git_status,
+            riga_git_diff,
+            riga_git_commit,
+            riga_git_push,
+            riga_git_log,
+            riga_git_commit_diff,
             riga_list_active_runs,
             riga_list_mcp_registry,
             riga_save_mcp_registry,

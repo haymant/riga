@@ -327,10 +327,37 @@ pub fn load_mcp_servers(root: &Path) -> Vec<McpServerSummary> {
         .unwrap_or_default()
 }
 
+/// The base repository the server operates on.
+///
+/// An explicit `RIGA_WORKSPACE_ROOT` wins; otherwise the current directory is
+/// used as-is.
 pub fn workspace_root() -> PathBuf {
     std::env::var_os("RIGA_WORKSPACE_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("current directory"))
+}
+
+/// The repository root containing `dir`, or `None` when it is not in a work tree.
+///
+/// The file/git APIs resolve a session's worktree from this so that a shell
+/// launched from a subdirectory (for example `demo/src-tauri`) still browses the
+/// worktrees the agent actually runs in.
+pub fn git_toplevel(dir: &std::path::Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(path))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1342,5 +1369,39 @@ mod tests {
             assert_eq!(super::find_agent_profile(alias).unwrap().name, expected);
         }
         assert!(super::find_agent_profile("not-an-agent").is_none());
+    }
+
+    #[test]
+    fn a_subdirectory_resolves_to_its_repository_root() {
+        let dir = std::env::temp_dir().join(format!("riga-catalog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("nested/deep")).unwrap();
+        let initialized = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .arg("init")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !initialized {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let resolved = super::git_toplevel(&dir.join("nested/deep")).unwrap();
+        // macOS temp dirs are symlinked, so compare the canonical paths.
+        assert_eq!(
+            std::fs::canonicalize(resolved).unwrap(),
+            std::fs::canonicalize(&dir).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_non_repository_directory_has_no_toplevel() {
+        let dir = std::env::temp_dir().join(format!("riga-catalog-plain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(super::git_toplevel(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

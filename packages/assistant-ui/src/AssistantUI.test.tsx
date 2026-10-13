@@ -61,6 +61,14 @@ function createTransport() {
     listMcpRegistry: async () => [],
     saveMcpRegistry: async () => [],
     uploadAttachment: async (file) => ({ name: file.name, path: `tmp/${file.name}`, size: file.size }),
+    workspaceEntries: async () => [],
+    workspaceFile: async (_sessionId, path) => ({ path, text: "", size: 0, truncated: false, binary: false }),
+    gitStatus: async () => [],
+    gitDiff: async (_sessionId, path) => ({ path, status: "modified", diff: "", binary: false }),
+    gitCommit: async () => ({ committed: true, message: "ok" }),
+    gitPush: async () => ({ pushed: true, message: "ok" }),
+    gitLog: async () => [],
+    gitCommitDiff: async (_sessionId, commit) => ({ path: commit, status: "commit", diff: "", binary: false }),
     listLocalModels: async () => emptyModels,
     subscribeLocalModels: () => () => undefined,
     downloadModel: async () => undefined,
@@ -332,5 +340,27 @@ describe("AssistantUI dynamic provider model catalog", () => {
       "https://b.example/v1", "", "model-y", "medium", "remote", "responses", "", "provider-b-id", "opencode_open_ai_compatible",
     ));
     expect(startRun).not.toHaveBeenCalled();
+  });
+
+  it("opens the workspace explorer and lists directories lazily", async () => {
+    const testTransport = createTransport();
+    const listDir = vi.spyOn(testTransport.transport, "workspaceEntries").mockImplementation(async (_sessionId, path) =>
+      path === ""
+        ? [{ name: "src", path: "src", kind: "dir" }]
+        : [{ name: "main.rs", path: "src/main.rs", kind: "file" }],
+    );
+    render(<AssistantUI transportFactory={testTransport.factory} />);
+    await waitFor(() => expect(screen.getByText("connected")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByRole("button", { name: "Open file explorer" }));
+    expect(await screen.findByText("Explorer")).toBeInTheDocument();
+    // Opening the panel fetches only the root level.
+    await waitFor(() => expect(screen.getByText("src")).toBeInTheDocument());
+    expect(listDir).toHaveBeenCalledWith(expect.any(String), "");
+
+    // Expanding a directory asks the backend for the next level.
+    fireEvent.click(screen.getByText("src"));
+    expect(await screen.findByText("main.rs")).toBeInTheDocument();
+    expect(listDir).toHaveBeenCalledWith(expect.any(String), "src");
   });
 });

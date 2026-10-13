@@ -2,6 +2,7 @@
 import { createOpencodeClient } from "@opencode-ai/sdk/v2";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { createServer as createProbeServer } from "node:net";
 import { env, exit } from "node:process";
 import { createResponseApiServer } from "./server.js";
 import { opencodeConfigContent } from "./config.js";
@@ -251,6 +252,46 @@ function createOpencodeAdapter(sdk: V2Client, io: OpencodeHttp): OpenCodeClient 
 
 type LaunchedServer = { url: string; password: string; close(): void };
 
+/** Ask the OS for a free loopback port, so a stale server cannot block startup. */
+async function freePort(host: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createProbeServer();
+    probe.unref();
+    probe.on("error", reject);
+    probe.listen(0, host, () => {
+      const address = probe.address();
+      const port = typeof address === "object" && address ? address.port : 0;
+      probe.close(() => resolve(port));
+    });
+  });
+}
+
+/**
+ * Start the OpenCode server, avoiding a fixed port by default. The old fixed
+ * `4096` collides with an OpenCode server a user already runs (or a stale one
+ * from a previous adapter), which used to abort the whole adapter. A pinned
+ * `OPENCODE_PORT` is honoured and its failure surfaced; otherwise a free port is
+ * chosen and retried if it is raced away.
+ */
+async function launchOpencodeServer(host: string, pinnedPort?: number): Promise<LaunchedServer> {
+  const attempts = pinnedPort === undefined ? 4 : 1;
+  let port = pinnedPort ?? (await freePort(host));
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const server = await startOpencodeServer(host, port);
+      if (pinnedPort === undefined && attempt > 0) {
+        console.log(`OpenCode server started on fallback port ${port}.`);
+      }
+      return server;
+    } catch (error) {
+      lastError = error;
+      port = await freePort(host);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
 /**
  * Spawn `opencode serve` and wait for it to bind. The official SDK helper waits
  * for a legacy "opencode server listening" banner that v2 no longer prints, and
@@ -310,9 +351,9 @@ async function main(): Promise<void> {
     throw new Error("RIGA_OPENCODE_API_KEY is required when binding the Responses API outside localhost/loopback.");
   }
   const opencodeHost = env.OPENCODE_HOST ?? "127.0.0.1";
-  const opencodePort = positivePort(env.OPENCODE_PORT, 4096);
+  const pinnedPort = env.OPENCODE_PORT ? positivePort(env.OPENCODE_PORT, 4096) : undefined;
 
-  const owned = env.OPENCODE_BASE_URL ? null : await startOpencodeServer(opencodeHost, opencodePort);
+  const owned = env.OPENCODE_BASE_URL ? null : await launchOpencodeServer(opencodeHost, pinnedPort);
   const baseUrl = owned?.url ?? env.OPENCODE_BASE_URL!;
   const password = owned?.password ?? env.OPENCODE_PASSWORD;
   const sdk = createOpencodeClient({

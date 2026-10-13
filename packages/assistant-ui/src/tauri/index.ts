@@ -5,6 +5,10 @@ import type {
   ActiveRun,
   Catalog,
   CreateSessionRequest,
+  GitChange,
+  GitCommit,
+  GitCommitResult,
+  GitPushResult,
   Health,
   McpRegistryRequest,
   McpServerSummary,
@@ -16,6 +20,9 @@ import type {
   ProviderProfile,
   ProviderProfileInput,
   ProviderType,
+  WorkspaceDiff,
+  WorkspaceEntry,
+  WorkspaceFile,
 } from "../protocol";
 
 export const RIGA_TAURI_TRANSPORT_VERSION = "0.1.0" as const;
@@ -42,6 +49,14 @@ export const RIGA_IPC_COMMANDS = {
   listMcpRegistry: "riga_list_mcp_registry",
   saveMcpRegistry: "riga_save_mcp_registry",
   uploadAttachment: "riga_upload_attachment",
+  workspaceEntries: "riga_workspace_entries",
+  workspaceFile: "riga_workspace_file",
+  gitStatus: "riga_git_status",
+  gitDiff: "riga_git_diff",
+  gitCommit: "riga_git_commit",
+  gitPush: "riga_git_push",
+  gitLog: "riga_git_log",
+  gitCommitDiff: "riga_git_commit_diff",
   localModels: "riga_local_models",
   localModelAction: "riga_local_model_action",
 } as const;
@@ -138,6 +153,31 @@ export class RigaTauriTransport implements RigaTransport {
   async uploadAttachment(file: File, sessionId: string): Promise<Attachment> {
     const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
     return this.call(RIGA_IPC_COMMANDS.uploadAttachment, { attachment: { name: file.name, bytes, session_id: sessionId } });
+  }
+
+  workspaceEntries(sessionId: string, path: string): Promise<WorkspaceEntry[]> {
+    return this.call(RIGA_IPC_COMMANDS.workspaceEntries, { sessionId, path });
+  }
+  workspaceFile(sessionId: string, path: string): Promise<WorkspaceFile> {
+    return this.call(RIGA_IPC_COMMANDS.workspaceFile, { sessionId, path });
+  }
+  gitStatus(sessionId: string): Promise<GitChange[]> {
+    return this.call(RIGA_IPC_COMMANDS.gitStatus, { sessionId });
+  }
+  gitDiff(sessionId: string, path: string): Promise<WorkspaceDiff> {
+    return this.call(RIGA_IPC_COMMANDS.gitDiff, { sessionId, path });
+  }
+  gitCommit(sessionId: string, message: string): Promise<GitCommitResult> {
+    return this.call(RIGA_IPC_COMMANDS.gitCommit, { sessionId, message });
+  }
+  gitPush(sessionId: string): Promise<GitPushResult> {
+    return this.call(RIGA_IPC_COMMANDS.gitPush, { sessionId });
+  }
+  gitLog(sessionId: string, limit?: number): Promise<GitCommit[]> {
+    return this.call(RIGA_IPC_COMMANDS.gitLog, { sessionId, limit });
+  }
+  gitCommitDiff(sessionId: string, commit: string): Promise<WorkspaceDiff> {
+    return this.call(RIGA_IPC_COMMANDS.gitCommitDiff, { sessionId, commit });
   }
 
   listLocalModels(): Promise<import("../protocol").LocalModelOverview> {

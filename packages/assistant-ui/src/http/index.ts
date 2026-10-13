@@ -3,6 +3,10 @@ import type {
   ActiveRun,
   Catalog,
   CreateSessionRequest,
+  GitChange,
+  GitCommit,
+  GitCommitResult,
+  GitPushResult,
   Health,
   McpRegistryRequest,
   McpServerSummary,
@@ -12,6 +16,9 @@ import type {
   RigaTransport,
   RigaTransportListeners,
   Session,
+  WorkspaceDiff,
+  WorkspaceEntry,
+  WorkspaceFile,
 } from "../protocol";
 import { LocalModelClient, reduceDownloadState, formatBytes } from "./local-models";
 import { RigaWebSocketClient } from "./websocket";
@@ -41,6 +48,38 @@ export class RigaHttpClient {
   }
   async renameSession(sessionId: string, title: string): Promise<Session> {
     return this.request(`/sessions/${encodeURIComponent(sessionId)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ title }) });
+  }
+  async workspaceEntries(sessionId: string, path: string): Promise<WorkspaceEntry[]> {
+    return this.request(`/workspace/entries?session=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}`);
+  }
+  async workspaceFile(sessionId: string, path: string): Promise<WorkspaceFile> {
+    return this.request(`/workspace/file?session=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}`);
+  }
+  async gitStatus(sessionId: string): Promise<GitChange[]> {
+    return this.request(`/git/status?session=${encodeURIComponent(sessionId)}`);
+  }
+  async gitDiff(sessionId: string, path: string): Promise<WorkspaceDiff> {
+    return this.request(`/git/diff?session=${encodeURIComponent(sessionId)}&path=${encodeURIComponent(path)}`);
+  }
+  async gitLog(sessionId: string, limit = 50): Promise<GitCommit[]> {
+    return this.request(`/git/log?session=${encodeURIComponent(sessionId)}&limit=${limit}`);
+  }
+  async gitCommitDiff(sessionId: string, commit: string): Promise<WorkspaceDiff> {
+    return this.request(`/git/commit-diff?session=${encodeURIComponent(sessionId)}&commit=${encodeURIComponent(commit)}`);
+  }
+  async gitCommit(sessionId: string, message: string): Promise<GitCommitResult> {
+    return this.request(`/git/commit`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session: sessionId, message }),
+    });
+  }
+  async gitPush(sessionId: string): Promise<GitPushResult> {
+    return this.request(`/git/push`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session: sessionId }),
+    });
   }
   async streamRunEvents(runId: string, onEvent: (event: RigaEventEnvelope) => void): Promise<void> {
     const response = await fetch(`${this.baseUrl}/runs/${encodeURIComponent(runId)}/events`, { headers: { accept: "text/event-stream" } });
@@ -91,6 +130,14 @@ export class RigaHttpTransport implements RigaTransport {
   createSession(request: CreateSessionRequest): Promise<Session> { return this.resources.createSession(request); }
   sessionHistory(sessionId: string): Promise<import("../protocol").ConversationTurn[]> { return this.resources.sessionHistory(sessionId); }
   renameSession(sessionId: string, title: string): Promise<Session> { return this.resources.renameSession(sessionId, title); }
+  workspaceEntries(sessionId: string, path: string): Promise<WorkspaceEntry[]> { return this.resources.workspaceEntries(sessionId, path); }
+  workspaceFile(sessionId: string, path: string): Promise<WorkspaceFile> { return this.resources.workspaceFile(sessionId, path); }
+  gitStatus(sessionId: string): Promise<GitChange[]> { return this.resources.gitStatus(sessionId); }
+  gitDiff(sessionId: string, path: string): Promise<WorkspaceDiff> { return this.resources.gitDiff(sessionId, path); }
+  gitLog(sessionId: string, limit?: number): Promise<GitCommit[]> { return this.resources.gitLog(sessionId, limit); }
+  gitCommitDiff(sessionId: string, commit: string): Promise<WorkspaceDiff> { return this.resources.gitCommitDiff(sessionId, commit); }
+  gitCommit(sessionId: string, message: string): Promise<GitCommitResult> { return this.resources.gitCommit(sessionId, message); }
+  gitPush(sessionId: string): Promise<GitPushResult> { return this.resources.gitPush(sessionId); }
   configureProvider(...args: Parameters<RigaWebSocketClient["configureProvider"]>): Promise<void> { return this.socket.configureProvider(...args); }
   providerProfiles(): Promise<ProviderProfile[]> { return this.resources.providerProfiles(); }
   saveProviderProfile(input: ProviderProfileInput): Promise<ProviderProfile> { return this.resources.saveProviderProfile(input); }

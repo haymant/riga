@@ -813,6 +813,78 @@ impl IpcService {
         })
     }
 
+    /// Resolve a session's worktree, creating it from `HEAD` if a run has not.
+    async fn session_root(&self, session_id: &str) -> Result<std::path::PathBuf, String> {
+        crate::workspace::ensure_worktree(&self.state.workspace_root, session_id).await
+    }
+
+    pub async fn workspace_dir(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<Vec<crate::files::WorkspaceEntry>, String> {
+        let root = self.session_root(session_id).await?;
+        crate::files::list_dir(&root, path)
+    }
+
+    pub async fn workspace_file(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<crate::files::WorkspaceFile, String> {
+        let root = self.session_root(session_id).await?;
+        crate::files::read_file(&root, path)
+    }
+
+    pub async fn git_status(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::files::GitChange>, String> {
+        let root = self.session_root(session_id).await?;
+        crate::files::git_status(&root).await
+    }
+
+    pub async fn git_diff(
+        &self,
+        session_id: &str,
+        path: &str,
+    ) -> Result<crate::files::WorkspaceDiff, String> {
+        let root = self.session_root(session_id).await?;
+        crate::files::git_diff(&root, path).await
+    }
+
+    pub async fn git_commit(
+        &self,
+        session_id: &str,
+        message: &str,
+    ) -> Result<crate::files::GitCommitResult, String> {
+        let root = self.session_root(session_id).await?;
+        crate::files::git_commit(&root, message).await
+    }
+
+    pub async fn git_push(&self, session_id: &str) -> Result<crate::files::GitPushResult, String> {
+        let root = self.session_root(session_id).await?;
+        crate::files::git_push(&root).await
+    }
+
+    pub async fn git_log(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::files::GitCommit>, String> {
+        let root = self.session_root(session_id).await?;
+        crate::files::git_log(&root, limit).await
+    }
+
+    pub async fn git_commit_diff(
+        &self,
+        session_id: &str,
+        commit: &str,
+    ) -> Result<crate::files::WorkspaceDiff, String> {
+        let root = self.session_root(session_id).await?;
+        crate::files::git_commit_diff(&root, commit).await
+    }
+
     #[cfg(test)]
     async fn start_deterministic_test_run(
         &self,
