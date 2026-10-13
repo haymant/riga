@@ -6,6 +6,8 @@ import type {
   Health,
   McpRegistryRequest,
   McpServerSummary,
+  ProviderProfile,
+  ProviderProfileInput,
   RigaEventEnvelope,
   RigaTransport,
   RigaTransportListeners,
@@ -19,6 +21,17 @@ export const RIGA_HTTP_TRANSPORT_VERSION = "0.1.0" as const;
 export class RigaHttpClient {
   constructor(private readonly baseUrl: string) {}
   async health(): Promise<Health> { return this.request("/health"); }
+  async remoteModels(providerId?: string): Promise<string[]> {
+    const query = providerId ? `?provider_id=${encodeURIComponent(providerId)}` : "";
+    return this.request(`/provider/models${query}`);
+  }
+  async providerProfiles(): Promise<ProviderProfile[]> { return this.request("/providers"); }
+  async saveProviderProfile(input: ProviderProfileInput): Promise<ProviderProfile> {
+    return this.request("/providers", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input) });
+  }
+  async deleteProviderProfile(providerId: string): Promise<void> {
+    return this.request(`/providers/${encodeURIComponent(providerId)}`, { method: "DELETE" });
+  }
   async listSessions(): Promise<Session[]> { return this.request("/sessions"); }
   async createSession(request: CreateSessionRequest): Promise<Session> {
     return this.request("/sessions", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request) });
@@ -50,6 +63,7 @@ export class RigaHttpClient {
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
     const response = await fetch(`${this.baseUrl}${path}`, init);
     if (!response.ok) throw new Error(`RIGA request failed with ${response.status}`);
+    if (response.status === 204) return undefined as T;
     return (await response.json()) as T;
   }
 }
@@ -78,6 +92,10 @@ export class RigaHttpTransport implements RigaTransport {
   sessionHistory(sessionId: string): Promise<import("../protocol").ConversationTurn[]> { return this.resources.sessionHistory(sessionId); }
   renameSession(sessionId: string, title: string): Promise<Session> { return this.resources.renameSession(sessionId, title); }
   configureProvider(...args: Parameters<RigaWebSocketClient["configureProvider"]>): Promise<void> { return this.socket.configureProvider(...args); }
+  providerProfiles(): Promise<ProviderProfile[]> { return this.resources.providerProfiles(); }
+  saveProviderProfile(input: ProviderProfileInput): Promise<ProviderProfile> { return this.resources.saveProviderProfile(input); }
+  deleteProviderProfile(providerId: string): Promise<void> { return this.resources.deleteProviderProfile(providerId); }
+  remoteModels(providerId?: string): Promise<string[]> { return this.resources.remoteModels(providerId); }
   startRun(...args: Parameters<RigaWebSocketClient["startRun"]>): Promise<void> { return this.socket.startRun(...args); }
   resumeRun(...args: Parameters<RigaWebSocketClient["resumeRun"]>): Promise<void> { return this.socket.resumeRun(...args); }
   cancelRun(...args: Parameters<RigaWebSocketClient["cancelRun"]>): Promise<void> { return this.socket.cancelRun(...args); }

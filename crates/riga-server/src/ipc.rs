@@ -24,6 +24,137 @@ pub struct ProviderConfigured {
     pub kind: ws::ProviderKind,
     pub api: ws::ProviderApi,
     pub subagent_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    pub provider_type: ws::ProviderType,
+}
+
+/// Write payload for a remote provider profile. `api_key` is write-only; an
+/// empty value on update preserves the secret already stored for that profile.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ProviderProfileInput {
+    pub id: Option<String>,
+    pub name: String,
+    pub provider_type: ws::ProviderType,
+    pub endpoint: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default = "default_profile_effort")]
+    pub reasoning_effort: String,
+    #[serde(default)]
+    pub api: ws::ProviderApi,
+    #[serde(default)]
+    pub subagent_model: Option<String>,
+}
+
+/// Safe read model for a saved registration; never includes the API key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderProfileSummary {
+    pub id: String,
+    pub name: String,
+    pub provider_type: ws::ProviderType,
+    pub endpoint: String,
+    pub model: String,
+    pub reasoning_effort: String,
+    pub api: ws::ProviderApi,
+    pub subagent_model: Option<String>,
+    pub api_key_configured: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredProviderProfile {
+    id: String,
+    name: String,
+    config: ws::ProviderConfig,
+}
+
+fn default_profile_effort() -> String {
+    "low".into()
+}
+
+fn profile_summary(profile: &StoredProviderProfile) -> ProviderProfileSummary {
+    ProviderProfileSummary {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+        provider_type: profile.config.provider_type,
+        endpoint: profile.config.endpoint.clone(),
+        model: profile.config.model.clone(),
+        reasoning_effort: profile.config.reasoning_effort.clone(),
+        api: profile.config.api,
+        subagent_model: profile.config.subagent_model.clone(),
+        api_key_configured: !profile.config.api_key.trim().is_empty(),
+    }
+}
+
+static PROVIDER_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn new_provider_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    let count = PROVIDER_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("provider-{nanos:x}-{count:x}")
+}
+
+fn normalize_effort(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "medium" => "medium".into(),
+        "high" => "high".into(),
+        _ => "low".into(),
+    }
+}
+
+async fn load_provider_profiles() -> Result<Vec<StoredProviderProfile>, String> {
+    if let Some(profiles) =
+        secure_store::load_json::<Vec<StoredProviderProfile>>("provider_profiles").await?
+    {
+        return Ok(profiles);
+    }
+    // One-time migration for installations that have the pre-registry single
+    // provider record. The secret remains encrypted and is never returned.
+    let Some(mut config) = secure_store::load_json::<ws::ProviderConfig>("provider").await? else {
+        return Ok(Vec::new());
+    };
+    if config.kind == ws::ProviderKind::Local || config.endpoint.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let id = config
+        .provider_id
+        .clone()
+        .unwrap_or_else(|| "legacy-default".into());
+    config.provider_id = Some(id.clone());
+    let profile = StoredProviderProfile {
+        id,
+        name: "Default provider".into(),
+        config: config.clone(),
+    };
+    secure_store::save_json("provider_profiles", &[profile.clone()]).await?;
+    secure_store::save_json("provider", &config).await?;
+    Ok(vec![profile])
+}
+
+/// Resolve a saved profile for one explicitly model-routed task. Provider
+/// credentials and endpoint are read from the server-side encrypted registry.
+pub async fn provider_config_for_profile(
+    provider_id: &str,
+    model: Option<&str>,
+) -> Result<ws::ProviderConfig, String> {
+    let profiles = load_provider_profiles().await?;
+    let profile = profiles
+        .iter()
+        .find(|profile| profile.id == provider_id)
+        .ok_or_else(|| format!("provider profile `{provider_id}` was not found"))?;
+    if profile.config.kind != ws::ProviderKind::Remote {
+        return Err("subagents can only select a saved remote provider".into());
+    }
+    let mut config = profile.config.clone();
+    if let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) {
+        config.model = model.to_owned();
+    }
+    Ok(config)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -272,6 +403,18 @@ impl IpcService {
                 )),
             };
         }
+        if let Err(error) = secure_store::remove_provider_session_mappings(session_id).await {
+            let sessions_rollback = secure_store::save_json("sessions", &original_sessions).await;
+            let transcripts_rollback =
+                secure_store::save_json("transcripts", &original_transcripts).await;
+            return Err(format!(
+                "could not remove provider session mappings ({error}); session rollback: {}; transcript rollback: {}",
+                sessions_rollback.err().unwrap_or_else(|| "ok".to_owned()),
+                transcripts_rollback
+                    .err()
+                    .unwrap_or_else(|| "ok".to_owned()),
+            ));
+        }
         *sessions = updated_sessions;
         *transcripts = updated_transcripts;
         Ok(())
@@ -281,11 +424,36 @@ impl IpcService {
         &self,
         mut config: ws::ProviderConfig,
     ) -> Result<ProviderConfigured, String> {
-        if config.api_key.trim().is_empty()
+        if let Some(provider_id) = config.provider_id.as_deref() {
+            let profiles = load_provider_profiles().await?;
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.id == provider_id)
+                .ok_or_else(|| format!("provider profile `{provider_id}` was not found"))?;
+            // Credentials and connection details always come from the encrypted
+            // registration; the client may select a model but cannot substitute
+            // a different endpoint under a saved registration ID.
+            config.endpoint = profile.config.endpoint.clone();
+            config.api_key = profile.config.api_key.clone();
+            config.provider_type = profile.config.provider_type;
+            config.api = profile.config.api;
+            config.kind = ws::ProviderKind::Remote;
+            if config.model.trim().is_empty() {
+                config.model = profile.config.model.clone();
+            }
+            if config.reasoning_effort.trim().is_empty() {
+                config.reasoning_effort = profile.config.reasoning_effort.clone();
+            }
+            if config.subagent_model.is_none() {
+                config.subagent_model = profile.config.subagent_model.clone();
+            }
+        } else if config.api_key.trim().is_empty()
             && let Some(existing) =
                 secure_store::load_json::<ws::ProviderConfig>("provider").await?
         {
             config.api_key = existing.api_key;
+            config.provider_id = existing.provider_id;
+            config.provider_type = existing.provider_type;
         }
         secure_store::save_json("provider", &config).await?;
         Ok(ProviderConfigured {
@@ -295,6 +463,8 @@ impl IpcService {
             kind: config.kind,
             api: config.api,
             subagent_model: config.subagent_model,
+            provider_id: config.provider_id,
+            provider_type: config.provider_type,
         })
     }
 
@@ -312,6 +482,8 @@ impl IpcService {
             kind: config.kind,
             api: config.api,
             subagent_model: config.subagent_model,
+            provider_id: config.provider_id,
+            provider_type: config.provider_type,
         }))
     }
 
@@ -322,6 +494,118 @@ impl IpcService {
             .await?
             .ok_or_else(|| "Configure a remote provider in Settings first.".to_string())?;
         fetch_remote_models(&config).await
+    }
+
+    pub async fn provider_profiles(&self) -> Result<Vec<ProviderProfileSummary>, String> {
+        Ok(load_provider_profiles()
+            .await?
+            .iter()
+            .map(profile_summary)
+            .collect())
+    }
+
+    pub async fn save_provider_profile(
+        &self,
+        input: ProviderProfileInput,
+    ) -> Result<ProviderProfileSummary, String> {
+        let name = input.name.trim();
+        let endpoint = input.endpoint.trim();
+        if name.is_empty() {
+            return Err("Provider name cannot be empty.".into());
+        }
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            return Err("Provider endpoint must be an HTTP or HTTPS URL.".into());
+        }
+        let mut profiles = load_provider_profiles().await?;
+        let id = input
+            .id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(new_provider_id);
+        let old = profiles.iter().find(|profile| profile.id == id).cloned();
+        if old.is_none()
+            && profiles
+                .iter()
+                .any(|profile| profile.name.eq_ignore_ascii_case(name))
+        {
+            return Err(format!("A provider named `{name}` already exists."));
+        }
+        let api_key = if input.api_key.trim().is_empty() {
+            old.as_ref()
+                .map(|profile| profile.config.api_key.clone())
+                .unwrap_or_default()
+        } else {
+            input.api_key
+        };
+        let provider_type = input.provider_type;
+        let api = if provider_type == ws::ProviderType::OpencodeOpenAiCompatible {
+            ws::ProviderApi::Responses
+        } else {
+            input.api
+        };
+        let config = ws::ProviderConfig {
+            endpoint: endpoint.trim_end_matches('/').to_owned(),
+            api_key,
+            model: input.model.trim().to_owned(),
+            reasoning_effort: normalize_effort(&input.reasoning_effort),
+            kind: ws::ProviderKind::Remote,
+            api,
+            subagent_model: input
+                .subagent_model
+                .filter(|value| !value.trim().is_empty()),
+            provider_id: Some(id.clone()),
+            provider_type,
+        };
+        let profile = StoredProviderProfile {
+            id,
+            name: name.to_owned(),
+            config,
+        };
+        if let Some(existing) = profiles
+            .iter_mut()
+            .find(|existing| existing.id == profile.id)
+        {
+            *existing = profile.clone();
+        } else {
+            profiles.push(profile.clone());
+        }
+        secure_store::save_json("provider_profiles", &profiles).await?;
+        Ok(profile_summary(&profile))
+    }
+
+    pub async fn delete_provider_profile(&self, provider_id: &str) -> Result<(), String> {
+        let mut profiles = load_provider_profiles().await?;
+        let before = profiles.len();
+        profiles.retain(|profile| profile.id != provider_id);
+        if profiles.len() == before {
+            return Err(format!("provider profile `{provider_id}` was not found"));
+        }
+        secure_store::save_json("provider_profiles", &profiles).await?;
+        if let Some(mut active) = secure_store::load_json::<ws::ProviderConfig>("provider").await?
+            && active.provider_id.as_deref() == Some(provider_id)
+        {
+            active.provider_id = None;
+            active.endpoint.clear();
+            active.api_key.clear();
+            active.model.clear();
+            active.kind = ws::ProviderKind::Remote;
+            secure_store::save_json("provider", &active).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn remote_models_for(
+        &self,
+        provider_id: Option<&str>,
+    ) -> Result<Vec<String>, String> {
+        if let Some(provider_id) = provider_id {
+            let profiles = load_provider_profiles().await?;
+            let profile = profiles
+                .iter()
+                .find(|profile| profile.id == provider_id)
+                .ok_or_else(|| format!("provider profile `{provider_id}` was not found"))?;
+            return fetch_remote_models(&profile.config).await;
+        }
+        self.remote_models().await
     }
 
     pub async fn list_mcp_registry(&self) -> Vec<catalog::McpServerSummary> {
@@ -834,6 +1118,8 @@ mod tests {
             kind: ws::ProviderKind::Remote,
             api: ws::ProviderApi::Chat,
             subagent_model: None,
+            provider_id: None,
+            provider_type: ws::ProviderType::OpenAiCompatible,
         };
 
         let models = fetch_remote_models(&config).await.unwrap();

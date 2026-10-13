@@ -120,6 +120,8 @@ async fn riga_configure_provider(
     kind: Option<riga_server::ws::ProviderKind>,
     api: Option<riga_server::ws::ProviderApi>,
     subagent_model: Option<String>,
+    provider_id: Option<String>,
+    provider_type: Option<riga_server::ws::ProviderType>,
 ) -> Result<ProviderConfigured, String> {
     let configured = service
         .configure_provider(ProviderConfig {
@@ -130,10 +132,43 @@ async fn riga_configure_provider(
             kind: kind.unwrap_or_default(),
             api: api.unwrap_or_default(),
             subagent_model,
+            provider_id,
+            provider_type: provider_type.unwrap_or_default(),
         })
         .await?;
     let _ = app.emit("riga://provider-configured", configured.clone());
     Ok(configured)
+}
+
+#[tauri::command]
+async fn riga_remote_models(
+    service: State<'_, IpcService>,
+    provider_id: Option<String>,
+) -> Result<Vec<String>, String> {
+    service.remote_models_for(provider_id.as_deref()).await
+}
+
+#[tauri::command]
+async fn riga_provider_profiles(
+    service: State<'_, IpcService>,
+) -> Result<Vec<riga_server::ipc::ProviderProfileSummary>, String> {
+    service.provider_profiles().await
+}
+
+#[tauri::command]
+async fn riga_save_provider_profile(
+    service: State<'_, IpcService>,
+    request: riga_server::ipc::ProviderProfileInput,
+) -> Result<riga_server::ipc::ProviderProfileSummary, String> {
+    service.save_provider_profile(request).await
+}
+
+#[tauri::command]
+async fn riga_delete_provider_profile(
+    service: State<'_, IpcService>,
+    provider_id: String,
+) -> Result<(), String> {
+    service.delete_provider_profile(&provider_id).await
 }
 
 async fn forward_events(
@@ -276,6 +311,10 @@ pub fn run() {
             riga_list_mcp_registry,
             riga_save_mcp_registry,
             riga_configure_provider,
+            riga_remote_models,
+            riga_provider_profiles,
+            riga_save_provider_profile,
+            riga_delete_provider_profile,
             riga_start_run,
             riga_resume_run,
             riga_cancel_run,

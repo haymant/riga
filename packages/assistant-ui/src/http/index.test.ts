@@ -52,6 +52,13 @@ describe("RigaHttpClient", () => {
     expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ method: "PATCH", body: JSON.stringify({ title: "Renamed" }) });
   });
 
+  it("loads provider model IDs dynamically from the server", async () => {
+    const models = ["provider-a/model-x", "provider-b/model-y"];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(models), { status: 200 }));
+    await expect(new RigaHttpClient("http://riga.test").remoteModels()).resolves.toEqual(models);
+    expect(String(fetchMock.mock.calls[0]?.[0])).toBe("http://riga.test/provider/models");
+  });
+
   it("surfaces non-2xx HTTP responses", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("nope", { status: 503 }));
     await expect(new RigaHttpClient("http://riga.test").health()).rejects.toThrow("RIGA request failed with 503");
@@ -103,6 +110,7 @@ describe("RigaHttpTransport", () => {
     await transport.sessionHistory("session");
     await transport.renameSession("session", "Renamed");
     await transport.configureProvider("https://model.test/v1", "key", "model", "low");
+    await transport.remoteModels();
     await transport.startRun("run", "session", "hello");
     await transport.resumeRun("run", 1);
     await transport.cancelRun("run");
@@ -116,6 +124,7 @@ describe("RigaHttpTransport", () => {
     await transport.loadModel("/tmp/model.gguf");
     await transport.unloadModel();
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/catalog"))).toBe(true);
+    expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/provider/models"))).toBe(true);
     expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/attachments?session=session"))).toBe(true);
     expect(socketCalls).toEqual(["connect", "wake", "configureProvider", "startRun", "resumeRun", "cancelRun", "respondToApproval"]);
     expect(localEvents).toEqual([]);

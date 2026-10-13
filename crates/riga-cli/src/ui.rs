@@ -425,9 +425,24 @@ fn sidebar_panel_lines(
         }
         UiPanel::Settings => {
             let provider = &app.provider;
-            lines.push(sidebar_section("Connection"));
+            lines.push(sidebar_section("Provider profile"));
+            let active_profile = app.provider.provider_id.as_deref();
             lines.push(sidebar_setting_line(
                 0,
+                app.provider_field,
+                "Name",
+                &provider.profile_name,
+                max_width,
+            ));
+            lines.push(sidebar_setting_line(
+                5,
+                app.provider_field,
+                "Type",
+                &format!("{:?}", provider.provider_type),
+                max_width,
+            ));
+            lines.push(sidebar_setting_line(
+                1,
                 app.provider_field,
                 "Endpoint",
                 if provider.endpoint.is_empty() {
@@ -438,18 +453,18 @@ fn sidebar_panel_lines(
                 max_width,
             ));
             lines.push(sidebar_setting_line(
-                1,
+                2,
                 app.provider_field,
                 "API key",
                 if provider.api_key.is_empty() {
-                    "Not configured"
+                    "Not configured / unchanged"
                 } else {
-                    "Configured"
+                    "New key entered"
                 },
                 max_width,
             ));
             lines.push(sidebar_setting_line(
-                2,
+                3,
                 app.provider_field,
                 "Model",
                 if provider.model.is_empty() {
@@ -461,28 +476,21 @@ fn sidebar_panel_lines(
             ));
             lines.push(sidebar_section("Behavior"));
             lines.push(sidebar_setting_line(
-                3,
+                4,
                 app.provider_field,
                 "Reasoning",
                 &provider.reasoning_effort,
                 max_width,
             ));
             lines.push(sidebar_setting_line(
-                4,
-                app.provider_field,
-                "Provider",
-                &format!("{:?}", provider.kind),
-                max_width,
-            ));
-            lines.push(sidebar_setting_line(
-                5,
+                6,
                 app.provider_field,
                 "API",
                 &format!("{:?}", provider.api),
                 max_width,
             ));
             lines.push(sidebar_setting_line(
-                6,
+                7,
                 app.provider_field,
                 "Subagent",
                 if provider.subagent_model.is_empty() {
@@ -492,6 +500,42 @@ fn sidebar_panel_lines(
                 },
                 max_width,
             ));
+            lines.push(sidebar_section(&format!(
+                "Saved providers · {}",
+                app.provider_profiles.len()
+            )));
+            for profile in &app.provider_profiles {
+                let active = active_profile == Some(profile.id.as_str());
+                let marker = if active { "●" } else { "·" };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{marker} "),
+                        Style::default().fg(if active {
+                            Color::Green
+                        } else {
+                            Color::DarkGray
+                        }),
+                    ),
+                    Span::styled(
+                        fit_sidebar_text(
+                            &format!("{} · {}", profile.name, profile.model),
+                            max_width.saturating_sub(2),
+                        ),
+                        Style::default().fg(if active { Color::White } else { Color::Gray }),
+                    ),
+                ]));
+            }
+            if let Some(provider_id) = &app.deleting_provider_profile {
+                if let Some(profile) = app
+                    .provider_profiles
+                    .iter()
+                    .find(|profile| &profile.id == provider_id)
+                {
+                    lines.push(sidebar_section("Confirm provider deletion"));
+                    lines.push(sidebar_field("Type exact name", &profile.name, max_width));
+                    lines.push(sidebar_field("Input", app.panel_input.text(), max_width));
+                }
+            }
             if let Some(error) = &provider.error {
                 lines.push(Line::from(vec![
                     Span::styled("Error · ", Style::default().fg(Color::Red)),
@@ -588,9 +632,14 @@ fn sidebar_footer_hints(app: &UiState, panel: UiPanel) -> Vec<String> {
             "Enter select · Esc close · /model ID direct".into(),
         ]
         .into(),
+        UiPanel::Settings if app.deleting_provider_profile.is_some() => [
+            "Type the exact provider name".into(),
+            "Enter delete · Esc cancel".into(),
+        ]
+        .into(),
         UiPanel::Settings => [
-            "Tab fields · Ctrl+S save".into(),
-            "↑/↓ change · Esc close".into(),
+            "Ctrl+S save · Ctrl+N new · Ctrl+P switch".into(),
+            "Ctrl+X delete · Tab fields · Enter cycle".into(),
         ]
         .into(),
         UiPanel::LocalModels if app.local_attachment_input => [
@@ -844,10 +893,17 @@ fn render_remote_models_sidebar(
             "No models match this filter"
         }));
     }
+    let mut previous_provider: Option<&str> = None;
     for (index, model) in models.iter().enumerate() {
+        let provider = model.provider_name.as_str();
+        if previous_provider != Some(provider) {
+            lines.push(sidebar_section(&format!("{provider} models")));
+            previous_provider = Some(provider);
+        }
         let selected = index == app.panel_cursor;
         let active = app.provider.kind == riga_server::ws::ProviderKind::Remote
-            && *model == app.provider.model;
+            && model.model == app.provider.model
+            && Some(model.provider_id.as_str()) == app.provider.provider_id.as_deref();
         let marker = if selected {
             "›"
         } else if active {
@@ -868,7 +924,7 @@ fn render_remote_models_sidebar(
                     .bg(surface),
             ),
             Span::styled(
-                fit_sidebar_text(model, max_width.saturating_sub(2)),
+                fit_sidebar_text(&model.model, max_width.saturating_sub(2)),
                 Style::default()
                     .fg(if active { Color::White } else { Color::Gray })
                     .bg(surface),
@@ -2600,7 +2656,62 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(!text.contains("do-not-display"));
-        assert!(text.contains("Configured"));
+        assert!(text.contains("API key"));
+    }
+
+    #[test]
+    fn wide_provider_settings_sidebar_renders_multi_provider_profile_fields() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let app = UiState {
+            panel: UiPanel::Settings,
+            provider: ProviderForm {
+                provider_id: Some("profile-1".into()),
+                profile_name: "OpenCode local".into(),
+                endpoint: "http://127.0.0.1:8788/v1".into(),
+                api_key: "never-render-this-secret".into(),
+                model: "openai/gpt-4.1".into(),
+                provider_type: riga_server::ws::ProviderType::OpencodeOpenAiCompatible,
+                api: riga_server::ws::ProviderApi::Responses,
+                subagent_model: "openai/gpt-4.1-mini".into(),
+                ..ProviderForm::default()
+            },
+            provider_profiles: vec![riga_server::ipc::ProviderProfileSummary {
+                id: "profile-1".into(),
+                name: "OpenCode local".into(),
+                provider_type: riga_server::ws::ProviderType::OpencodeOpenAiCompatible,
+                endpoint: "http://127.0.0.1:8788/v1".into(),
+                model: "openai/gpt-4.1".into(),
+                reasoning_effort: "medium".into(),
+                api: riga_server::ws::ProviderApi::Responses,
+                subagent_model: Some("openai/gpt-4.1-mini".into()),
+                api_key_configured: true,
+            }],
+            ..UiState::default()
+        };
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in [
+            "PROVIDER PROFILE",
+            "Name",
+            "Type",
+            "Endpoint",
+            "API key",
+            "Model",
+            "Reasoning",
+            "Subagent",
+            "SAVED PROVIDERS · 1",
+            "OpenCode local",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}: {text}");
+        }
+        assert!(!text.contains("never-render-this-secret"));
     }
 
     #[test]
@@ -2611,10 +2722,21 @@ mod tests {
             let app = UiState {
                 panel: UiPanel::Settings,
                 model_picker_open: true,
-                remote_models: vec!["alpha-model".into(), "beta-model".into()],
+                remote_models: vec![
+                    crate::app::RemoteModelChoice {
+                        provider_id: "alpha-id".into(),
+                        provider_name: "Alpha".into(),
+                        model: "model-x".into(),
+                    },
+                    crate::app::RemoteModelChoice {
+                        provider_id: "beta-id".into(),
+                        provider_name: "Beta".into(),
+                        model: "model-y".into(),
+                    },
+                ],
                 provider: ProviderForm {
                     endpoint: "https://provider.example/v1".into(),
-                    model: "beta-model".into(),
+                    model: "beta/model-y".into(),
                     ..ProviderForm::default()
                 },
                 ..UiState::default()
@@ -2631,7 +2753,10 @@ mod tests {
                 text.to_lowercase().contains("models"),
                 "width {width}: {text}"
             );
-            assert!(text.contains("beta-model"), "width {width}: {text}");
+            assert!(text.contains("model-x"), "width {width}: {text}");
+            assert!(text.contains("model-y"), "width {width}: {text}");
+            assert!(text.contains("ALPHA MODELS"), "width {width}: {text}");
+            assert!(text.contains("BETA MODELS"), "width {width}: {text}");
             assert!(text.contains("Enter select"), "width {width}: {text}");
         }
     }
@@ -2880,6 +3005,11 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = UiState {
             panel: UiPanel::Settings,
+            provider: ProviderForm {
+                profile_name: "Mobile profile".into(),
+                model: "vendor/model".into(),
+                ..ProviderForm::default()
+            },
             ..UiState::default()
         };
         app.draft.replace("draft remains here");
@@ -2892,6 +3022,9 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(text.contains("Settings"));
+        assert!(text.contains("Name"));
+        assert!(text.contains("Type"));
+        assert!(text.contains("vendor/model"));
         assert!(text.contains("draft remains here"));
         assert!(!text.contains("WORKSPACE"));
     }

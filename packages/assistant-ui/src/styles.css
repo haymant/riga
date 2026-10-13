@@ -241,13 +241,42 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 .provider-form input { width: 100%; padding: 10px; color: #e5e8ee; background: #0d1118; border: 1px solid #30394a; border-radius: 6px; outline: none; font-size: 11px; }
 .provider-form input:focus { border-color: #7659c4; }
 .settings-save { white-space: nowrap; height: 35px; }
+.provider-profiles-manager { display: grid; gap: 10px; max-height: min(58dvh, 660px); overflow-y: auto; padding: 2px 2px 8px; }
+.provider-profile-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 5px 2px 8px; }
+.provider-profile-heading > div, .provider-profile-card summary > span:first-child { display: grid; gap: 4px; }
+.provider-profile-heading strong, .provider-profile-card summary strong { color: #e8eaf0; font-size: 12px; }
+.provider-profile-heading span, .provider-profile-card summary small, .provider-profile-empty { color: #8b93a4; font-size: 10px; }
+.provider-profile-card { background: #0d1118; border: 1px solid #293141; border-radius: 9px; overflow: hidden; }
+.provider-profile-card[open] { border-color: #544478; background: #10141c; }
+.provider-profile-card summary { cursor: pointer; list-style: none; display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 11px 13px; }
+.provider-profile-card summary::-webkit-details-marker { display: none; }
+.provider-profile-card summary::after { content: "⌄"; color: #8b93a4; font-size: 13px; }
+.provider-profile-status { color: #a9b2c1; background: #202632; border-radius: 999px; padding: 3px 7px; font: 8px 'DM Mono', monospace; letter-spacing: .06em; }
+.provider-profile-status.active { color: #87e4b6; background: #17362b; }
+.provider-profile-editor { padding: 0 13px 13px; }
+.provider-profile-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.provider-profile-fields label { color: #8e98aa; display: grid; gap: 5px; font-size: 10px; }
+.provider-profile-fields label span { color: #79d8ad; font: 9px 'DM Mono', monospace; }
+.provider-profile-fields input, .provider-profile-fields select { min-width: 0; width: 100%; padding: 9px; color: #e5e8ee; background: #0b0f15; border: 1px solid #30394a; border-radius: 6px; outline: none; font-size: 11px; }
+.provider-profile-fields input:focus, .provider-profile-fields select:focus { border-color: #7659c4; }
+.provider-profile-fields select:disabled { opacity: .62; }
+.provider-profile-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; padding-top: 12px; }
+.provider-profile-actions .approve-button, .provider-profile-actions .outline-button, .provider-profile-actions .danger-button { min-height: 32px; }
+.danger-button { color: #f0a1a6; background: #321e25; border: 1px solid #64333b; border-radius: 6px; padding: 7px 10px; font-size: 10px; }
+.danger-button:hover:not(:disabled) { background: #47252e; }
+.provider-profile-empty { padding: 12px; background: #0d1118; border: 1px dashed #30394a; border-radius: 8px; }
+[data-theme="light"] .provider-profile-card { background: var(--surface-raised); border-color: var(--border); }
+[data-theme="light"] .provider-profile-card[open] { background: var(--surface); border-color: var(--accent); }
+[data-theme="light"] .provider-profile-heading strong, [data-theme="light"] .provider-profile-card summary strong { color: var(--text); }
+[data-theme="light"] .provider-profile-fields input, [data-theme="light"] .provider-profile-fields select { color: var(--text); background: var(--surface); border-color: var(--border); }
+.settings-popover .provider-profiles-manager { max-height: min(48dvh, 560px); }
 .local-model-card { display: flex; gap: 12px; align-items: flex-start; color: #aeb6c4; }
 .local-model-card strong { color: #e4e6ec; font-size: 12px; }
 .local-model-card p { max-width: 630px; color: #8a94a5; line-height: 1.6; font-size: 11px; margin: 7px 0 12px; }
 [data-theme="light"] .local-model-card { color: var(--text-muted); }
 [data-theme="light"] .local-model-card strong { color: var(--text); }
 [data-theme="light"] .local-model-card p { color: var(--text-muted); }
-@media (max-width: 760px) { .settings-panel { margin: 18px 17px 0; padding: 16px; }.provider-form { grid-template-columns: 1fr; }.settings-save { width: max-content; }.provider-tabs { overflow-x: auto; white-space: nowrap; }.local-model-card { flex-direction: column; } }
+@media (max-width: 760px) { .settings-panel { margin: 18px 17px 0; padding: 16px; }.provider-form { grid-template-columns: 1fr; }.settings-save { width: max-content; }.provider-tabs { overflow-x: auto; white-space: nowrap; }.local-model-card { flex-direction: column; }.provider-profile-fields { grid-template-columns: 1fr; }.provider-profile-heading { align-items: flex-start; flex-direction: column; }.provider-profile-actions > button { flex: 1 1 auto; }.settings-popover .provider-profiles-manager { max-height: 56dvh; } }
 
 .composer-model { display: flex; gap: 5px; align-items: center; flex: 0 0 auto; }
 .composer-model select, .provider-form select { color: #c8c0e8; background: #211b31; border: 1px solid #473a68; border-radius: 5px; padding: 6px 7px; font-size: 10px; outline: none; }

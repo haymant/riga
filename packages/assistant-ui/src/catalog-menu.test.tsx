@@ -8,8 +8,8 @@ import type { RigaTransport, RigaTransportListeners } from "./protocol";
 
 const catalogWithSkills = {
   tools: [{ id: "read", kind: "tool", description: "Read a file", insert_text: "read ", requires_approval: false }],
-  agents: [],
-  files: [],
+  agents: [{ name: "explore", aliases: ["scout"], purpose: "Read-only reconnaissance", read_only: true }],
+  files: [{ name: "main.rs", path: "src/main.rs" }],
   skills: [
     { name: "rundeck", description: "Orchestrate subagents", path: "skills/rundeck/SKILL.md" },
     { name: "code-review", description: "Review code", path: "skills/code-review/SKILL.md" },
@@ -30,6 +30,10 @@ function createTransport() {
     sessionHistory: async () => [],
     renameSession: async (sessionId, title) => ({ id: sessionId, title, workspace: ".", created_at: "now", updated_at: "now" }),
     configureProvider: async () => undefined,
+    remoteModels: async () => [],
+    providerProfiles: async () => [],
+    saveProviderProfile: async (input) => ({ ...input, id: input.id ?? "profile-new", api_key_configured: Boolean(input.api_key) }),
+    deleteProviderProfile: async () => undefined,
     startRun: async () => undefined,
     resumeRun: async () => undefined,
     cancelRun: async () => undefined,
@@ -78,5 +82,35 @@ describe("composer + menu", () => {
 
     expect(await screen.findByText("skill/rundeck")).toBeInTheDocument();
     expect(screen.getByText("skill/code-review")).toBeInTheDocument();
+  });
+
+  it("shows native slash commands and TUI-compatible file and subagent mentions", async () => {
+    const testTransport = createTransport();
+    render(<AssistantUI transportFactory={testTransport.factory} />);
+    await waitFor(() => expect(screen.getByText("connected")).toBeInTheDocument());
+    const composer = screen.getByPlaceholderText("Ask RIGA to make a change…");
+
+    fireEvent.change(composer, { target: { value: "/mod" } });
+    expect(await screen.findByText("/model")).toBeInTheDocument();
+    expect(screen.getByText("/models")).toBeInTheDocument();
+
+    fireEvent.change(composer, { target: { value: "@expl" } });
+    expect(await screen.findByText("@explore")).toBeInTheDocument();
+    fireEvent.change(composer, { target: { value: "@src" } });
+    expect(await screen.findByText("@main.rs")).toBeInTheDocument();
+    fireEvent.change(composer, { target: { value: "literal@expl" } });
+    expect(screen.queryByText("@explore")).not.toBeInTheDocument();
+  });
+
+  it("uses TUI slash labels and tool-provided insertion text for dynamic tools", async () => {
+    const testTransport = createTransport();
+    render(<AssistantUI transportFactory={testTransport.factory} />);
+    await waitFor(() => expect(screen.getByText("connected")).toBeInTheDocument());
+    const composer = screen.getByPlaceholderText("Ask RIGA to make a change…");
+    fireEvent.change(composer, { target: { value: "/tools/rea" } });
+
+    const candidate = await screen.findByText("/tools/read");
+    fireEvent.click(candidate.closest("button")!);
+    expect(composer).toHaveValue("read ");
   });
 });

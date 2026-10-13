@@ -243,6 +243,75 @@ Configure an OpenAI-compatible endpoint, model, reasoning effort, and API key in
 
 Set `RIGA_TOKEN` to the encryption secret used by the server-side store. Use a deployment secret manager in production.
 
+### OpenCode Responses API adapter
+
+`packages/opencode` is a standalone TypeScript server that uses the official
+[`@opencode-ai/sdk`](https://opencode.ai/docs/sdk/) to start OpenCode and expose
+its configured providers through an OpenAI Responses-compatible API. Install and
+configure the OpenCode CLI first, then from the repository root run:
+
+```bash
+npm install
+npm run dev --workspace @rigai/opencode
+```
+
+The adapter listens on `http://127.0.0.1:8788/v1` by default, while the SDK
+starts the OpenCode server on `127.0.0.1:4096`. Build and run the compiled
+package with `npm run build --workspace @rigai/opencode` followed by
+`npm run start --workspace @rigai/opencode`. To connect to an OpenCode server
+that is already running instead, set `OPENCODE_BASE_URL` and the adapter will
+attach through `createOpencodeClient` rather than spawning another server.
+
+The adapter implements `GET /v1/models`, `POST /v1/responses`, and
+`GET /v1/responses/{id}`. Model IDs use OpenCode's `provider/model` convention.
+The adapter returns the OpenCode session ID directly as both `response.id` and
+`response.conversation.id`; a supplied `previous_response_id` is used directly as
+the OpenCode session ID. Without one, the adapter creates a new OpenCode session.
+The proxy therefore does not need a response-ID-to-session mapping. It retains
+response snapshots only for `GET /v1/responses/{id}`.
+
+RIGA persists the mapping from each RIGA session to the upstream session ID for
+each provider registration. It is stored as `provider_sessions` using RIGA's
+configured database, encrypted file store (`RIGA_TOKEN`), or local JSON fallback.
+The registration identity is derived from the endpoint, backend/API type, and a
+hash of the API key; the model is excluded, so changing models within the same
+provider keeps the conversation, while changing providers or credentials starts
+a separate provider-side conversation. When RIGA has a mapping, it sends that
+ID as `previous_response_id` and sends only the current turn; on the first turn
+for that provider registration it omits the ID, seeds the new session with any
+RIGA transcript history, then saves the returned ID. Deleting a RIGA session
+removes its local mappings but does not delete provider-side sessions.
+
+The adapter currently accepts text input and returns text; OpenCode tool
+execution remains inside its session. `stream: true` returns Responses SSE events
+after the SDK's completed prompt result (the SDK call itself is buffered, not
+token-streamed).
+
+Set `RIGA_OPENCODE_HOST` / `RIGA_OPENCODE_PORT` to change the API bind address;
+`OPENCODE_HOST` / `OPENCODE_PORT` configure the SDK-launched OpenCode server.
+`RIGA_OPENCODE_API_KEY` enables bearer-token authentication and is required when
+the adapter binds beyond localhost/loopback. State defaults to
+`~/.local/share/riga/opencode/responses.json` on Linux and can be redirected with
+`RIGA_OPENCODE_STATE_PATH` or `RIGA_OPENCODE_DATA_DIR`.
+
+Example request:
+
+```bash
+curl http://127.0.0.1:8788/v1/responses \
+  -H 'content-type: application/json' \
+  -d '{"model":"provider/model","input":"Summarize this project"}'
+```
+
+Replace `provider/model` with an exact ID from `GET /v1/models`. Use the returned
+response `id` as `previous_response_id` on the next request. Configure multiple
+upstream providers and credentials in OpenCode using its
+[model-provider setup](https://opencode.ai/docs/models/); the adapter lists their
+available models as `provider/model` IDs. When using RIGA as a client,
+configure its remote endpoint as `http://127.0.0.1:8788/v1`, choose the
+**Responses API** mode, and select one of those provider/model IDs. RIGA's model
+picker fetches and groups that catalog from the configured endpoint instead of
+using a hard-coded list.
+
 ## Tool and attachment model
 
 Built-in tools include read, write, glob, grep, web, bash, task, and skill. Tool calls are rendered as collapsible call/result cards; bash and shell output use terminal-style blocks.
@@ -258,7 +327,7 @@ The `task` tool exposes four transport-neutral agent profiles:
 | `build` | `executor`, `worker` | Mutating, capability-gated | Implementation and repository validation |
 | `review` | `reviewer` | Read-only | Independent correctness, security, and test review |
 
-Use `task` with `action: "agents"` to discover profiles or `action: "dispatch"` with an `agent` and `prompt` to request a structured handoff. The parent RIGA run remains responsible for tool execution and approvals, so the profiles do not bypass workspace policy gates.
+Use `task` with `action: "agents"` to discover profiles or `action: "dispatch"` with an `agent` and `prompt` to request a structured handoff. A dispatch may include an optional `model` override, such as `provider/model` when using the OpenCode adapter; otherwise the configured subagent/main-model policy applies. The parent RIGA run remains responsible for tool execution and approvals, so the profiles do not bypass workspace policy gates.
 
 Attachments are uploaded through `POST /attachments` and stored under `tmp/riga-attachments/`. The generated workspace-relative path is included in the agent prompt so the read tool can inspect the file. Runtime attachments are ignored by Git.
 

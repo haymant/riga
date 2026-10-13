@@ -139,6 +139,64 @@ pub async fn save_json<T: serde::Serialize>(name: &str, value: &T) -> Result<(),
     fs::rename(temp, path).map_err(|error| error.to_string())
 }
 
+type ProviderSessionMappings =
+    std::collections::HashMap<String, std::collections::HashMap<String, String>>;
+
+fn provider_session_mappings_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Look up the provider-specific conversation ID associated with one RIGA
+/// session and one provider registration fingerprint.
+pub(crate) async fn provider_session_id(
+    riga_session_id: &str,
+    provider_registration_id: &str,
+) -> Result<Option<String>, String> {
+    let _guard = provider_session_mappings_lock().lock().await;
+    let mappings = load_json::<ProviderSessionMappings>("provider_sessions")
+        .await?
+        .unwrap_or_default();
+    Ok(mappings
+        .get(riga_session_id)
+        .and_then(|providers| providers.get(provider_registration_id))
+        .cloned())
+}
+
+/// Persist the upstream session ID returned by a remote Responses provider.
+pub(crate) async fn save_provider_session_id(
+    riga_session_id: &str,
+    provider_registration_id: &str,
+    provider_session_id: &str,
+) -> Result<(), String> {
+    let _guard = provider_session_mappings_lock().lock().await;
+    let mut mappings = load_json::<ProviderSessionMappings>("provider_sessions")
+        .await?
+        .unwrap_or_default();
+    mappings
+        .entry(riga_session_id.to_owned())
+        .or_default()
+        .insert(
+            provider_registration_id.to_owned(),
+            provider_session_id.to_owned(),
+        );
+    save_json("provider_sessions", &mappings).await
+}
+
+/// Remove all provider-specific conversation IDs when their RIGA session is
+/// deleted. The provider-side conversations themselves are not deleted.
+pub(crate) async fn remove_provider_session_mappings(riga_session_id: &str) -> Result<(), String> {
+    let _guard = provider_session_mappings_lock().lock().await;
+    let Some(mut mappings) = load_json::<ProviderSessionMappings>("provider_sessions").await?
+    else {
+        return Ok(());
+    };
+    if mappings.remove(riga_session_id).is_some() {
+        save_json("provider_sessions", &mappings).await?;
+    }
+    Ok(())
+}
+
 async fn load_database<T: serde::de::DeserializeOwned>(
     url: &str,
     name: &str,
@@ -255,6 +313,31 @@ mod tests {
         assert_eq!(
             store.load::<serde_json::Value>("test").unwrap().unwrap()["secret"],
             "value"
+        );
+    }
+
+    #[test]
+    fn provider_session_mapping_round_trips_encrypted_by_riga_session_and_registration() {
+        let directory = tempdir().unwrap();
+        let store = SecureStore::new(directory.path().to_owned(), "test-token");
+        let mappings = std::collections::HashMap::from([(
+            "riga-session-1".to_owned(),
+            std::collections::HashMap::from([(
+                "provider_fingerprint".to_owned(),
+                "opencode-session-9".to_owned(),
+            )]),
+        )]);
+        store.save("provider_sessions", &mappings).unwrap();
+
+        let bytes = std::fs::read(directory.path().join("provider_sessions.enc")).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("opencode-session-9"));
+        let restored = store
+            .load::<super::ProviderSessionMappings>("provider_sessions")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            restored["riga-session-1"]["provider_fingerprint"],
+            "opencode-session-9"
         );
     }
 }

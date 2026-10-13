@@ -16,6 +16,7 @@ describe("RigaTauriTransport", () => {
     const transport = new RigaTauriTransport({ invoke: invoke as TauriTransportOptions["invoke"], listen });
 
     await transport.configureProvider("https://model.test/v1", "secret", "model", "medium", "remote", "responses", "cheap");
+    await transport.remoteModels();
     await transport.startRun("run-1", "session-1", "hello");
     await transport.resumeRun("run-1", 4);
     await transport.cancelRun("run-1");
@@ -25,6 +26,7 @@ describe("RigaTauriTransport", () => {
     expect(calls.map(({ command }) => command)).toEqual([
       RIGA_IPC_COMMANDS.connect,
       RIGA_IPC_COMMANDS.configureProvider,
+      RIGA_IPC_COMMANDS.remoteModels,
       RIGA_IPC_COMMANDS.startRun,
       RIGA_IPC_COMMANDS.resumeRun,
       RIGA_IPC_COMMANDS.cancelRun,
@@ -32,7 +34,7 @@ describe("RigaTauriTransport", () => {
       RIGA_IPC_COMMANDS.approval,
     ]);
     expect(calls[1]?.args).toMatchObject({ endpoint: "https://model.test/v1", apiKey: "secret", reasoningEffort: "medium", api: "responses" });
-    expect(calls[4]?.args).toEqual({ runId: "run-1" });
+    expect(calls[5]?.args).toEqual({ runId: "run-1" });
   });
 
   it("delivers run, local-model, provider, and error events", async () => {

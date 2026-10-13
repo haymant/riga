@@ -46,6 +46,7 @@ export default defineConfig(() => ({
     proxy: {
       "/ws": { target: "ws://127.0.0.1:8787", ws: true },
       "/health": { target: "http://127.0.0.1:8787" },
+      "/provider": { target: "http://127.0.0.1:8787" },
       "/catalog": { target: "http://127.0.0.1:8787" },
       "/mcp": { target: "http://127.0.0.1:8787" },
       "/attachments": { target: "http://127.0.0.1:8787" },

@@ -1,6 +1,6 @@
 import { Component, useEffect, useMemo, useRef, useState, type ReactNode, type SetStateAction } from "react";
 import { createHttpTransport, formatBytes, reduceDownloadState } from "./http";
-import type { ActiveRun, ConversationTurn, DownloadState, LocalModelOverview, RigaEventEnvelope, RigaTransport, RigaTransportListeners, Session as ProtocolSession } from "./protocol";
+import type { ActiveRun, ConversationTurn, DownloadState, LocalModelOverview, ProviderProfile, ProviderProfileInput, ProviderType, RigaEventEnvelope, RigaTransport, RigaTransportListeners, Session as ProtocolSession } from "./protocol";
 import {
   Bot,
   Check,
@@ -30,6 +30,7 @@ import "./styles.css";
 import { Markdown } from "./Markdown";
 import { DEFAULT_ASSISTANT_UI_OPTIONS, type AssistantUiOptions } from "./options";
 import { RunGraphPanel } from "./RunGraphPanel";
+import { conversationExportFilename, conversationJsonl, matchingNativeSlashCommands, NATIVE_SLASH_COMMANDS, parseNativeSlashCommand } from "./native-commands";
 
 // Sentinel for the composer's local-model entry. Distinct from any remote model
 // id so selecting it is unambiguous.
@@ -92,6 +93,7 @@ type FileCandidate = { name: string; path: string };
 type McpServerSummary = { name: string; command: string; args?: string[]; tools: string[]; transport?: "stdio" | "http"; url?: string; api_key_configured?: boolean };
 type ConnectorDraft = { name: string; transport: "stdio" | "http"; command: string; args: string; url: string; apiKey: string };
 type CatalogLayer = "root" | "connectors";
+type CatalogScope = "tools" | "skills" | "mcp" | null;
 type ReasoningEffort = "low" | "medium" | "high";
 type Attachment = { name: string; path: string; size: number };
 type PlanStep = { id?: string; label: string; description?: string };
@@ -169,6 +171,10 @@ function AssistantUIInner({
   const [providerEndpoint, setProviderEndpoint] = useState("");
   const [providerApiKey, setProviderApiKey] = useState("");
   const [providerModel, setProviderModel] = useState("");
+  const [remoteModels, setRemoteModels] = useState<string[]>([]);
+  const [providerProfiles, setProviderProfiles] = useState<ProviderProfile[]>([]);
+  const [providerModelsById, setProviderModelsById] = useState<Record<string, string[]>>({});
+  const [activeProviderId, setActiveProviderId] = useState<string | undefined>();
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("low");
   // The settings tab the user is editing. Distinct from `providerKind`, which is
   // the backend runs actually use: they diverge as soon as the user opens
@@ -178,6 +184,7 @@ function AssistantUIInner({
   // Which remote API the form will call. Defaults to the OpenAI-compatible chat
   // contract; the Responses API is opt-in.
   const [providerApi, setProviderApi] = useState<"chat" | "responses">("chat");
+  const [providerType, setProviderType] = useState<ProviderType>("open_ai_compatible");
   // Optional cheaper model for read-only subagents (explore/plan/review).
   const [subagentModel, setSubagentModel] = useState("");
   const [localModels, setLocalModels] = useState<LocalModelOverview | null>(null);
@@ -206,6 +213,7 @@ function AssistantUIInner({
   const [manualCatalog, setManualCatalog] = useState(false);
   const [catalogLayer, setCatalogLayer] = useState<CatalogLayer>("root");
   const [catalogQuery, setCatalogQuery] = useState("");
+  const [catalogScope, setCatalogScope] = useState<CatalogScope>(null);
   const [editingConnector, setEditingConnector] = useState<string | "new" | null>(null);
   const [connectorDraft, setConnectorDraft] = useState<ConnectorDraft>({ name: "", transport: "stdio", command: "", args: "", url: "", apiKey: "" });
   const [catalogItems, setCatalogItems] = useState<CatalogItem[]>([]);
@@ -322,7 +330,32 @@ function AssistantUIInner({
     return () => window.cancelAnimationFrame(frame);
   }, [transcript, isRunning]);
 
+  async function refreshProviderRegistry() {
+    const transport = transportRef.current;
+    if (!transport) return;
+    try {
+      const profiles = await transport.providerProfiles();
+      const catalogs = await Promise.all(profiles.map(async (profile) => {
+        const models = await transport.remoteModels(profile.id).catch(() => []);
+        return [profile.id, Array.from(new Set([...models, profile.model].filter(Boolean)))] as const;
+      }));
+      setProviderProfiles(profiles);
+      setProviderModelsById(Object.fromEntries(catalogs));
+      setRemoteModels(catalogs.flatMap(([, models]) => models));
+      if (!activeProviderId && profiles.length === 1) setActiveProviderId(profiles[0]?.id);
+    } catch {
+      setProviderProfiles([]);
+      setProviderModelsById({});
+      setRemoteModels([]);
+    }
+  }
+
   const allConnectors = mcpServers;
+  const remoteModelGroups = useMemo(() => providerProfiles.map((profile) => [
+    profile.id,
+    profile.name,
+    providerModelsById[profile.id] ?? [profile.model].filter(Boolean),
+  ] as const), [providerModelsById, providerProfiles]);
 
   const triggerMatch = useMemo(() => {
     const match = draft.match(/(?:^|\s)([@/])([^\s]*)$/);
@@ -356,6 +389,7 @@ function AssistantUIInner({
       onStatus: (status) => {
         setTransportStatus(status);
         if (status !== "connected") return;
+        void refreshProviderRegistry();
         void transportRef.current?.listActiveRuns().then((runs) => {
           setActiveRuns(runs);
           setRunIds((current) => Array.from(new Set([...current, ...runs.map((run) => run.run_id)])));
@@ -374,7 +408,7 @@ function AssistantUIInner({
           void transportRef.current?.listLocalModels().then(setLocalModels).catch(() => undefined);
         }
       },
-      onProviderConfigured: (endpoint, model, effort, kind, api, subagent) => {
+      onProviderConfigured: (endpoint, model, effort, kind, api, subagent, providerId, registeredType) => {
         // Endpoint and model are echoed even for a local provider so the remote
         // form survives a switch to local. `kind` decides what runs use.
         setProviderEndpoint(endpoint);
@@ -383,6 +417,11 @@ function AssistantUIInner({
         setProviderKind(kind);
         setProviderApi(api);
         setSubagentModel(subagent);
+        setActiveProviderId(providerId);
+        if (registeredType) setProviderType(registeredType);
+        if (kind === "remote") {
+          void refreshProviderRegistry();
+        }
       },
       onError: (code, message) => {
         activeRunIdRef.current = null;
@@ -655,14 +694,14 @@ function AssistantUIInner({
     }
   }
 
-  async function createSession() {
+  async function createSession(title = NEW_SESSION_TITLE) {
     const client = transportRef.current;
     if (!client || transportStatus !== "connected") {
       setToast("RIGA is not connected yet.");
       return;
     }
     try {
-      const next = await client.createSession({ title: NEW_SESSION_TITLE, workspace: "." });
+      const next = await client.createSession({ title, workspace: activeSession.workspace || "." });
       setSessions((current) => [{ ...next, meta: next.workspace, active: true }, ...current.map((session) => ({ ...session, active: false }))]);
       setSessionTranscripts((current) => ({ ...current, [next.id]: [] }));
       setPendingApproval(null);
@@ -698,9 +737,137 @@ function AssistantUIInner({
     }
   }
 
-  function sendMessage() {
+  async function handleNativeSlashCommand(input: string): Promise<boolean> {
+    const parsed = parseNativeSlashCommand(input);
+    if (!parsed) return false;
+    const { name, arguments: args } = parsed;
+    const clearCommand = (keepCatalog = false) => {
+      setDraft("");
+      if (composerInputRef.current) composerInputRef.current.style.height = "auto";
+      if (!keepCatalog) setCatalogOpen(false);
+      setManualCatalog(keepCatalog);
+      setCatalogQuery(keepCatalog ? args : "");
+      if (!keepCatalog) setCatalogScope(null);
+    };
+    const openProviderSettings = (mode: "remote" | "local" = "remote") => {
+      setSettingsOpen(true);
+      setHistoryOpen(false);
+      setProviderMode(mode);
+      setCatalogOpen(false);
+    };
+    switch (name) {
+      case "/model":
+      case "/models": {
+        const requested = args.replace(/^set\s+/iu, "").trim();
+        if (!requested || requested.toLowerCase() === "list") {
+          openProviderSettings("remote");
+          setToast("Choose a model under its provider in Settings or the composer selector.");
+        } else {
+          const match = providerProfiles
+            .flatMap((profile) => (providerModelsById[profile.id] ?? [profile.model]).map((model) => ({ profile, model })))
+            .find(({ model }) => model === requested);
+          const providerId = match?.profile.id ?? activeProviderId;
+          selectComposerModel(providerId ? JSON.stringify([providerId, match?.model ?? requested]) : requested);
+          setToast(`Switching to remote model ${requested}…`);
+        }
+        clearCommand();
+        return true;
+      }
+      case "/export": {
+        const jsonl = conversationJsonl(activeSession.id || null, activeSession.title || null, transcript);
+        const fileName = conversationExportFilename(
+          args,
+          `riga-conversation-${new Date().toISOString().replace(/[:.]/gu, "-")}.jsonl`,
+        );
+        try {
+          const url = URL.createObjectURL(new Blob([jsonl], { type: "application/x-ndjson" }));
+          const link = document.createElement("a");
+          link.href = url;
+          link.download = fileName;
+          link.click();
+          window.setTimeout(() => URL.revokeObjectURL(url), 0);
+          setToast(`Exported ${transcript.length} record${transcript.length === 1 ? "" : "s"} to ${fileName}`);
+        } catch (error) {
+          setToast(error instanceof Error ? `Export failed: ${error.message}` : "Export failed in this browser");
+        }
+        clearCommand();
+        return true;
+      }
+      case "/tools":
+        openCatalogScope("tools", args);
+        clearCommand(true);
+        return true;
+      case "/mcp":
+        openCatalogScope("mcp", args);
+        clearCommand(true);
+        return true;
+      case "/skills":
+        openCatalogScope("skills", args);
+        clearCommand(true);
+        return true;
+      case "/settings":
+        openProviderSettings("remote");
+        clearCommand();
+        return true;
+      case "/local-models":
+        openProviderSettings("local");
+        clearCommand();
+        return true;
+      case "/new":
+      case "/clear":
+        clearCommand();
+        if (isRunning) setToast("Wait for the active operation to finish before starting a new session.");
+        else await createSession(args || NEW_SESSION_TITLE);
+        return true;
+      case "/resume":
+      case "/sessions":
+        setHistoryOpen(true);
+        setSettingsOpen(false);
+        clearCommand();
+        return true;
+      case "/rename":
+        if (!activeSession.id) setToast("There is no session to rename yet.");
+        else if (!args.trim()) beginSessionRename(activeSession);
+        else {
+          try {
+            const updated = await transportRef.current?.renameSession(activeSession.id, args.trim());
+            if (!updated) throw new Error("RIGA is not connected.");
+            setSessions((current) => current.map((session) => session.id === activeSession.id
+              ? { ...updated, meta: session.meta, active: session.active }
+              : session));
+            setToast("Session name updated");
+          } catch (error) {
+            setToast(error instanceof Error ? error.message : "Could not rename this session");
+          }
+        }
+        clearCommand();
+        return true;
+      case "/status":
+        setToast(`Connection ${transportStatus} · provider ${providerKind} · model ${providerModel || "not configured"} · session ${activeSession.title || "none"}`);
+        clearCommand();
+        return true;
+      case "/help":
+        setToast("Commands: /model, /export, /tools, /mcp, /skills, /settings, /local-models, /new, /resume, /rename, /status, /quit. Use @ for files and subagents.");
+        clearCommand();
+        return true;
+      case "/exit":
+      case "/quit":
+        setToast("This browser UI cannot close its own tab. Close the tab to exit RIGA.");
+        clearCommand();
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  async function sendMessage() {
     const text = draft.trim();
-    if (!text || isRunning) return;
+    if (!text) return;
+    const parsed = parseNativeSlashCommand(text);
+    if (parsed && NATIVE_SLASH_COMMANDS.some((command) => command.name === parsed.name)) {
+      if (await handleNativeSlashCommand(text)) return;
+    }
+    if (isRunning) return;
     if (!activeSession.id) {
       setToast("Wait for the session list to finish loading.");
       return;
@@ -790,8 +957,8 @@ function AssistantUIInner({
     void transportRef.current?.respondToApproval(activeRunIdRef.current ?? "", pending.approvalId, approved, option);
   }
 
-  function selectComposerModel(model: string) {
-    if (model === LOCAL_MODEL_VALUE) {
+  function selectComposerModel(selection: string) {
+    if (selection === LOCAL_MODEL_VALUE) {
       // Keep the stored endpoint and model so switching back to remote does not
       // lose them; the server ignores both while `kind` is local.
       setProviderKind("local");
@@ -800,9 +967,31 @@ function AssistantUIInner({
       }
       return;
     }
+    let model = selection;
+    let providerId: string | undefined;
+    try {
+      const parsed: unknown = JSON.parse(selection);
+      if (Array.isArray(parsed) && typeof parsed[0] === "string" && typeof parsed[1] === "string") {
+        [providerId, model] = parsed as [string, string];
+      }
+    } catch {
+      // Older clients and direct model IDs still use the current provider.
+    }
     setProviderKind("remote");
     setProviderModel(model);
-    if (model && providerEndpoint.trim() && transportStatus === "connected") {
+    if (providerId) {
+      const profile = providerProfiles.find((item) => item.id === providerId);
+      if (!profile) return;
+      setActiveProviderId(providerId);
+      setProviderEndpoint(profile.endpoint);
+      setProviderApi(profile.api);
+      setProviderType(profile.provider_type);
+      setReasoningEffort(profile.reasoning_effort);
+      setSubagentModel(profile.subagent_model ?? "");
+      if (transportStatus === "connected") {
+        void transportRef.current?.configureProvider(profile.endpoint, "", model, profile.reasoning_effort, "remote", profile.api, profile.subagent_model ?? "", profile.id, profile.provider_type);
+      }
+    } else if (model && providerEndpoint.trim() && transportStatus === "connected") {
       void transportRef.current?.configureProvider(providerEndpoint.trim(), "", model, reasoningEffort, "remote", providerApi, subagentModel.trim());
     }
   }
@@ -816,6 +1005,24 @@ function AssistantUIInner({
     setManualCatalog(false);
     setCatalogQuery("");
     setCatalogLayer("root");
+    setCatalogScope(null);
+  }
+
+  function closeCatalogMenu() {
+    setCatalogOpen(false);
+    setManualCatalog(false);
+    setCatalogQuery("");
+    setCatalogScope(null);
+  }
+
+  function openCatalogScope(scope: Exclude<CatalogScope, null>, query = "") {
+    setCatalogOpen(true);
+    setManualCatalog(true);
+    setCatalogScope(scope);
+    setCatalogQuery(query);
+    setCatalogLayer(scope === "mcp" ? "connectors" : "root");
+    setHistoryOpen(false);
+    setSettingsOpen(false);
   }
 
   function openConnectorEditor(server?: McpServerSummary) {
@@ -853,9 +1060,55 @@ function AssistantUIInner({
     return { tools, skills: skillItems, connectors: connectorItems, files, agents: agentItems };
   }, [agents, allConnectors, attachments, catalogItems, catalogQuery, skills, workspaceFiles]);
 
-  const menuTools = activeTrigger?.char === "@" ? [] : searchableItems.tools;
-  const menuSkills = activeTrigger?.char === "@" ? [] : searchableItems.skills;
-  const menuConnectors = activeTrigger?.char === "/" || activeTrigger?.char === "@" ? [] : searchableItems.connectors;
+  const nativeCommandItems: CatalogItem[] = activeTrigger?.char === "/"
+    ? matchingNativeSlashCommands(activeTrigger.query).map((command) => ({
+      id: command.name.slice(1),
+      kind: "native_command",
+      description: command.description,
+      insert_text: `${command.name} `,
+      requires_approval: false,
+    }))
+    : [];
+  const slashToolItems: CatalogItem[] = activeTrigger?.char === "/"
+    ? catalogItems.filter((item) => `tools/${item.id}`.toLowerCase().startsWith(activeTrigger.query.toLowerCase())).map((item) => ({
+      ...item,
+      id: `tools/${item.id}`,
+      insert_text: item.insert_text || `Use the ${item.id} tool: `,
+    }))
+    : [];
+  const slashSkillItems = activeTrigger?.char === "/"
+    ? skills.filter((skill) => `skills/${skill.name}`.toLowerCase().startsWith(activeTrigger.query.toLowerCase()))
+    : [];
+  const slashMcpItems: CatalogItem[] = activeTrigger?.char === "/"
+    ? allConnectors.flatMap((server) => [
+      {
+        id: `mcp/${server.name}`,
+        kind: "mcp_command",
+        description: "Configured MCP server",
+        insert_text: `Use MCP server ${server.name}: `,
+        requires_approval: false,
+      },
+      ...server.tools.map((tool) => ({
+        id: `mcp/${server.name}/${tool}`,
+        kind: "mcp_command",
+        description: `Tool exposed by ${server.name}`,
+        insert_text: `Use the MCP tool ${server.name}/${tool}: `,
+        requires_approval: false,
+      })),
+    ])
+      .filter((item) => item.id.toLowerCase().startsWith(activeTrigger.query.toLowerCase()))
+    : [];
+  const menuTools = activeTrigger?.char === "@" || (catalogScope !== null && catalogScope !== "tools")
+    ? []
+    : activeTrigger?.char === "/"
+      ? [...nativeCommandItems, ...slashToolItems, ...slashMcpItems]
+      : searchableItems.tools;
+  const menuSkills = activeTrigger?.char === "@" || (catalogScope !== null && catalogScope !== "skills")
+    ? []
+    : activeTrigger?.char === "/" ? slashSkillItems : searchableItems.skills;
+  const menuConnectors = activeTrigger?.char === "/" || activeTrigger?.char === "@" || (catalogScope !== null && catalogScope !== "mcp")
+    ? []
+    : searchableItems.connectors;
 
   async function saveProvider() {
     if (providerMode === "local") {
@@ -893,10 +1146,10 @@ function AssistantUIInner({
             <div className="chat-header-actions">
               {showSessionHistoryButton && <button className={`icon-button chat-header-button ${historyOpen ? "selected" : ""}`} aria-label="Open chat history" title="Open chat history" onClick={() => { setHistoryOpen((value) => !value); setSettingsOpen(false); }}><Menu size={16} /></button>}
               <button className={`icon-button chat-header-button ${settingsOpen ? "selected" : ""}`} aria-label="Open settings" title="Open settings" onClick={() => { setSettingsOpen((value) => !value); setHistoryOpen(false); }}><Settings2 size={16} /></button>
-              <button className="icon-button chat-header-button" aria-label="New chat" title="New chat" onClick={createSession}><Plus size={16} /></button>
+              <button className="icon-button chat-header-button" aria-label="New chat" title="New chat" onClick={() => void createSession()}><Plus size={16} /></button>
             </div>
             {historyOpen && <div className="chat-popover history-popover"><div className="chat-popover-header"><strong>Chat history</strong><button className="outline-button" onClick={() => void createSession()}><Plus size={13} /> New chat</button></div><nav className="compact-session-list" aria-label="Chat history">{sessions.map((session) => editingSessionId === session.id ? <div className="compact-session-edit" key={session.id}><input aria-label="Session name" value={renameDraft} autoFocus onChange={(event) => setRenameDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); void saveSessionRename(session.id); } else if (event.key === "Escape") setEditingSessionId(null); }} /><button className="approve-button" onClick={() => void saveSessionRename(session.id)}>Save</button><button className="outline-button" onClick={() => setEditingSessionId(null)}>Cancel</button></div> : <div className={`compact-session-row ${session.active ? "active" : ""}`} key={session.id}><button className={`compact-session-item ${session.active ? "active" : ""}`} onClick={() => void selectSession(session.id)}><MessageSquare size={14} /><span><strong>{session.title}</strong><small>{session.meta}</small></span></button><button className="icon-button compact-session-rename" aria-label={`Rename ${session.title}`} title="Rename session" onClick={() => beginSessionRename(session)}><Pencil size={12} /></button></div>)}</nav></div>}
-            {settingsOpen && <section className="chat-popover settings-popover"><div className="settings-panel-header"><div><p className="eyebrow">RUNTIME / PROVIDER</p><h2>Connect your model.</h2><p>Endpoint and model restore after reload. The API key is sent over WebSocket and retained only in the server's encrypted store.</p></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><div className="provider-tabs"><button className={providerMode === "remote" ? "selected" : ""} onClick={() => setProviderMode("remote")}>OpenAI-compatible / OpenCode Go</button><button className={providerMode === "local" ? "selected" : ""} onClick={() => setProviderMode("local")}>Local GGUF model</button></div>{providerMode === "remote" ? <div className="provider-form"><label>API endpoint<input value={providerEndpoint} onChange={(event) => setProviderEndpoint(event.target.value)} placeholder="https://api.example.com/v1" /></label><label>API key <span>encrypted at rest</span><input type="password" value={providerApiKey} onChange={(event) => setProviderApiKey(event.target.value)} placeholder="sk-…" autoComplete="off" /></label><label>Model<input value={providerModel} onChange={(event) => setProviderModel(event.target.value)} placeholder="opencode-go / gpt-4o-mini" /></label><label>API<select value={providerApi} onChange={(event) => setProviderApi(event.target.value as "chat" | "responses")}><option value="chat">Chat completions (compatible)</option><option value="responses">Responses API (OpenAI)</option></select></label><label>Subagent model <span>optional</span><input value={subagentModel} onChange={(event) => setSubagentModel(event.target.value)} placeholder="cheap model for explore/plan" /></label><label>Reasoning effort<select value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label><button className="approve-button settings-save" onClick={() => void saveProvider()}><Check size={15} /> Save settings</button></div> : <div className="local-model-panel"><div className="local-model-head"><div className="tool-symbol"><Bot size={17} /></div><div><strong>Local GGUF models</strong><p>Download a curated GGUF and run it in this process through llama.cpp. Runs on {localModels?.accelerator ?? "the local CPU"}{localModels?.accelerator?.includes("CPU") ? " — build with `--features cuda` for GPU offload." : "."}</p></div></div>{modelError && <p className="model-error">{modelError}</p>}<div className="model-section"><div className="model-section-title"><span>Downloaded</span><button className="outline-button" onClick={() => void refreshLocalModels()} disabled={modelBusy !== null}>Refresh</button></div>{!localModels && <p className="model-empty">Loading the model manager…</p>}{localModels?.installed.length === 0 && <p className="model-empty">No models yet. Download one below; it is verified against a pinned SHA-256 before use.</p>}{localModels?.installed.map((model) => { const state = downloads[model.id]; return <div className="model-row" key={model.path}><div className="model-row-main"><strong>{model.name}</strong><span>{formatBytes(model.size_bytes)} · {model.curated ? model.recommended_context ? `${model.recommended_context >= 1024 ? `${Math.round(model.recommended_context / 1024)}k` : model.recommended_context} ctx` : "curated GGUF" : "local GGUF"}</span></div><div className="model-row-actions">{state?.phase === "downloading" && <button className="outline-button" onClick={() => void runModelAction("cancel", async () => { await transportRef.current?.cancelDownload(model.id); })} disabled={modelBusy !== null}>{state.percent.toFixed(0)}% · Cancel</button>}{localModels.loaded === model.file_name ? <span className="model-loaded">Loaded</span> : <button className="approve-button" onClick={() => void runModelAction("load", async () => { await transportRef.current?.loadModel(model.path); })} disabled={modelBusy !== null}>{modelBusy === "load" ? "Loading…" : "Load"}</button>}</div>{state?.phase === "downloading" && <div className="model-progress"><span style={{ width: `${Math.max(2, state.percent)}%` }} /></div>}{state?.phase === "failed" && <p className="model-error">{state.message}</p>}</div>; })}{localModels && <div className="model-section-title"><span>Curated catalog</span></div>}{localModels?.catalog.map((model) => { const state = downloads[model.id]; const already = localModels.installed.some((installed) => installed.id === model.id); return <div className="model-row" key={model.id}><div className="model-row-main"><strong>{model.name}</strong><span>{formatBytes(model.size_bytes)} · {model.quant} · {Math.round(model.recommended_context / 1024)}k ctx · <a href={model.license_url} target="_blank" rel="noreferrer">license</a></span></div><div className="model-row-actions">{already ? <span className="model-installed-tag">Installed</span> : state?.phase === "downloading" ? <button className="outline-button" onClick={() => void runModelAction("cancel", async () => { await transportRef.current?.cancelDownload(model.id); })} disabled={modelBusy !== null}>{state.percent.toFixed(0)}% · Cancel</button> : state?.phase === "finished" ? <span className="model-installed-tag">Ready</span> : <button className="approve-button" onClick={() => void runModelAction("download", async () => { await transportRef.current?.downloadModel(model.id); })} disabled={modelBusy !== null}>{modelBusy === "download" ? "Starting…" : "Download"}</button>}</div>{state?.phase === "downloading" && <div className="model-progress"><span style={{ width: `${Math.max(2, state.percent)}%` }} /></div>}{state?.phase === "failed" && <p className="model-error">{state.message}</p>}</div>; })}</div><p className="model-hint">Select the loaded Local model from the composer to use it for the next run.</p></div>}</section>}
+            {settingsOpen && <section className="chat-popover settings-popover"><div className="settings-panel-header"><div><p className="eyebrow">RUNTIME / PROVIDER</p><h2>Connect your model.</h2><p>Manage multiple provider registrations with independent model catalogs. API keys remain encrypted server-side and are never returned to the browser.</p></div><button className="icon-button" aria-label="Close settings" onClick={() => setSettingsOpen(false)}><X size={17} /></button></div><div className="provider-tabs"><button className={providerMode === "remote" ? "selected" : ""} onClick={() => setProviderMode("remote")}>OpenAI-compatible / OpenCode Go</button><button className={providerMode === "local" ? "selected" : ""} onClick={() => setProviderMode("local")}>Local GGUF model</button></div>{providerMode === "remote" ? <ProviderProfilesManager transport={transportRef.current} connected={transportStatus === "connected"} activeProviderId={activeProviderId} onActivated={(profile, model) => { setActiveProviderId(profile.id); setProviderEndpoint(profile.endpoint); setProviderModel(model); setProviderApi(profile.api); setProviderType(profile.provider_type); setProviderKind("remote"); setReasoningEffort(profile.reasoning_effort); setSubagentModel(profile.subagent_model ?? ""); }} onRegistryChanged={() => { void refreshProviderRegistry(); }} onToast={setToast} /> : <div className="local-model-panel"><div className="local-model-head"><div className="tool-symbol"><Bot size={17} /></div><div><strong>Local GGUF models</strong><p>Download a curated GGUF and run it in this process through llama.cpp. Runs on {localModels?.accelerator ?? "the local CPU"}{localModels?.accelerator?.includes("CPU") ? " — build with `--features cuda` for GPU offload." : "."}</p></div></div>{modelError && <p className="model-error">{modelError}</p>}<div className="model-section"><div className="model-section-title"><span>Downloaded</span><button className="outline-button" onClick={() => void refreshLocalModels()} disabled={modelBusy !== null}>Refresh</button></div>{!localModels && <p className="model-empty">Loading the model manager…</p>}{localModels?.installed.length === 0 && <p className="model-empty">No models yet. Download one below; it is verified against a pinned SHA-256 before use.</p>}{localModels?.installed.map((model) => { const state = downloads[model.id]; return <div className="model-row" key={model.path}><div className="model-row-main"><strong>{model.name}</strong><span>{formatBytes(model.size_bytes)} · {model.curated ? model.recommended_context ? `${model.recommended_context >= 1024 ? `${Math.round(model.recommended_context / 1024)}k` : model.recommended_context} ctx` : "curated GGUF" : "local GGUF"}</span></div><div className="model-row-actions">{state?.phase === "downloading" && <button className="outline-button" onClick={() => void runModelAction("cancel", async () => { await transportRef.current?.cancelDownload(model.id); })} disabled={modelBusy !== null}>{state.percent.toFixed(0)}% · Cancel</button>}{localModels.loaded === model.file_name ? <span className="model-loaded">Loaded</span> : <button className="approve-button" onClick={() => void runModelAction("load", async () => { await transportRef.current?.loadModel(model.path); })} disabled={modelBusy !== null}>{modelBusy === "load" ? "Loading…" : "Load"}</button>}</div>{state?.phase === "downloading" && <div className="model-progress"><span style={{ width: `${Math.max(2, state.percent)}%` }} /></div>}{state?.phase === "failed" && <p className="model-error">{state.message}</p>}</div>; })}{localModels && <div className="model-section-title"><span>Curated catalog</span></div>}{localModels?.catalog.map((model) => { const state = downloads[model.id]; const already = localModels.installed.some((installed) => installed.id === model.id); return <div className="model-row" key={model.id}><div className="model-row-main"><strong>{model.name}</strong><span>{formatBytes(model.size_bytes)} · {model.quant} · {Math.round(model.recommended_context / 1024)}k ctx · <a href={model.license_url} target="_blank" rel="noreferrer">license</a></span></div><div className="model-row-actions">{already ? <span className="model-installed-tag">Installed</span> : state?.phase === "downloading" ? <button className="outline-button" onClick={() => void runModelAction("cancel", async () => { await transportRef.current?.cancelDownload(model.id); })} disabled={modelBusy !== null}>{state.percent.toFixed(0)}% · Cancel</button> : state?.phase === "finished" ? <span className="model-installed-tag">Ready</span> : <button className="approve-button" onClick={() => void runModelAction("download", async () => { await transportRef.current?.downloadModel(model.id); })} disabled={modelBusy !== null}>{modelBusy === "download" ? "Starting…" : "Download"}</button>}</div>{state?.phase === "downloading" && <div className="model-progress"><span style={{ width: `${Math.max(2, state.percent)}%` }} /></div>}{state?.phase === "failed" && <p className="model-error">{state.message}</p>}</div>; })}</div><p className="model-hint">Select the loaded Local model from the composer to use it for the next run.</p></div>}</section>}
           </header>
           <div ref={transcriptRef} className="transcript" aria-live="polite">
             {transcript.length === 0 && <div className="empty-state"><div className="empty-icon"><Bot size={26} /></div><h2>Start a coding run</h2><p>Describe the change, then review every tool action before it touches your workspace.</p></div>}
@@ -906,10 +1159,10 @@ function AssistantUIInner({
 
           {pendingApproval && <div className="approval-card"><div className="approval-icon"><ShieldCheck size={19} /></div><div className="approval-copy"><div className="approval-title"><strong>Approval required</strong><span>{pendingApproval.tool}</span></div><p>The agent wants to run <code>{pendingApproval.summary}</code>.</p></div><div className="approval-actions"><button className="deny-button" onClick={() => answerApproval(false, "once")}>Decline</button><button className="outline-button" onClick={() => answerApproval(true, "always")}>Always allow</button><button className="approve-button" onClick={() => answerApproval(true, "once")}><Check size={15} /> Allow once</button></div></div>}
 
-          <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}{!runDeckCollapsed && <RunDeck collapsed={runDeckCollapsed} onToggle={() => setRunDeckCollapsed((value) => !value)} isRunning={isRunning} onStopRun={stopRun} activeRuns={activeRuns} lens={graphLens} onLensChange={setGraphLens} runIds={runIds} selectedRunId={selectedRunId} onRunChange={setSelectedRunId} focusNode={focusNode} onFocusNode={setFocusNode} graphNodes={graphNodes} plan={agentPlan} todos={agentTodos} tasks={agentTasks} toolRuns={taskTools} evidence={evidence} knowledge={knowledge} />}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" className="composer-model-name" value={providerKind === "local" ? LOCAL_MODEL_VALUE : providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{localModels?.loaded && <option value={LOCAL_MODEL_VALUE}>Local · {localModels.loaded}</option>}{Array.from(new Set([providerModel, "gpt-5-nano", "gpt-5-mini", "gpt-5-codex"])).filter(Boolean).map((model) => <option key={model} value={model}>{model}</option>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setCatalogOpen((value) => !value); setManualCatalog(true); setCatalogLayer("root"); setCatalogQuery(""); }}><Plus size={17} /></button><textarea ref={composerInputRef} value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${isRunning ? "stop-ready" : draft.trim() ? "send-ready" : ""}`} aria-label={isRunning ? "Stop run" : "Send message"} onClick={isRunning ? () => stopRun() : sendMessage}>{isRunning ? <Square size={14} fill="currentColor" /> : <Send size={16} />}</button></div>{catalogOpen && <div className="catalog-menu" ref={catalogRef} role="listbox">
-              <div className="catalog-menu-header">{catalogLayer === "connectors" && <button className="catalog-back" aria-label="Back to insert menu" onClick={() => setCatalogLayer("root")}><ChevronLeft size={14} /></button>}<strong>{activeTrigger ? `${activeTrigger.char === "@" ? "Mention" : "Command"} suggestions` : catalogLayer === "root" ? "Insert into composer" : "Connectors"}</strong><button className="catalog-close" aria-label="Close insert menu" onClick={() => setCatalogOpen(false)}><X size={14} /></button></div>
+          <div className="composer-wrap">{attachments.length > 0 && <div className="composer-attachments">{attachments.map((attachment) => <span className="attachment-chip" key={attachment.path}><Paperclip size={12} /> {attachment.name}<button type="button" aria-label={`Remove ${attachment.name}`} onClick={() => setAttachments((current) => current.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}{!runDeckCollapsed && <RunDeck collapsed={runDeckCollapsed} onToggle={() => setRunDeckCollapsed((value) => !value)} isRunning={isRunning} onStopRun={stopRun} activeRuns={activeRuns} lens={graphLens} onLensChange={setGraphLens} runIds={runIds} selectedRunId={selectedRunId} onRunChange={setSelectedRunId} focusNode={focusNode} onFocusNode={setFocusNode} graphNodes={graphNodes} plan={agentPlan} todos={agentTodos} tasks={agentTasks} toolRuns={taskTools} evidence={evidence} knowledge={knowledge} />}<div className="composer"><input ref={fileInputRef} className="file-input-hidden" type="file" multiple onChange={(event) => { void uploadAttachments(event.target.files); event.currentTarget.value = ""; }} /><button className="icon-button composer-icon" aria-label="Attach file" onClick={() => fileInputRef.current?.click()}><Paperclip size={17} /></button><div className="composer-model"><select aria-label="Configured model" className="composer-model-name" value={providerKind === "local" ? LOCAL_MODEL_VALUE : activeProviderId ? JSON.stringify([activeProviderId, providerModel]) : providerModel} onChange={(event) => selectComposerModel(event.target.value)}><option value="">Model</option>{localModels?.loaded && <option value={LOCAL_MODEL_VALUE}>Local · {localModels.loaded}</option>}{remoteModelGroups.map(([providerId, providerName, models]) => <optgroup key={providerId} label={providerName}>{models.map((model) => <option key={`${providerId}:${model}`} value={JSON.stringify([providerId, model])}>{model}</option>)}</optgroup>)}</select><select aria-label="Reasoning effort" value={reasoningEffort} onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></div><button className="icon-button composer-plus" aria-label="Insert tool, skill, or MCP" onPointerDown={(event) => event.stopPropagation()} onClick={() => { setCatalogOpen((value) => !value); setManualCatalog(true); setCatalogLayer("root"); setCatalogQuery(""); }}><Plus size={17} /></button><textarea ref={composerInputRef} value={draft} onChange={(event) => { setDraft(event.target.value); event.currentTarget.style.height = "auto"; event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 168)}px`; }} onKeyDown={(event) => { if (event.key === "ArrowUp" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("up"); return; } if (event.key === "ArrowDown" && !event.shiftKey && !event.altKey && !event.metaKey) { event.preventDefault(); navigateComposerHistory("down"); return; } if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder="Ask RIGA to make a change…" rows={1} /><button className={`send-button ${isRunning ? "stop-ready" : draft.trim() ? "send-ready" : ""}`} aria-label={isRunning ? "Stop run" : "Send message"} onClick={isRunning ? () => stopRun() : sendMessage}>{isRunning ? <Square size={14} fill="currentColor" /> : <Send size={16} />}</button></div>{catalogOpen && <div className="catalog-menu" ref={catalogRef} role="listbox">
+              <div className="catalog-menu-header">{catalogLayer === "connectors" && <button className="catalog-back" aria-label="Back to insert menu" onClick={() => setCatalogLayer("root")}><ChevronLeft size={14} /></button>}<strong>{activeTrigger ? `${activeTrigger.char === "@" ? "Mention" : "Command"} suggestions` : catalogLayer === "root" ? "Insert into composer" : "Connectors"}</strong><button className="catalog-close" aria-label="Close insert menu" onClick={closeCatalogMenu}><X size={14} /></button></div>
               <input className="catalog-search" autoFocus={catalogOpen} value={catalogQuery} onChange={(event) => setCatalogQuery(event.target.value)} placeholder={activeTrigger ? `Filter ${activeTrigger.char === "@" ? "files or agents" : "tools and skills"}…` : "Search tools, skills, connectors…"} aria-label="Search composer insert menu" />
-              {editingConnector ? <div className="connector-form"><label>Name<input value={connectorDraft.name} onChange={(event) => setConnectorDraft({ ...connectorDraft, name: event.target.value })} placeholder="my-server" /></label><label>Transport<select value={connectorDraft.transport} onChange={(event) => setConnectorDraft({ ...connectorDraft, transport: event.target.value as "stdio" | "http" })}><option value="stdio">stdio process</option><option value="http">HTTP stream</option></select></label>{connectorDraft.transport === "stdio" ? <><label>Command<input value={connectorDraft.command} onChange={(event) => setConnectorDraft({ ...connectorDraft, command: event.target.value })} placeholder="riga-server" /></label><label>Arguments<input value={connectorDraft.args} onChange={(event) => setConnectorDraft({ ...connectorDraft, args: event.target.value })} placeholder="mcp-health-stdio" /></label></> : <><label>HTTP stream URL<input value={connectorDraft.url} onChange={(event) => setConnectorDraft({ ...connectorDraft, url: event.target.value })} placeholder="http://127.0.0.1:8787/mcp/health" /></label><label>API key<input type="password" value={connectorDraft.apiKey} onChange={(event) => setConnectorDraft({ ...connectorDraft, apiKey: event.target.value })} placeholder="RIGA_MCP_HEALTH_API_KEY (optional)" autoComplete="off" /></label></>}<div className="connector-form-actions"><button className="outline-button" onClick={() => setEditingConnector(null)}>Cancel</button><button className="approve-button" onClick={saveConnector}><Check size={14} /> Save connector</button></div></div> : <>{catalogLayer === "root" && !activeTrigger && !catalogQuery && <><small>Connectors</small><button className="catalog-category" onClick={() => setCatalogLayer("connectors")}><span><FolderOpen size={14} /> MCP connectors</span><em>{allConnectors.length} registered <ChevronDown size={13} /></em></button><small>Built-in tools</small></>}{(catalogLayer === "connectors" || catalogQuery || activeTrigger?.char === "/" || activeTrigger?.char === "@") && <>{catalogLayer === "connectors" && <div className="catalog-inline-actions"><button className="catalog-category" onClick={() => openConnectorEditor()}><span><Plus size={14} /> Add connector</span><em>stdio or HTTP stream</em></button></div>}{menuConnectors.map((server) => <button className="catalog-item" key={`connector-${server.name}`} onClick={() => insertCatalog(`Use MCP server ${server.name}: `)}><span>mcp/{server.name}</span><em>{server.transport === "http" ? server.url : server.command}<button type="button" className="catalog-edit" aria-label={`Edit ${server.name}`} onClick={(event) => { event.stopPropagation(); openConnectorEditor(server); }}><Pencil size={12} /></button></em></button>)}</>}{(catalogLayer === "root" || catalogLayer === "connectors" || catalogQuery || activeTrigger) && <>{menuTools.length > 0 && <small>Built-in tools</small>}{menuTools.map((item) => <button className="catalog-item" key={item.id} onClick={() => insertCatalog(activeTrigger?.char === "@" ? `@${item.id} ` : activeTrigger?.char === "/" ? `/${item.id} ` : item.insert_text)}><span>{activeTrigger?.char === "/" ? `/${item.id}` : item.id}</span><em>{item.description}</em></button>)}{menuSkills.length > 0 && <small>Skills and agents</small>}{menuSkills.map((skill) => <button className="catalog-item" key={skill.name} onClick={() => insertCatalog(activeTrigger?.char === "@" ? `@${skill.name} ` : activeTrigger?.char === "/" ? `/${skill.name} ` : `Use the skill tool with name ${skill.name}: `)}><span>{activeTrigger?.char === "@" ? `@${skill.name}` : activeTrigger?.char === "/" ? `/${skill.name}` : `skill/${skill.name}`}</span><em>{skill.description}</em></button>)}{activeTrigger?.char === "@" && searchableItems.agents.length > 0 && <><small>Agents</small>{searchableItems.agents.map((agent) => <button className="catalog-item" key={`agent-${agent.name}`} onClick={() => insertCatalog(`@${agent.name} `)}><span>@{agent.name}</span><em>{agent.purpose}</em></button>)}</>}{activeTrigger?.char === "@" && searchableItems.files.length > 0 && <><small>Files</small>{searchableItems.files.map((file) => <button className="catalog-item" key={file.path} onClick={() => insertCatalog(`@${file.path} `)}><span>@{file.name}</span><em>{file.path}</em></button>)}</>}</>}</>}
+              {editingConnector ? <div className="connector-form"><label>Name<input value={connectorDraft.name} onChange={(event) => setConnectorDraft({ ...connectorDraft, name: event.target.value })} placeholder="my-server" /></label><label>Transport<select value={connectorDraft.transport} onChange={(event) => setConnectorDraft({ ...connectorDraft, transport: event.target.value as "stdio" | "http" })}><option value="stdio">stdio process</option><option value="http">HTTP stream</option></select></label>{connectorDraft.transport === "stdio" ? <><label>Command<input value={connectorDraft.command} onChange={(event) => setConnectorDraft({ ...connectorDraft, command: event.target.value })} placeholder="riga-server" /></label><label>Arguments<input value={connectorDraft.args} onChange={(event) => setConnectorDraft({ ...connectorDraft, args: event.target.value })} placeholder="mcp-health-stdio" /></label></> : <><label>HTTP stream URL<input value={connectorDraft.url} onChange={(event) => setConnectorDraft({ ...connectorDraft, url: event.target.value })} placeholder="http://127.0.0.1:8787/mcp/health" /></label><label>API key<input type="password" value={connectorDraft.apiKey} onChange={(event) => setConnectorDraft({ ...connectorDraft, apiKey: event.target.value })} placeholder="RIGA_MCP_HEALTH_API_KEY (optional)" autoComplete="off" /></label></>}<div className="connector-form-actions"><button className="outline-button" onClick={() => setEditingConnector(null)}>Cancel</button><button className="approve-button" onClick={saveConnector}><Check size={14} /> Save connector</button></div></div> : <>{catalogLayer === "root" && !activeTrigger && !catalogQuery && <><small>Connectors</small><button className="catalog-category" onClick={() => setCatalogLayer("connectors")}><span><FolderOpen size={14} /> MCP connectors</span><em>{allConnectors.length} registered <ChevronDown size={13} /></em></button><small>Built-in tools</small></>}{(catalogLayer === "connectors" || catalogQuery || activeTrigger?.char === "/" || activeTrigger?.char === "@") && <>{catalogLayer === "connectors" && <div className="catalog-inline-actions"><button className="catalog-category" onClick={() => openConnectorEditor()}><span><Plus size={14} /> Add connector</span><em>stdio or HTTP stream</em></button></div>}{menuConnectors.map((server) => <button className="catalog-item" key={`connector-${server.name}`} onClick={() => insertCatalog(`Use MCP server ${server.name}: `)}><span>mcp/{server.name}</span><em>{server.transport === "http" ? server.url : server.command}<button type="button" className="catalog-edit" aria-label={`Edit ${server.name}`} onClick={(event) => { event.stopPropagation(); openConnectorEditor(server); }}><Pencil size={12} /></button></em></button>)}</>}{(catalogLayer === "root" || catalogLayer === "connectors" || catalogQuery || activeTrigger) && <>{menuTools.length > 0 && <small>{activeTrigger?.char === "/" ? "Commands and tools" : "Built-in tools"}</small>}{menuTools.map((item) => <button className="catalog-item" key={item.id} onClick={() => insertCatalog(activeTrigger?.char === "@" ? `@${item.id} ` : activeTrigger?.char === "/" ? item.insert_text || `Use the ${item.id} tool: ` : item.insert_text)}><span>{activeTrigger?.char === "/" ? `/${item.id}` : item.id}</span><em>{item.description}</em></button>)}{menuSkills.length > 0 && <small>{activeTrigger?.char === "/" ? "Skills" : "Skills and agents"}</small>}{menuSkills.map((skill) => <button className="catalog-item" key={skill.name} onClick={() => insertCatalog(activeTrigger?.char === "@" ? `@${skill.name} ` : activeTrigger?.char === "/" ? `Use the ${skill.name} skill: ` : `Use the skill tool with name ${skill.name}: `)}><span>{activeTrigger?.char === "@" ? `@${skill.name}` : activeTrigger?.char === "/" ? `/skills/${skill.name}` : `skill/${skill.name}`}</span><em>{skill.description}</em></button>)}{activeTrigger?.char === "@" && searchableItems.agents.length > 0 && <><small>Agents</small>{searchableItems.agents.map((agent) => <button className="catalog-item" key={`agent-${agent.name}`} onClick={() => insertCatalog(`@${agent.name} `)}><span>@{agent.name}</span><em>{agent.purpose}</em></button>)}</>}{activeTrigger?.char === "@" && searchableItems.files.length > 0 && <><small>Files</small>{searchableItems.files.map((file) => <button className="catalog-item" key={file.path} onClick={() => insertCatalog(`@${file.path} `)}><span>@{file.name}</span><em>{file.path}</em></button>)}</>}</>}</>}
               {catalogQuery && menuTools.length + menuSkills.length + menuConnectors.length + searchableItems.files.length + searchableItems.agents.length === 0 && <div className="catalog-empty">No matching tools, skills, or connectors.</div>}
             </div>}<div className="composer-footer"><span><kbd>Enter</kbd> send · <kbd>Shift Enter</kbd> newline · <kbd>↑↓</kbd> history</span>{runDeckCollapsed && <RunDeck collapsed={runDeckCollapsed} onToggle={() => setRunDeckCollapsed((value) => !value)} isRunning={isRunning} onStopRun={stopRun} activeRuns={activeRuns} lens={graphLens} onLensChange={setGraphLens} runIds={runIds} selectedRunId={selectedRunId} onRunChange={setSelectedRunId} focusNode={focusNode} onFocusNode={setFocusNode} graphNodes={graphNodes} plan={agentPlan} todos={agentTodos} tasks={agentTasks} toolRuns={taskTools} evidence={evidence} knowledge={knowledge} />}<span>RIGA Kernel · local</span></div></div>
         </section>
@@ -1257,6 +1510,160 @@ function AgentTaskList({ tasks, toolRuns }: { tasks: AgentTaskView[]; toolRuns: 
       </ul>
     </section>
   );
+}
+
+type ProviderProfileDraft = ProviderProfileInput;
+
+function newProviderProfileDraft(): ProviderProfileDraft {
+  return { name: "", provider_type: "open_ai_compatible", endpoint: "", model: "", reasoning_effort: "low", api: "chat", subagent_model: "", api_key: "" };
+}
+
+function providerDraftFromProfile(profile: ProviderProfile): ProviderProfileDraft {
+  return { id: profile.id, name: profile.name, provider_type: profile.provider_type, endpoint: profile.endpoint, model: profile.model, reasoning_effort: profile.reasoning_effort, api: profile.api, subagent_model: profile.subagent_model ?? "", api_key: "" };
+}
+
+function ProviderProfilesManager({
+  transport,
+  connected,
+  activeProviderId,
+  onActivated,
+  onRegistryChanged,
+  onToast,
+}: {
+  transport: RigaTransport | null;
+  connected: boolean;
+  activeProviderId?: string;
+  onActivated: (profile: ProviderProfile, model: string) => void;
+  onRegistryChanged: () => void;
+  onToast: (message: string) => void;
+}) {
+  const [profiles, setProfiles] = useState<ProviderProfile[]>([]);
+  const [drafts, setDrafts] = useState<Record<string, ProviderProfileDraft>>({});
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [modelOptions, setModelOptions] = useState<Record<string, string[]>>({});
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const newKey = "__new_provider__";
+
+  useEffect(() => {
+    if (!connected || !transport) return;
+    let cancelled = false;
+    void transport.providerProfiles().then((loaded) => {
+      if (cancelled) return;
+      setProfiles(loaded);
+      setDrafts(Object.fromEntries(loaded.map((profile) => [profile.id, providerDraftFromProfile(profile)])));
+      if (loaded.length) setExpandedId((current) => current ?? loaded[0]?.id ?? null);
+    }).catch((error: unknown) => {
+      if (!cancelled) onToast(error instanceof Error ? error.message : "Could not load provider profiles");
+    });
+    return () => { cancelled = true; };
+  }, [connected, transport]);
+
+  function updateDraft(key: string, patch: Partial<ProviderProfileDraft>) {
+    setDrafts((current) => ({ ...current, [key]: { ...(current[key] ?? newProviderProfileDraft()), ...patch } }));
+  }
+
+  async function refreshModels(profileId: string) {
+    if (!transport) return;
+    setBusyId(profileId);
+    try {
+      const models = await transport.remoteModels(profileId);
+      setModelOptions((current) => ({ ...current, [profileId]: models }));
+      onToast(`Loaded ${models.length} models`);
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "Model discovery failed");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function saveProfile(key: string) {
+    const draft = drafts[key];
+    if (!transport || !draft) return;
+    if (!draft.name.trim() || !draft.endpoint.trim() || !draft.model.trim()) {
+      onToast("Provider name, endpoint, and model are required");
+      return;
+    }
+    setBusyId(key);
+    try {
+      const saved = await transport.saveProviderProfile({ ...draft, name: draft.name.trim(), endpoint: draft.endpoint.trim(), model: draft.model.trim(), api_key: draft.api_key.trim() });
+      setProfiles((current) => current.some((profile) => profile.id === saved.id) ? current.map((profile) => profile.id === saved.id ? saved : profile) : [...current, saved]);
+      setDrafts((current) => { const next = { ...current }; delete next[key]; next[saved.id] = { ...draft, id: saved.id, api_key: "" }; return next; });
+      setExpandedId(saved.id);
+      onRegistryChanged();
+      onToast(`Saved provider profile: ${saved.name}`);
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "Provider profile could not be saved");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function activateProfile(profile: ProviderProfile, key: string) {
+    const draft = drafts[key] ?? providerDraftFromProfile(profile);
+    if (!transport) return;
+    setBusyId(key);
+    try {
+      await transport.configureProvider(draft.endpoint, draft.api_key, draft.model, draft.reasoning_effort, "remote", draft.provider_type === "opencode_open_ai_compatible" ? "responses" : draft.api, draft.subagent_model ?? "", profile.id, draft.provider_type);
+      onActivated(profile, draft.model);
+      onToast(`Active provider: ${profile.name} · ${draft.model}`);
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "Could not activate provider");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function deleteProfile(profile: ProviderProfile) {
+    if (!transport || !window.confirm(`Delete provider profile “${profile.name}”?`)) return;
+    setBusyId(profile.id);
+    try {
+      await transport.deleteProviderProfile(profile.id);
+      setProfiles((current) => current.filter((item) => item.id !== profile.id));
+      setDrafts((current) => { const next = { ...current }; delete next[profile.id]; return next; });
+      setModelOptions((current) => { const next = { ...current }; delete next[profile.id]; return next; });
+      if (activeProviderId === profile.id) onToast("Deleted the active provider profile");
+      if (expandedId === profile.id) setExpandedId(null);
+      onRegistryChanged();
+    } catch (error) {
+      onToast(error instanceof Error ? error.message : "Provider profile could not be deleted");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  function renderEditor(key: string) {
+    const draft = drafts[key] ?? newProviderProfileDraft();
+    const profile = profiles.find((item) => item.id === key);
+    const listId = `provider-models-${key.replace(/[^a-zA-Z0-9_-]/gu, "-")}`;
+    return <div className="provider-profile-editor">
+      <div className="provider-profile-fields">
+        <label>Registration name<input value={draft.name} onChange={(event) => updateDraft(key, { name: event.target.value })} placeholder="OpenAI, OpenCode, staging…" /></label>
+        <label>Provider type<select value={draft.provider_type} onChange={(event) => { const providerType = event.target.value as ProviderType; updateDraft(key, { provider_type: providerType, api: providerType === "opencode_open_ai_compatible" ? "responses" : draft.api }); }}><option value="open_ai_compatible">OpenAI compatible</option><option value="opencode_open_ai_compatible">OpenCode OpenAI compatible</option></select></label>
+        <label>API endpoint<input value={draft.endpoint} onChange={(event) => updateDraft(key, { endpoint: event.target.value })} placeholder="https://api.example.com/v1" /></label>
+        <label>API key <span>{profile?.api_key_configured ? "saved · leave blank to keep" : "encrypted at rest"}</span><input type="password" value={draft.api_key} onChange={(event) => updateDraft(key, { api_key: event.target.value })} placeholder={profile?.api_key_configured ? "•••••••• (unchanged)" : "sk-…"} autoComplete="new-password" /></label>
+        <label>Default model<input list={listId} value={draft.model} onChange={(event) => updateDraft(key, { model: event.target.value })} placeholder="provider/model-id" /><datalist id={listId}>{(modelOptions[key] ?? []).map((model) => <option key={model} value={model} />)}</datalist></label>
+        <label>API<select value={draft.provider_type === "opencode_open_ai_compatible" ? "responses" : draft.api} disabled={draft.provider_type === "opencode_open_ai_compatible"} onChange={(event) => updateDraft(key, { api: event.target.value as "chat" | "responses" })}><option value="chat">Chat completions</option><option value="responses">Responses API</option></select></label>
+        <label>Reasoning effort<select value={draft.reasoning_effort} onChange={(event) => updateDraft(key, { reasoning_effort: event.target.value as ReasoningEffort })}><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+        <label>Subagent model <span>optional</span><input value={draft.subagent_model ?? ""} onChange={(event) => updateDraft(key, { subagent_model: event.target.value })} placeholder="default for this provider" /></label>
+      </div>
+      <div className="provider-profile-actions">
+        {profile && <button className="outline-button" onClick={() => void refreshModels(key)} disabled={busyId === key}>{busyId === key ? "Loading…" : "Refresh models"}</button>}
+        <button className="outline-button" onClick={() => void saveProfile(key)} disabled={busyId === key}>Save profile</button>
+        {profile && <button className="approve-button" onClick={() => void activateProfile(profile, key)} disabled={busyId === key}>{activeProviderId === key ? "Active" : "Use provider"}</button>}
+        {profile && <button className="danger-button" onClick={() => void deleteProfile(profile)} disabled={busyId === key}>Delete</button>}
+      </div>
+    </div>;
+  }
+
+  return <section className="provider-profiles-manager" aria-label="Remote provider profiles">
+    <div className="provider-profile-heading"><div><strong>Remote providers</strong><span>Independent credentials, model catalogs, and provider-session mappings.</span></div><button className="outline-button" onClick={() => { setDrafts((current) => ({ ...current, [newKey]: newProviderProfileDraft() })); setExpandedId(newKey); }}><Plus size={14} /> Add provider</button></div>
+    {!profiles.length && expandedId !== newKey && <p className="provider-profile-empty">No saved providers. Add one to begin.</p>}
+    {profiles.map((profile) => <details className="provider-profile-card" key={profile.id} open={expandedId === profile.id} onToggle={(event) => { if ((event.currentTarget as HTMLDetailsElement).open) setExpandedId(profile.id); else if (expandedId === profile.id) setExpandedId(null); }}>
+      <summary><span><strong>{profile.name}</strong><small>{profile.provider_type === "opencode_open_ai_compatible" ? "OpenCode OpenAI compatible" : "OpenAI compatible"} · {profile.model || "No default model"}</small></span><span className={`provider-profile-status ${activeProviderId === profile.id ? "active" : ""}`}>{activeProviderId === profile.id ? "ACTIVE" : "SAVED"}</span></summary>
+      {renderEditor(profile.id)}
+    </details>)}
+    {expandedId === newKey && <details className="provider-profile-card new" open onToggle={(event) => { if (!(event.currentTarget as HTMLDetailsElement).open && expandedId === newKey) setExpandedId(null); }}><summary><span><strong>New provider</strong><small>Configure a separate remote registration</small></span></summary>{renderEditor(newKey)}</details>}
+  </section>;
 }
 
 /**

@@ -2,6 +2,7 @@ export const RIGA_PROTOCOL_VERSION = 1 as const;
 
 export type ProviderKind = "remote" | "local";
 export type ProviderApi = "chat" | "responses";
+export type ProviderType = "open_ai_compatible" | "opencode_open_ai_compatible";
 export type TransportStatus = "connecting" | "connected" | "closed" | "error";
 
 export type RigaEventEnvelope = {
@@ -65,7 +66,23 @@ export type ProviderConfiguration = {
   kind?: ProviderKind;
   api?: ProviderApi;
   subagent_model?: string;
+  provider_id?: string;
+  provider_type?: ProviderType;
 };
+
+export type ProviderProfile = {
+  id: string;
+  name: string;
+  provider_type: ProviderType;
+  endpoint: string;
+  model: string;
+  reasoning_effort: "low" | "medium" | "high";
+  api: ProviderApi;
+  subagent_model?: string;
+  api_key_configured: boolean;
+};
+
+export type ProviderProfileInput = Omit<ProviderProfile, "id" | "api_key_configured"> & { id?: string; api_key: string };
 
 export type Attachment = { name: string; path: string; size: number };
 export type McpRegistryRequest = {
@@ -128,6 +145,8 @@ export type RigaTransportListeners = {
     kind: ProviderKind,
     api: ProviderApi,
     subagentModel: string,
+    providerId?: string,
+    providerType?: ProviderType,
   ) => void;
   onLocalModelEvent?: (event: LocalModelEvent) => void;
 };
@@ -150,7 +169,13 @@ export interface RigaTransport {
     kind?: ProviderKind,
     api?: ProviderApi,
     subagentModel?: string,
+    providerId?: string,
+    providerType?: ProviderType,
   ): Promise<void>;
+  providerProfiles(): Promise<ProviderProfile[]>;
+  saveProviderProfile(input: ProviderProfileInput): Promise<ProviderProfile>;
+  deleteProviderProfile(providerId: string): Promise<void>;
+  remoteModels(providerId?: string): Promise<string[]>;
   startRun(runId: string, sessionId: string, prompt: string): Promise<void>;
   resumeRun(runId: string, afterSequence: number): Promise<void>;
   cancelRun(runId: string): Promise<void>;
@@ -189,6 +214,10 @@ export const RIGA_TRANSPORT_METHODS = [
   "sessionHistory",
   "renameSession",
   "configureProvider",
+  "providerProfiles",
+  "saveProviderProfile",
+  "deleteProviderProfile",
+  "remoteModels",
   "startRun",
   "resumeRun",
   "cancelRun",

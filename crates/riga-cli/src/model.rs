@@ -8,7 +8,7 @@ use riga_kernel::{
     state::Session,
     task::{Graph, Plan, TaskRecord, TaskState, TodoList},
 };
-use riga_server::ws::{ActiveRun, ProviderApi, ProviderConfig, ProviderKind};
+use riga_server::ws::{ActiveRun, ProviderApi, ProviderConfig, ProviderKind, ProviderType};
 
 const MAX_TRANSCRIPT_ITEMS: usize = 2_000;
 const MAX_TOOL_OUTPUT_CHARS: usize = 100_000;
@@ -75,6 +75,9 @@ pub struct CompletionItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderForm {
+    pub profile_name: String,
+    pub provider_id: Option<String>,
+    pub provider_type: ProviderType,
     pub endpoint: String,
     pub api_key: String,
     pub model: String,
@@ -88,6 +91,9 @@ pub struct ProviderForm {
 impl Default for ProviderForm {
     fn default() -> Self {
         Self {
+            profile_name: "Default provider".into(),
+            provider_id: None,
+            provider_type: ProviderType::OpenAiCompatible,
             endpoint: String::new(),
             api_key: String::new(),
             model: String::new(),
@@ -111,6 +117,8 @@ impl ProviderForm {
             api: self.api,
             subagent_model: (!self.subagent_model.trim().is_empty())
                 .then(|| self.subagent_model.trim().into()),
+            provider_id: self.provider_id.clone(),
+            provider_type: self.provider_type,
         }
     }
 }

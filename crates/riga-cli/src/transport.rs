@@ -64,7 +64,18 @@ pub trait RigaTransport: Clone + Send + Sync + 'static {
         config: ProviderConfig,
     ) -> TransportFuture<Result<ProviderConfigured, String>>;
 
-    fn remote_models(&self) -> TransportFuture<Result<Vec<String>, String>>;
+    fn provider_profiles(
+        &self,
+    ) -> TransportFuture<Result<Vec<riga_server::ipc::ProviderProfileSummary>, String>>;
+    fn save_provider_profile(
+        &self,
+        input: riga_server::ipc::ProviderProfileInput,
+    ) -> TransportFuture<Result<riga_server::ipc::ProviderProfileSummary, String>>;
+    fn delete_provider_profile(&self, provider_id: String) -> TransportFuture<Result<(), String>>;
+    fn remote_models(
+        &self,
+        provider_id: Option<String>,
+    ) -> TransportFuture<Result<Vec<String>, String>>;
 
     fn start_run(
         &self,
@@ -162,8 +173,25 @@ impl IpcTransport {
         self.service.configure_provider(config).await
     }
 
-    pub async fn remote_models(&self) -> Result<Vec<String>, String> {
-        self.service.remote_models().await
+    pub async fn provider_profiles(
+        &self,
+    ) -> Result<Vec<riga_server::ipc::ProviderProfileSummary>, String> {
+        self.service.provider_profiles().await
+    }
+
+    pub async fn save_provider_profile(
+        &self,
+        input: riga_server::ipc::ProviderProfileInput,
+    ) -> Result<riga_server::ipc::ProviderProfileSummary, String> {
+        self.service.save_provider_profile(input).await
+    }
+
+    pub async fn delete_provider_profile(&self, provider_id: &str) -> Result<(), String> {
+        self.service.delete_provider_profile(provider_id).await
+    }
+
+    pub async fn remote_models(&self, provider_id: Option<&str>) -> Result<Vec<String>, String> {
+        self.service.remote_models_for(provider_id).await
     }
 
     pub async fn start_run(
@@ -317,9 +345,32 @@ impl RigaTransport for IpcTransport {
         Box::pin(async move { transport.configure_provider(config).await })
     }
 
-    fn remote_models(&self) -> TransportFuture<Result<Vec<String>, String>> {
+    fn provider_profiles(
+        &self,
+    ) -> TransportFuture<Result<Vec<riga_server::ipc::ProviderProfileSummary>, String>> {
         let transport = self.clone();
-        Box::pin(async move { transport.remote_models().await })
+        Box::pin(async move { transport.provider_profiles().await })
+    }
+
+    fn save_provider_profile(
+        &self,
+        input: riga_server::ipc::ProviderProfileInput,
+    ) -> TransportFuture<Result<riga_server::ipc::ProviderProfileSummary, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.save_provider_profile(input).await })
+    }
+
+    fn delete_provider_profile(&self, provider_id: String) -> TransportFuture<Result<(), String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.delete_provider_profile(&provider_id).await })
+    }
+
+    fn remote_models(
+        &self,
+        provider_id: Option<String>,
+    ) -> TransportFuture<Result<Vec<String>, String>> {
+        let transport = self.clone();
+        Box::pin(async move { transport.remote_models(provider_id.as_deref()).await })
     }
 
     fn start_run(

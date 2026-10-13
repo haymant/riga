@@ -43,6 +43,7 @@ const REQUEST_METHODS = [
   "sessionHistory",
   "renameSession",
   "configureProvider",
+  "remoteModels",
   "startRun",
   "resumeRun",
   "cancelRun",
@@ -70,6 +71,7 @@ function callRequest(transport: RigaTransport, method: RequestMethod): Promise<u
     case "sessionHistory": return transport.sessionHistory("session");
     case "renameSession": return transport.renameSession("session", "Renamed");
     case "configureProvider": return transport.configureProvider("https://model.test/v1", "key", "model", "low");
+    case "remoteModels": return transport.remoteModels();
     case "startRun": return transport.startRun("run", "session", "hello");
     case "resumeRun": return transport.resumeRun("run", 1);
     case "cancelRun": return transport.cancelRun("run");

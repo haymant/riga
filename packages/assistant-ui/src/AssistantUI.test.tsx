@@ -46,6 +46,13 @@ function createTransport() {
     sessionHistory: async () => [],
     renameSession: async (sessionId, title) => ({ id: sessionId, title, workspace: ".", created_at: "now", updated_at: "now" }),
     configureProvider: async () => undefined,
+    remoteModels: async (providerId) => providerId === "provider-a-id" ? ["model-x"] : providerId === "provider-b-id" ? ["model-y"] : [],
+    providerProfiles: async () => [
+      { id: "provider-a-id", name: "provider-a", provider_type: "open_ai_compatible", endpoint: "https://a.example/v1", model: "model-x", reasoning_effort: "low", api: "responses", api_key_configured: true },
+      { id: "provider-b-id", name: "provider-b", provider_type: "opencode_open_ai_compatible", endpoint: "https://b.example/v1", model: "model-y", reasoning_effort: "medium", api: "responses", api_key_configured: true },
+    ],
+    saveProviderProfile: async (input) => ({ ...input, id: input.id ?? "profile-new", api_key_configured: Boolean(input.api_key) }),
+    deleteProviderProfile: async () => undefined,
     startRun: async () => undefined,
     resumeRun: async () => undefined,
     cancelRun: async () => undefined,
@@ -70,6 +77,7 @@ function createTransport() {
     emit: (event: RigaEventEnvelope["event"], sequence: number, runId?: string) => {
       act(() => listeners?.onEvent?.(envelope(event, sequence, runId)));
     },
+    emitProvider: () => act(() => listeners?.onProviderConfigured?.("http://opencode.test/v1", "provider-a/model-x", "low", "remote", "responses", "")),
   };
 }
 
@@ -290,5 +298,39 @@ describe("AssistantUI subagent task card", () => {
 
     await waitFor(() => expect(rename).toHaveBeenCalledWith("riga", "Design notes"));
     await waitFor(() => expect(screen.getAllByText("Design notes").length).toBeGreaterThan(0));
+  });
+});
+
+
+describe("AssistantUI dynamic provider model catalog", () => {
+  it("loads and groups remote models from the configured provider instead of a hard-coded list", async () => {
+    const testTransport = createTransport();
+    render(<AssistantUI transportFactory={testTransport.factory} />);
+    await waitFor(() => expect(screen.getByText("connected")).toBeInTheDocument());
+
+    testTransport.emitProvider();
+    expect(await screen.findByRole("option", { name: "model-y" })).toBeInTheDocument();
+    expect(screen.getByRole("group", { name: "provider-a" })).toContainElement(
+      screen.getByRole("option", { name: "model-x" }),
+    );
+    expect(screen.getByRole("group", { name: "provider-b" })).toContainElement(
+      screen.getByRole("option", { name: "model-y" }),
+    );
+  });
+
+  it("executes /model set against the matching registered provider instead of starting a run", async () => {
+    const testTransport = createTransport();
+    const configure = vi.spyOn(testTransport.transport, "configureProvider");
+    const startRun = vi.spyOn(testTransport.transport, "startRun");
+    render(<AssistantUI transportFactory={testTransport.factory} />);
+    await screen.findByRole("option", { name: "model-y" });
+    const composer = screen.getByPlaceholderText("Ask RIGA to make a change…");
+    fireEvent.change(composer, { target: { value: "/model set model-y" } });
+    fireEvent.keyDown(composer, { key: "Enter" });
+
+    await waitFor(() => expect(configure).toHaveBeenCalledWith(
+      "https://b.example/v1", "", "model-y", "medium", "remote", "responses", "", "provider-b-id", "opencode_open_ai_compatible",
+    ));
+    expect(startRun).not.toHaveBeenCalled();
   });
 });

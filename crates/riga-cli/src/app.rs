@@ -53,6 +53,13 @@ pub enum UiCommand {
     SaveProvider {
         config: riga_server::ws::ProviderConfig,
     },
+    SaveProviderProfile {
+        input: riga_server::ipc::ProviderProfileInput,
+    },
+    DeleteProviderProfile {
+        provider_id: String,
+        confirmation_name: String,
+    },
     LoadRemoteModels,
     InsertCatalog {
         text: String,
@@ -112,6 +119,8 @@ pub struct UiState {
     pub session_field: usize,
     pub provider: ProviderForm,
     pub provider_field: usize,
+    pub provider_profiles: Vec<riga_server::ipc::ProviderProfileSummary>,
+    pub deleting_provider_profile: Option<String>,
     pub catalog: Vec<CatalogEntry>,
     pub catalog_query: TextBuffer,
     pub catalog_scope: Option<String>,
@@ -119,7 +128,7 @@ pub struct UiState {
     pub deck_details_expanded: bool,
     pub local_models_expanded: bool,
     pub model_picker_open: bool,
-    pub remote_models: Vec<String>,
+    pub remote_models: Vec<RemoteModelChoice>,
     pub remote_models_loading: bool,
     pub remote_models_error: Option<String>,
     pub remote_model_query: TextBuffer,
@@ -143,6 +152,13 @@ pub struct UiState {
     pub shell_input: TextBuffer,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteModelChoice {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub model: String,
+}
+
 enum BackgroundResult {
     StartRun {
         run_id: String,
@@ -154,7 +170,16 @@ enum BackgroundResult {
         model_id: Option<String>,
         result: Result<(), String>,
     },
-    RemoteModels(Result<Vec<String>, String>),
+    RemoteModels(
+        Result<
+            (
+                Vec<riga_server::ipc::ProviderProfileSummary>,
+                Vec<RemoteModelChoice>,
+                Vec<String>,
+            ),
+            String,
+        >,
+    ),
 }
 
 enum SlashCommandResult {
@@ -1181,6 +1206,39 @@ impl UiState {
                 }
             }
             UiPanel::Settings => {
+                if let Some(provider_id) = self.deleting_provider_profile.clone() {
+                    let Some(profile) = self
+                        .provider_profiles
+                        .iter()
+                        .find(|item| item.id == provider_id)
+                    else {
+                        self.deleting_provider_profile = None;
+                        self.panel_input.clear();
+                        self.notice = Some("Provider profile no longer exists.".into());
+                        return None;
+                    };
+                    if key.code == KeyCode::Esc {
+                        self.deleting_provider_profile = None;
+                        self.panel_input.clear();
+                        return None;
+                    }
+                    if key.code == KeyCode::Enter {
+                        if self.panel_input.text() == profile.name {
+                            let confirmation_name = self.panel_input.text().to_owned();
+                            self.deleting_provider_profile = None;
+                            self.panel_input.clear();
+                            return Some(UiCommand::DeleteProviderProfile {
+                                provider_id,
+                                confirmation_name,
+                            });
+                        }
+                        self.notice =
+                            Some("Provider name did not match; nothing was deleted.".into());
+                        return None;
+                    }
+                    let _ = self.panel_input.handle_key(key);
+                    return None;
+                }
                 if self.model_picker_open {
                     match key.code {
                         KeyCode::Up => self.panel_cursor = self.panel_cursor.saturating_sub(1),
@@ -1192,20 +1250,46 @@ impl UiState {
                         }
                         KeyCode::Enter => {
                             let models = self.filtered_remote_models();
-                            let model = models.get(self.panel_cursor).copied().map(str::to_owned);
-                            let model = model.or_else(|| {
-                                (self.remote_models.is_empty()
-                                    && !self.remote_model_query.text().trim().is_empty())
-                                .then(|| self.remote_model_query.text().trim().to_owned())
-                            });
-                            if let Some(model) = model {
+                            let choice = models
+                                .get(self.panel_cursor)
+                                .map(|choice| (*choice).clone());
+                            if let Some(choice) = choice {
+                                if let Some(profile) = self
+                                    .provider_profiles
+                                    .iter()
+                                    .find(|profile| profile.id == choice.provider_id)
+                                {
+                                    self.provider.profile_name = profile.name.clone();
+                                    self.provider.provider_id = Some(profile.id.clone());
+                                    self.provider.provider_type = profile.provider_type;
+                                    self.provider.endpoint = profile.endpoint.clone();
+                                    self.provider.api = profile.api;
+                                    self.provider.reasoning_effort =
+                                        profile.reasoning_effort.clone();
+                                    self.provider.subagent_model =
+                                        profile.subagent_model.clone().unwrap_or_default();
+                                }
                                 self.provider.kind = riga_server::ws::ProviderKind::Remote;
-                                self.provider.model = model.clone();
+                                self.provider.model = choice.model.clone();
                                 self.provider.error = None;
                                 self.model_picker_open = false;
                                 self.panel = UiPanel::Transcript;
                                 self.last_sidebar_panel = Some(UiPanel::Settings);
-                                self.notice = Some(format!("Switching to remote model {model}…"));
+                                self.notice = Some(format!(
+                                    "Switching to {} · {}…",
+                                    choice.provider_name, choice.model
+                                ));
+                                return Some(UiCommand::SaveProvider {
+                                    config: self.provider.to_config(),
+                                });
+                            }
+                            if !self.remote_model_query.text().trim().is_empty() {
+                                self.provider.model =
+                                    self.remote_model_query.text().trim().to_owned();
+                                self.provider.kind = riga_server::ws::ProviderKind::Remote;
+                                self.model_picker_open = false;
+                                self.panel = UiPanel::Transcript;
+                                self.last_sidebar_panel = Some(UiPanel::Settings);
                                 return Some(UiCommand::SaveProvider {
                                     config: self.provider.to_config(),
                                 });
@@ -1218,24 +1302,92 @@ impl UiState {
                     }
                     return None;
                 }
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+                    self.provider = ProviderForm::default();
+                    self.provider.profile_name = "New provider".into();
+                    self.provider_field = 0;
+                    self.sync_provider_input();
+                    self.notice = Some("Editing a new remote provider profile.".into());
+                    return None;
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+                    if self.provider_profiles.is_empty() {
+                        self.notice =
+                            Some("No saved provider profiles. Press Ctrl+N to add one.".into());
+                    } else {
+                        let current = self
+                            .provider
+                            .provider_id
+                            .as_deref()
+                            .and_then(|id| {
+                                self.provider_profiles
+                                    .iter()
+                                    .position(|profile| profile.id == id)
+                            })
+                            .unwrap_or(usize::MAX);
+                        let next = if current == usize::MAX {
+                            0
+                        } else {
+                            (current + 1) % self.provider_profiles.len()
+                        };
+                        if let Some(profile) = self.provider_profiles.get(next) {
+                            let id = profile.id.clone();
+                            let name = profile.name.clone();
+                            self.load_provider_profile(&id);
+                            self.provider_field = 0;
+                            self.sync_provider_input();
+                            self.notice = Some(format!("Editing provider profile {name}."));
+                        }
+                    }
+                    return None;
+                }
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('x') {
+                    if let Some(profile) = self.provider.provider_id.as_ref().and_then(|id| {
+                        self.provider_profiles
+                            .iter()
+                            .find(|profile| &profile.id == id)
+                    }) {
+                        self.deleting_provider_profile = Some(profile.id.clone());
+                        self.panel_input.clear();
+                        self.notice = Some(format!(
+                            "Type the exact provider name {:?} to delete it.",
+                            profile.name
+                        ));
+                    } else {
+                        self.notice =
+                            Some("Load a saved provider profile before deleting it.".into());
+                    }
+                    return None;
+                }
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
                     self.commit_provider_input();
-                    return Some(UiCommand::SaveProvider {
-                        config: self.provider.to_config(),
+                    return Some(UiCommand::SaveProviderProfile {
+                        input: riga_server::ipc::ProviderProfileInput {
+                            id: self.provider.provider_id.clone(),
+                            name: self.provider.profile_name.trim().to_owned(),
+                            provider_type: self.provider.provider_type,
+                            endpoint: self.provider.endpoint.trim().to_owned(),
+                            api_key: self.provider.api_key.clone(),
+                            model: self.provider.model.trim().to_owned(),
+                            reasoning_effort: self.provider.reasoning_effort.clone(),
+                            api: self.provider.api,
+                            subagent_model: (!self.provider.subagent_model.trim().is_empty())
+                                .then(|| self.provider.subagent_model.trim().to_owned()),
+                        },
                     });
                 }
                 match key.code {
                     KeyCode::Tab => {
                         self.commit_provider_input();
-                        self.provider_field = (self.provider_field + 1) % 7;
+                        self.provider_field = (self.provider_field + 1) % 8;
                         self.sync_provider_input();
                     }
                     KeyCode::BackTab => {
                         self.commit_provider_input();
-                        self.provider_field = self.provider_field.checked_sub(1).unwrap_or(6);
+                        self.provider_field = self.provider_field.checked_sub(1).unwrap_or(7);
                         self.sync_provider_input();
                     }
-                    KeyCode::Enter if self.provider_field == 3 => {
+                    KeyCode::Enter if self.provider_field == 4 => {
                         self.provider.reasoning_effort =
                             match self.provider.reasoning_effort.as_str() {
                                 "low" => "medium",
@@ -1245,18 +1397,23 @@ impl UiState {
                             .into();
                         self.sync_provider_input();
                     }
-                    KeyCode::Enter if self.provider_field == 4 => {
-                        self.provider.kind = match self.provider.kind {
-                            riga_server::ws::ProviderKind::Remote => {
-                                riga_server::ws::ProviderKind::Local
+                    KeyCode::Enter if self.provider_field == 5 => {
+                        self.provider.provider_type = match self.provider.provider_type {
+                            riga_server::ws::ProviderType::OpenAiCompatible => {
+                                riga_server::ws::ProviderType::OpencodeOpenAiCompatible
                             }
-                            riga_server::ws::ProviderKind::Local => {
-                                riga_server::ws::ProviderKind::Remote
+                            riga_server::ws::ProviderType::OpencodeOpenAiCompatible => {
+                                riga_server::ws::ProviderType::OpenAiCompatible
                             }
                         };
+                        if self.provider.provider_type
+                            == riga_server::ws::ProviderType::OpencodeOpenAiCompatible
+                        {
+                            self.provider.api = riga_server::ws::ProviderApi::Responses;
+                        }
                         self.sync_provider_input();
                     }
-                    KeyCode::Enter if self.provider_field == 5 => {
+                    KeyCode::Enter if self.provider_field == 6 => {
                         self.provider.api = match self.provider.api {
                             riga_server::ws::ProviderApi::Chat => {
                                 riga_server::ws::ProviderApi::Responses
@@ -1404,12 +1561,13 @@ impl UiState {
 
     fn sync_provider_input(&mut self) {
         let value = match self.provider_field {
-            0 => self.provider.endpoint.clone(),
-            1 => self.provider.api_key.clone(),
-            2 => self.provider.model.clone(),
-            3 => self.provider.reasoning_effort.clone(),
-            4 => format!("{:?}", self.provider.kind),
-            5 => format!("{:?}", self.provider.api),
+            0 => self.provider.profile_name.clone(),
+            1 => self.provider.endpoint.clone(),
+            2 => self.provider.api_key.clone(),
+            3 => self.provider.model.clone(),
+            4 => self.provider.reasoning_effort.clone(),
+            5 => format!("{:?}", self.provider.provider_type),
+            6 => format!("{:?}", self.provider.api),
             _ => self.provider.subagent_model.clone(),
         };
         self.panel_input.clear();
@@ -1421,13 +1579,37 @@ impl UiState {
     fn commit_provider_input(&mut self) {
         let value = self.panel_input.text().to_owned();
         match self.provider_field {
-            0 => self.provider.endpoint = value,
-            1 => self.provider.api_key = value,
-            2 => self.provider.model = value,
-            3 => self.provider.reasoning_effort = value,
-            6 => self.provider.subagent_model = value,
+            0 => self.provider.profile_name = value,
+            1 => self.provider.endpoint = value,
+            2 => self.provider.api_key = value,
+            3 => self.provider.model = value,
+            4 => self.provider.reasoning_effort = value,
+            7 => self.provider.subagent_model = value,
             _ => {}
         }
+    }
+
+    fn load_provider_profile(&mut self, profile_id: &str) -> bool {
+        let Some(profile) = self
+            .provider_profiles
+            .iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            return false;
+        };
+        self.provider.profile_name = profile.name.clone();
+        self.provider.provider_id = Some(profile.id.clone());
+        self.provider.provider_type = profile.provider_type;
+        self.provider.endpoint = profile.endpoint.clone();
+        self.provider.api_key.clear();
+        self.provider.model = profile.model.clone();
+        self.provider.reasoning_effort = profile.reasoning_effort.clone();
+        self.provider.kind = riga_server::ws::ProviderKind::Remote;
+        self.provider.api = profile.api;
+        self.provider.subagent_model = profile.subagent_model.clone().unwrap_or_default();
+        self.provider.error = None;
+        self.sync_provider_input();
+        true
     }
 
     pub fn filtered_catalog(&self) -> Vec<&CatalogEntry> {
@@ -1456,12 +1638,16 @@ impl UiState {
         self.provider = provider;
     }
 
-    pub fn filtered_remote_models(&self) -> Vec<&str> {
+    pub fn filtered_remote_models(&self) -> Vec<&RemoteModelChoice> {
         let query = self.remote_model_query.text().trim().to_lowercase();
         self.remote_models
             .iter()
-            .map(String::as_str)
-            .filter(|model| query.is_empty() || model.to_lowercase().contains(&query))
+            .filter(|choice| {
+                query.is_empty()
+                    || choice.model.to_lowercase().contains(&query)
+                    || choice.provider_name.to_lowercase().contains(&query)
+                    || choice.provider_id.to_lowercase().contains(&query)
+            })
             .collect()
     }
 
@@ -1473,7 +1659,7 @@ impl UiState {
         self.remote_models_error = None;
         self.remote_model_query.clear();
         self.panel_cursor = 0;
-        self.notice = Some("Loading remote models from the configured provider…".into());
+        self.notice = Some("Loading registered providers and their remote models…".into());
         UiCommand::LoadRemoteModels
     }
 
@@ -1876,6 +2062,18 @@ pub async fn run_with_transport<T: RigaTransport>(
     mut app: UiState,
     transport: T,
 ) -> Result<(), String> {
+    if let Ok(profiles) = transport.provider_profiles().await {
+        if app.provider.provider_id.is_none()
+            && let Some(profile) = profiles.iter().find(|profile| {
+                profile.endpoint == app.provider.endpoint && profile.model == app.provider.model
+            })
+        {
+            app.provider.provider_id = Some(profile.id.clone());
+            app.provider.provider_type = profile.provider_type;
+            app.provider.profile_name = profile.name.clone();
+        }
+        app.provider_profiles = profiles;
+    }
     let mut terminal = crate::terminal::TerminalGuard::enter()?;
     let mut events: Option<broadcast::Receiver<riga_kernel::events::RigaEventEnvelope>> = None;
     let mut local_events = transport.subscribe_local_models();
@@ -1938,23 +2136,39 @@ pub async fn run_with_transport<T: RigaTransport>(
                 BackgroundResult::RemoteModels(result) => {
                     app.remote_models_loading = false;
                     match result {
-                        Ok(models) => {
+                        Ok((profiles, models, errors)) => {
+                            app.provider_profiles = profiles;
                             app.remote_models = models;
-                            app.remote_models_error = None;
-                            if let Some(index) = app
-                                .remote_models
-                                .iter()
-                                .position(|model| model == &app.provider.model)
-                            {
+                            app.remote_models_error = if errors.is_empty() {
+                                None
+                            } else {
+                                Some(errors.join(" · "))
+                            };
+                            if let Some(index) = app.remote_models.iter().position(|choice| {
+                                choice.model == app.provider.model
+                                    && Some(choice.provider_id.as_str())
+                                        == app.provider.provider_id.as_deref()
+                            }) {
                                 app.panel_cursor = index;
                             }
                             app.notice = Some(format!(
-                                "Loaded {} remote model{}.",
+                                "Loaded {} model{} across {} provider{}{}",
                                 app.remote_models.len(),
                                 if app.remote_models.len() == 1 {
                                     ""
                                 } else {
                                     "s"
+                                },
+                                app.provider_profiles.len(),
+                                if app.provider_profiles.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                },
+                                if errors.is_empty() {
+                                    ".".into()
+                                } else {
+                                    format!("; {} provider catalog(s) unavailable.", errors.len())
                                 }
                             ));
                         }
@@ -2339,15 +2553,111 @@ pub async fn run_with_transport<T: RigaTransport>(
                                 }
                             }
                         }
+                        UiCommand::SaveProviderProfile { input } => {
+                            match transport.save_provider_profile(input).await {
+                                Ok(profile) => {
+                                    app.provider_profiles.retain(|saved| saved.id != profile.id);
+                                    app.provider_profiles.push(profile.clone());
+                                    app.provider.profile_name = profile.name.clone();
+                                    app.provider.provider_id = Some(profile.id.clone());
+                                    app.provider.provider_type = profile.provider_type;
+                                    app.provider.endpoint = profile.endpoint.clone();
+                                    app.provider.model = profile.model.clone();
+                                    app.provider.reasoning_effort =
+                                        profile.reasoning_effort.clone();
+                                    app.provider.api = profile.api;
+                                    app.provider.subagent_model =
+                                        profile.subagent_model.clone().unwrap_or_default();
+                                    app.provider.api_key.clear();
+                                    app.provider.kind = riga_server::ws::ProviderKind::Remote;
+                                    match transport
+                                        .configure_provider(app.provider.to_config())
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            app.provider.error = None;
+                                            app.notice = Some(format!(
+                                                "Saved and activated provider {} · {}.",
+                                                profile.name, profile.model
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            app.provider.error = Some(error.clone());
+                                            app.notice = Some(format!(
+                                                "Profile saved, but activation failed: {error}"
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    app.provider.error = Some(error.clone());
+                                    app.notice =
+                                        Some(format!("Could not save provider profile: {error}"));
+                                }
+                            }
+                        }
+                        UiCommand::DeleteProviderProfile {
+                            provider_id,
+                            confirmation_name,
+                        } => {
+                            let expected = app
+                                .provider_profiles
+                                .iter()
+                                .find(|profile| profile.id == provider_id)
+                                .map(|profile| profile.name.clone());
+                            if expected.as_deref() != Some(confirmation_name.as_str()) {
+                                app.notice = Some(
+                                    "Provider name did not match; nothing was deleted.".into(),
+                                );
+                                continue;
+                            }
+                            match transport.delete_provider_profile(provider_id.clone()).await {
+                                Ok(()) => {
+                                    app.provider_profiles
+                                        .retain(|profile| profile.id != provider_id);
+                                    if app.provider.provider_id.as_deref()
+                                        == Some(provider_id.as_str())
+                                    {
+                                        app.provider = ProviderForm::default();
+                                        app.provider_field = 0;
+                                        app.sync_provider_input();
+                                    }
+                                    app.notice = Some("Provider profile deleted.".into());
+                                }
+                                Err(error) => {
+                                    app.notice =
+                                        Some(format!("Could not delete provider profile: {error}"))
+                                }
+                            }
+                        }
                         UiCommand::LoadRemoteModels => {
                             app.remote_models_loading = true;
                             app.remote_models_error = None;
                             let tx = completion_tx.clone();
                             let transport = transport.clone();
                             tokio::spawn(async move {
-                                let _ = tx.send(BackgroundResult::RemoteModels(
-                                    transport.remote_models().await,
-                                ));
+                                let result = async {
+                                    let profiles = transport.provider_profiles().await?;
+                                    let mut choices = Vec::new();
+                                    let mut errors = Vec::new();
+                                    for profile in &profiles {
+                                        match transport.remote_models(Some(profile.id.clone())).await {
+                                            Ok(models) => {
+                                                for model in models.into_iter().chain(std::iter::once(profile.model.clone())) {
+                                                    if !model.is_empty() && !choices.iter().any(|choice: &RemoteModelChoice| choice.provider_id == profile.id && choice.model == model) {
+                                                        choices.push(RemoteModelChoice { provider_id: profile.id.clone(), provider_name: profile.name.clone(), model });
+                                                    }
+                                                }
+                                            }
+                                            Err(error) => errors.push(format!("{}: {error}", profile.name)),
+                                        }
+                                    }
+                                    if profiles.is_empty() {
+                                        return Err("No saved provider profiles; use Ctrl+N in Settings to add one.".to_owned());
+                                    }
+                                    Ok((profiles, choices, errors))
+                                }.await;
+                                let _ = tx.send(BackgroundResult::RemoteModels(result));
                             });
                         }
                         UiCommand::InsertCatalog { text } => {
@@ -2636,18 +2946,63 @@ mod tests {
 
     #[test]
     fn remote_model_picker_filters_and_selects_the_active_provider_model() {
+        let alpha = RemoteModelChoice {
+            provider_id: "alpha-id".into(),
+            provider_name: "Alpha".into(),
+            model: "model-x".into(),
+        };
+        let beta_chat = RemoteModelChoice {
+            provider_id: "beta-id".into(),
+            provider_name: "Beta".into(),
+            model: "chat".into(),
+        };
+        let beta_code = RemoteModelChoice {
+            provider_id: "beta-id".into(),
+            provider_name: "Beta".into(),
+            model: "code".into(),
+        };
         let mut app = UiState {
             panel: UiPanel::Settings,
             model_picker_open: true,
-            remote_models: vec!["alpha".into(), "beta-chat".into(), "beta-code".into()],
+            remote_models: vec![alpha, beta_chat, beta_code],
+            provider_profiles: vec![
+                riga_server::ipc::ProviderProfileSummary {
+                    id: "alpha-id".into(),
+                    name: "Alpha".into(),
+                    provider_type: riga_server::ws::ProviderType::OpenAiCompatible,
+                    endpoint: "https://alpha.test/v1".into(),
+                    model: "model-x".into(),
+                    reasoning_effort: "low".into(),
+                    api: riga_server::ws::ProviderApi::Chat,
+                    subagent_model: None,
+                    api_key_configured: true,
+                },
+                riga_server::ipc::ProviderProfileSummary {
+                    id: "beta-id".into(),
+                    name: "Beta".into(),
+                    provider_type: riga_server::ws::ProviderType::OpencodeOpenAiCompatible,
+                    endpoint: "https://beta.test/v1".into(),
+                    model: "code".into(),
+                    reasoning_effort: "medium".into(),
+                    api: riga_server::ws::ProviderApi::Responses,
+                    subagent_model: Some("cheap".into()),
+                    api_key_configured: true,
+                },
+            ],
             ..UiState::default()
         };
         app.handle_paste("beta");
-        assert_eq!(app.filtered_remote_models(), vec!["beta-chat", "beta-code"]);
+        assert_eq!(
+            app.filtered_remote_models()
+                .iter()
+                .map(|choice| choice.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["chat", "code"]
+        );
         app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert!(matches!(
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
-            Some(UiCommand::SaveProvider { config }) if config.model == "beta-code"
+            Some(UiCommand::SaveProvider { config }) if config.model == "code" && config.provider_id.as_deref() == Some("beta-id") && config.provider_type == riga_server::ws::ProviderType::OpencodeOpenAiCompatible
         ));
         assert!(!app.model_picker_open);
         assert_eq!(app.panel, UiPanel::Transcript);
@@ -3250,18 +3605,20 @@ mod tests {
     }
 
     #[test]
-    fn settings_save_command_keeps_the_api_key_out_of_display_state() {
+    fn settings_save_command_preserves_the_secret_for_provider_profile_persistence() {
         let mut app = UiState::default();
+        app.provider.profile_name = "Test profile".into();
         app.provider.endpoint = "https://model.test/v1".into();
         app.provider.api_key = "secret".into();
         app.provider.model = "model".into();
         app.handle_key(KeyEvent::new(KeyCode::Char(','), KeyModifiers::CONTROL));
-        let Some(UiCommand::SaveProvider { config }) =
+        let Some(UiCommand::SaveProviderProfile { input }) =
             app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
         else {
             panic!("settings should emit an explicit save command")
         };
-        assert_eq!(config.api_key, "secret");
+        assert_eq!(input.name, "Test profile");
+        assert_eq!(input.api_key, "secret");
         assert_eq!(app.provider.api_key, "secret");
     }
 

@@ -13,6 +13,9 @@ import type {
   RigaTransportListeners,
   Session,
   ConversationTurn,
+  ProviderProfile,
+  ProviderProfileInput,
+  ProviderType,
 } from "../protocol";
 
 export const RIGA_TAURI_TRANSPORT_VERSION = "0.1.0" as const;
@@ -28,6 +31,10 @@ export const RIGA_IPC_COMMANDS = {
   renameSession: "riga_rename_session",
   listActiveRuns: "riga_list_active_runs",
   configureProvider: "riga_configure_provider",
+  remoteModels: "riga_remote_models",
+  providerProfiles: "riga_provider_profiles",
+  saveProviderProfile: "riga_save_provider_profile",
+  deleteProviderProfile: "riga_delete_provider_profile",
   startRun: "riga_start_run",
   resumeRun: "riga_resume_run",
   cancelRun: "riga_cancel_run",
@@ -56,6 +63,8 @@ type ProviderConfigured = {
   kind?: "remote" | "local";
   api?: "chat" | "responses";
   subagent_model?: string;
+  provider_id?: string;
+  provider_type?: ProviderType;
 };
 
 export type TauriTransportOptions = {
@@ -105,9 +114,13 @@ export class RigaTauriTransport implements RigaTransport {
   // flat command args are camelCase. A parameter that is itself a struct is
   // passed under its own key (`request` / `attachment`) and keeps serde's
   // snake_case field names inside.
-  configureProvider(endpoint: string, apiKey: string, model: string, reasoningEffort: "low" | "medium" | "high", kind = "remote", api = "chat", subagentModel = ""): Promise<void> {
-    return this.call(RIGA_IPC_COMMANDS.configureProvider, { endpoint, apiKey, model, reasoningEffort, kind, api, subagentModel });
+  configureProvider(endpoint: string, apiKey: string, model: string, reasoningEffort: "low" | "medium" | "high", kind = "remote", api = "chat", subagentModel = "", providerId?: string, providerType?: ProviderType): Promise<void> {
+    return this.call(RIGA_IPC_COMMANDS.configureProvider, { endpoint, apiKey, model, reasoningEffort, kind, api, subagentModel, providerId, providerType });
   }
+  remoteModels(providerId?: string): Promise<string[]> { return this.call(RIGA_IPC_COMMANDS.remoteModels, { providerId }); }
+  providerProfiles(): Promise<ProviderProfile[]> { return this.call(RIGA_IPC_COMMANDS.providerProfiles); }
+  saveProviderProfile(request: ProviderProfileInput): Promise<ProviderProfile> { return this.call(RIGA_IPC_COMMANDS.saveProviderProfile, { request }); }
+  deleteProviderProfile(providerId: string): Promise<void> { return this.call(RIGA_IPC_COMMANDS.deleteProviderProfile, { providerId }); }
   startRun(runId: string, sessionId: string, prompt: string): Promise<void> {
     return this.call(RIGA_IPC_COMMANDS.startRun, { runId, sessionId, prompt });
   }
@@ -144,7 +157,7 @@ export class RigaTauriTransport implements RigaTransport {
         this.listen<import("../protocol").LocalModelEvent>(RIGA_IPC_EVENTS.localModel, (event) => this.listeners.onLocalModelEvent?.(event.payload)),
         this.listen<ProviderConfigured>(RIGA_IPC_EVENTS.providerConfigured, (event) => {
           const value = event.payload;
-          this.listeners.onProviderConfigured?.(value.endpoint, value.model, value.reasoning_effort, value.kind ?? "remote", value.api ?? "chat", value.subagent_model ?? "");
+          this.listeners.onProviderConfigured?.(value.endpoint, value.model, value.reasoning_effort, value.kind ?? "remote", value.api ?? "chat", value.subagent_model ?? "", value.provider_id, value.provider_type);
         }),
         this.listen<TransportError>(RIGA_IPC_EVENTS.error, (event) => {
           this.listeners.onStatus?.("error");

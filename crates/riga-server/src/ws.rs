@@ -32,6 +32,18 @@ pub enum ProviderApi {
     Responses,
 }
 
+/// Distinguishes remote provider registration protocols independently from the
+/// API shape selected for a request. Keeping this value on the registration lets
+/// provider-specific session and model behavior evolve without guessing from an
+/// endpoint URL.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderType {
+    #[default]
+    OpenAiCompatible,
+    OpencodeOpenAiCompatible,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub endpoint: String,
@@ -51,6 +63,12 @@ pub struct ProviderConfig {
     /// `review`). When unset, subagents use the main model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_model: Option<String>,
+    /// Stable ID of a saved provider registration. `None` denotes a legacy
+    /// one-off configuration or a local model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub provider_type: ProviderType,
 }
 
 impl ProviderConfig {
@@ -900,6 +918,9 @@ pub enum ServerMessage {
         /// Optional cheaper model for read-only subagents, echoed for the form.
         #[serde(skip_serializing_if = "Option::is_none")]
         subagent_model: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        provider_id: Option<String>,
+        provider_type: ProviderType,
     },
     Event {
         envelope: RigaEventEnvelope,
@@ -1138,6 +1159,7 @@ pub(crate) async fn start_ipc_run(
             &mut channel,
             &broker_task,
             &config_task,
+            &session_id_task,
             &run_root,
             &run_prompt_task,
             &mcp_task,
@@ -1210,6 +1232,8 @@ pub(crate) async fn upgrade(
                                     kind: config.kind,
                                     api: config.api,
                                     subagent_model: config.subagent_model.clone(),
+                                    provider_id: config.provider_id.clone(),
+                                    provider_type: config.provider_type,
                                 },
                             )
                             .await
@@ -1219,10 +1243,39 @@ pub(crate) async fn upgrade(
                         }
                     }
                     Ok(ClientMessage::ConfigureProvider(mut config)) => {
-                        if config.api_key.trim().is_empty()
+                        if let Some(provider_id) = config.provider_id.clone() {
+                            match crate::ipc::provider_config_for_profile(&provider_id, None).await
+                            {
+                                Ok(mut registered) => {
+                                    if !config.model.trim().is_empty() {
+                                        registered.model = config.model;
+                                    }
+                                    if !config.reasoning_effort.trim().is_empty() {
+                                        registered.reasoning_effort = config.reasoning_effort;
+                                    }
+                                    if let Some(subagent_model) = config.subagent_model {
+                                        registered.subagent_model = Some(subagent_model);
+                                    }
+                                    config = registered;
+                                }
+                                Err(error) => {
+                                    let _ = send(
+                                        &mut sender,
+                                        ServerMessage::Error {
+                                            code: "provider_profile_not_found".into(),
+                                            message: error,
+                                        },
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                            }
+                        } else if config.api_key.trim().is_empty()
                             && let Some(existing) = &provider
                         {
                             config.api_key = existing.api_key.clone();
+                            config.provider_id = existing.provider_id.clone();
+                            config.provider_type = existing.provider_type;
                         }
                         let model = config.model.clone();
                         let endpoint = config.endpoint.clone();
@@ -1230,6 +1283,8 @@ pub(crate) async fn upgrade(
                         let kind = config.kind;
                         let api = config.api;
                         let subagent_model = config.subagent_model.clone();
+                        let provider_id = config.provider_id.clone();
+                        let provider_type = config.provider_type;
                         if let Err(error) =
                             crate::secure_store::save_json("provider", &config).await
                         {
@@ -1259,6 +1314,8 @@ pub(crate) async fn upgrade(
                                 kind,
                                 api,
                                 subagent_model,
+                                provider_id,
+                                provider_type,
                             },
                         )
                         .await
@@ -1531,6 +1588,7 @@ pub(crate) async fn upgrade(
                                     &mut channel,
                                     &broker_task,
                                     &config_task,
+                                    &session_id_task,
                                     &run_root_task,
                                     &run_prompt_task,
                                     &mcp_task,
@@ -2297,6 +2355,7 @@ async fn run_provider(
     channel: &mut RunChannel,
     broker: &ApprovalBroker,
     config: &ProviderConfig,
+    riga_session_id: &str,
     workspace_root: &std::path::Path,
     prompt: &str,
     mcp_runtime: &McpRuntime,
@@ -2342,6 +2401,7 @@ async fn run_provider(
     } else {
         Box::pin(call_openai_compatible(
             config,
+            Some(riga_session_id),
             workspace_root,
             prompt,
             mcp_runtime,
@@ -2471,6 +2531,8 @@ fn resolve_run_provider(
             // Ignored for a local run; kept explicit so the struct is complete.
             api: ProviderApi::Chat,
             subagent_model: None,
+            provider_id: None,
+            provider_type: ProviderType::OpenAiCompatible,
         });
     }
     Err((
@@ -2482,6 +2544,7 @@ fn resolve_run_provider(
 #[allow(clippy::too_many_arguments)]
 async fn call_openai_compatible(
     config: &ProviderConfig,
+    riga_session_id: Option<&str>,
     workspace_root: &std::path::Path,
     prompt: &str,
     mcp_runtime: &McpRuntime,
@@ -2515,6 +2578,7 @@ async fn call_openai_compatible(
                 &coding_agent_system_prompt(workspace_root),
                 None,
                 prompt,
+                riga_session_id,
                 mcp_runtime,
                 trace_sender,
                 history,
@@ -3047,15 +3111,26 @@ async fn dispatch_subagent(
         .chars()
         .take(120)
         .collect();
-    // Read-only recon can run on a cheaper model when one is configured; a
-    // mutating profile keeps the main model.
-    let child_model = subagent_model_for(config, &profile);
-    let child_config = if child_model == config.model {
-        config.clone()
+    // A task may override provider and model without changing the parent run.
+    let requested_model = match input.get("model") {
+        Some(value) => Some(value.as_str().ok_or("task model must be a string")?),
+        None => None,
+    };
+    let requested_provider = input
+        .get("provider_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (child_config, child_model) = if let Some(provider_id) = requested_provider {
+        let selected =
+            crate::ipc::provider_config_for_profile(provider_id, requested_model).await?;
+        let selected_model = selected.model.clone();
+        (selected, selected_model)
     } else {
-        let mut clone = config.clone();
-        clone.model = child_model.clone();
-        clone
+        let child_model = subagent_model_for_request(config, &profile, requested_model)?;
+        let mut selected = config.clone();
+        selected.model = child_model.clone();
+        (selected, child_model)
     };
     let started = riga_kernel::task::TaskRecord {
         id: task_id.clone(),
@@ -3097,7 +3172,7 @@ async fn dispatch_subagent(
     // A local run dispatches local children; a remote run dispatches remote
     // children, so a subagent never crosses the provider boundary. The child's
     // loop is tagged with its task id so its tool calls nest in the UI.
-    let outcome = match (config.is_local(), local_models) {
+    let outcome = match (child_config.is_local(), local_models) {
         (true, Some(local_models)) => {
             Box::pin(run_local_loop(
                 &child_config,
@@ -3124,6 +3199,7 @@ async fn dispatch_subagent(
                     &system_prompt,
                     Some(&allowed),
                     prompt,
+                    None,
                     mcp_runtime,
                     trace_sender.clone(),
                     &[],
@@ -3280,6 +3356,20 @@ fn subagent_model_for(config: &ProviderConfig, profile: &crate::catalog::AgentPr
         Some(model) if profile.read_only && !model.is_empty() => model.to_owned(),
         _ => config.model.clone(),
     }
+}
+
+fn subagent_model_for_request(
+    config: &ProviderConfig,
+    profile: &crate::catalog::AgentProfile,
+    requested: Option<&str>,
+) -> Result<String, String> {
+    if let Some(model) = requested.map(str::trim).filter(|model| !model.is_empty()) {
+        if config.is_local() && model != config.model.trim() {
+            return Err("a local GGUF subagent must use the currently loaded model".into());
+        }
+        return Ok(model.to_owned());
+    }
+    Ok(subagent_model_for(config, profile))
 }
 /// How many times a local turn is asked to re-emit an unparseable tool call.
 const MAX_TOOL_CALL_RETRIES: usize = 2;
@@ -4197,6 +4287,65 @@ async fn run_local_loop(
     }
 }
 
+/// A registration identity deliberately excludes the model so a RIGA session
+/// can switch models within one provider without losing its provider session.
+/// Saved provider IDs keep two registrations with identical endpoint/key pairs
+/// independent; the key material itself is only hashed.
+/// The API key participates only in the hash: the credential itself is never
+/// persisted as part of the mapping key.
+fn provider_registration_id(config: &ProviderConfig) -> String {
+    let identity = format!(
+        "{}\n{:?}\n{:?}\n{:?}\n{}\n{}",
+        config.endpoint.trim_end_matches('/'),
+        config.kind,
+        config.api,
+        config.provider_type,
+        config.provider_id.as_deref().unwrap_or_default(),
+        config.api_key,
+    );
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(identity.as_bytes());
+    let hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("provider_{hex}")
+}
+
+fn provider_session_run_lock(
+    riga_session_id: &str,
+    provider_registration_id: &str,
+) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let locks = LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = format!("{riga_session_id}:{provider_registration_id}");
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .entry(key)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+fn responses_input(
+    current: &str,
+    history: &[ConversationTurn],
+    has_provider_session: bool,
+) -> serde_json::Value {
+    if has_provider_session || history.is_empty() {
+        serde_json::json!(current)
+    } else {
+        let mut items: Vec<serde_json::Value> = history
+            .iter()
+            .map(|turn| serde_json::json!({ "role": turn.role, "content": turn.content }))
+            .collect();
+        items.push(serde_json::json!({ "role": "user", "content": current }));
+        serde_json::json!(items)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn call_responses_api(
     config: &ProviderConfig,
@@ -4204,11 +4353,25 @@ async fn call_responses_api(
     system_prompt: &str,
     allowed_tools: Option<&[String]>,
     prompt: &str,
+    riga_session_id: Option<&str>,
     mcp_runtime: &McpRuntime,
     trace_sender: mpsc::Sender<ToolTraceEvent>,
     history: &[ConversationTurn],
     evidence: &RunEvidence,
 ) -> Result<AgentResult, String> {
+    let provider_registration_id = provider_registration_id(config);
+    let session_lock = riga_session_id
+        .map(|session_id| provider_session_run_lock(session_id, &provider_registration_id));
+    let _session_guard = match session_lock {
+        Some(lock) => Some(lock.lock_owned().await),
+        None => None,
+    };
+    let mut previous_response_id = match riga_session_id {
+        Some(session_id) => {
+            crate::secure_store::provider_session_id(session_id, &provider_registration_id).await?
+        }
+        None => None,
+    };
     let endpoint = if config
         .endpoint
         .trim_end_matches('/')
@@ -4226,20 +4389,11 @@ async fn call_responses_api(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(|e| e.to_string())?;
-    // The Responses API accepts `input` as a string or a list of messages. Build
-    // the list when there is history so prior turns are not lost.
+    // If this RIGA session already has a provider session, the provider owns
+    // the earlier turns; send only this turn with previous_response_id. On a
+    // fresh provider session, seed it with RIGA's stored transcript.
     let current = format!("{}\n\nUser request:\n{}", system_prompt, prompt);
-    let mut input = if history.is_empty() {
-        serde_json::json!(current)
-    } else {
-        let mut items: Vec<serde_json::Value> = history
-            .iter()
-            .map(|turn| serde_json::json!({ "role": turn.role, "content": turn.content }))
-            .collect();
-        items.push(serde_json::json!({ "role": "user", "content": current }));
-        serde_json::json!(items)
-    };
-    let mut previous_response_id: Option<String> = None;
+    let mut input = responses_input(&current, history, previous_response_id.is_some());
     for _ in 0..24 {
         let mut body = serde_json::json!({
             "model": config.model,
@@ -4291,6 +4445,21 @@ async fn call_responses_api(
             serde_json::from_str(&raw)
                 .map_err(|e| format!("invalid provider Responses API response: {e}"))?
         };
+        let response_id = response
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or("provider Responses API response has no non-empty id")?
+            .to_owned();
+        if let Some(session_id) = riga_session_id {
+            crate::secure_store::save_provider_session_id(
+                session_id,
+                &provider_registration_id,
+                &response_id,
+            )
+            .await?;
+        }
+        previous_response_id = Some(response_id);
         let calls = response
             .get("output")
             .and_then(serde_json::Value::as_array)
@@ -4305,13 +4474,6 @@ async fn call_responses_api(
                 output: extract_response_text(&response)?,
             });
         }
-        previous_response_id = Some(
-            response
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .ok_or("provider response has no id for tool continuation")?
-                .to_owned(),
-        );
         let mut outputs = Vec::new();
         for call in calls {
             let name = call
@@ -4697,8 +4859,8 @@ fn tool_schemas() -> Vec<serde_json::Value> {
         ),
         function_schema(
             "task",
-            "Run a specialized subagent (action \"dispatch\" with `agent` and `prompt`), list the subagent profiles (action \"agents\"), or manage durable task records (list/inspect/create/update). action \"agents\" only lists; it runs nothing.",
-            serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list","inspect","create","update","agents","agent_list","dispatch","agent","run"]},"agent":{"type":"string","enum":["explore","plan","build","review","scout","planner","executor","worker","reviewer"]},"prompt":{"type":"string"},"description":{"type":"string"},"name":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"task_id":{"type":"string"},"node_id":{"type":"string"},"parent_task_id":{"type":"string"}},"required":[]}),
+            "Run a specialized subagent (action \"dispatch\" with `agent` and `prompt`; optionally provide `provider_id` to select a saved remote provider and `model` for that provider). Omit provider_id to inherit the parent provider. `provider_id` is available in Settings. action \"agents\" only lists; it runs nothing.",
+            serde_json::json!({"type":"object","properties":{"action":{"type":"string","enum":["list","inspect","create","update","agents","agent_list","dispatch","agent","run"]},"agent":{"type":"string","enum":["explore","plan","build","review","scout","planner","executor","worker","reviewer"]},"prompt":{"type":"string"},"provider_id":{"type":"string","description":"Optional saved provider registration ID from Settings. It changes only this child task, not the parent run."},"model":{"type":"string","description":"Optional model ID on the selected provider; defaults to that provider's configured model."},"description":{"type":"string"},"name":{"type":"string"},"title":{"type":"string"},"status":{"type":"string"},"task_id":{"type":"string"},"node_id":{"type":"string"},"parent_task_id":{"type":"string"}},"required":[]}),
         ),
         function_schema(
             "skill",
@@ -4887,9 +5049,10 @@ fn run_journal_path(run_id: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientMessage, ParsedToolCall, ProviderApi, ProviderConfig, ProviderKind, ServerMessage,
-        builtin_tool_definitions, is_record_only_tool, local_tool_instructions,
-        parse_local_tool_calls, resolve_run_provider, strip_reasoning,
+        ClientMessage, ParsedToolCall, ProviderApi, ProviderConfig, ProviderKind, ProviderType,
+        ServerMessage, builtin_tool_definitions, is_record_only_tool, local_tool_instructions,
+        parse_local_tool_calls, provider_registration_id, resolve_run_provider, responses_input,
+        strip_reasoning,
     };
     use riga_kernel::events::RigaEvent;
     use tokio::sync::mpsc;
@@ -4969,6 +5132,8 @@ mod tests {
             kind: ProviderKind::Local,
             api: ProviderApi::Chat,
             subagent_model: None,
+            provider_id: None,
+            provider_type: ProviderType::OpenAiCompatible,
         })
         .unwrap();
         assert!(local.contains(r#""kind":"local""#), "{local}");
@@ -5201,6 +5366,8 @@ mod tests {
             kind: ProviderKind::Remote,
             api: ProviderApi::Chat,
             subagent_model: None,
+            provider_id: None,
+            provider_type: ProviderType::OpenAiCompatible,
         };
         let resolved = resolve_run_provider(Some(&stored), true).expect("stored provider must win");
         assert_eq!(resolved.kind, ProviderKind::Remote);
@@ -5220,6 +5387,8 @@ mod tests {
             kind: ProviderKind::Local,
             api: ProviderApi::Chat,
             subagent_model: None,
+            provider_id: None,
+            provider_type: ProviderType::OpenAiCompatible,
         };
         let resolved = resolve_run_provider(Some(&stored), false).expect("passed through");
         assert_eq!(resolved.kind, ProviderKind::Local);
@@ -5257,6 +5426,46 @@ mod tests {
                 .kind,
             ProviderKind::Local
         );
+    }
+
+    #[test]
+    fn provider_registration_identity_survives_model_changes_but_separates_credentials() {
+        let config = ProviderConfig {
+            endpoint: "https://api.example/v1/".into(),
+            api_key: "secret-one".into(),
+            model: "provider-a/model-x".into(),
+            reasoning_effort: "low".into(),
+            kind: ProviderKind::Remote,
+            api: ProviderApi::Responses,
+            subagent_model: None,
+            provider_id: None,
+            provider_type: ProviderType::OpenAiCompatible,
+        };
+        let registration = provider_registration_id(&config);
+        let mut other_model = config.clone();
+        other_model.model = "provider-a/model-y".into();
+        other_model.endpoint = "https://api.example/v1".into();
+        assert_eq!(provider_registration_id(&other_model), registration);
+
+        let mut other_credential = config;
+        other_credential.api_key = "secret-two".into();
+        assert_ne!(provider_registration_id(&other_credential), registration);
+        assert!(!registration.contains("secret-one"));
+    }
+
+    #[test]
+    fn a_mapped_provider_session_does_not_resend_riga_transcript_history() {
+        let history = [super::ConversationTurn {
+            role: "user".into(),
+            content: "Earlier turn".into(),
+        }];
+        let current = "System prompt\n\nUser request:\nNew turn";
+        let seeded = responses_input(current, &history, false);
+        assert_eq!(seeded.as_array().map(Vec::len), Some(2));
+        assert_eq!(seeded[0]["content"], "Earlier turn");
+
+        let continued = responses_input(current, &history, true);
+        assert_eq!(continued, serde_json::json!(current));
     }
 
     #[test]
@@ -5789,6 +5998,8 @@ mod tests {
             kind: super::ProviderKind::Remote,
             api: super::ProviderApi::Chat,
             subagent_model: None,
+            provider_id: None,
+            provider_type: ProviderType::OpenAiCompatible,
         };
         let error = super::dispatch_subagent(
             &config,
@@ -5958,6 +6169,8 @@ mod tests {
             kind: ProviderKind::Remote,
             api: ProviderApi::Chat,
             subagent_model: Some("cheap-model".into()),
+            provider_id: None,
+            provider_type: ProviderType::OpenAiCompatible,
         };
         let explore = crate::catalog::find_agent_profile("explore").unwrap();
         let build = crate::catalog::find_agent_profile("build").unwrap();
@@ -5969,6 +6182,47 @@ mod tests {
         assert_eq!(super::subagent_model_for(&config, &explore), "main-model");
         config.subagent_model = Some("   ".into());
         assert_eq!(super::subagent_model_for(&config, &explore), "main-model");
+    }
+
+    #[test]
+    fn subagent_dispatch_can_override_model_per_task() {
+        let mut config = ProviderConfig {
+            endpoint: "https://api.example/v1".into(),
+            api_key: "k".into(),
+            model: "main-model".into(),
+            reasoning_effort: "low".into(),
+            kind: ProviderKind::Remote,
+            api: ProviderApi::Responses,
+            subagent_model: Some("cheap-model".into()),
+            provider_id: None,
+            provider_type: ProviderType::OpenAiCompatible,
+        };
+        let explore = crate::catalog::find_agent_profile("explore").unwrap();
+        let build = crate::catalog::find_agent_profile("build").unwrap();
+        assert_eq!(
+            super::subagent_model_for_request(&config, &explore, Some(" provider-a/model-x "))
+                .unwrap(),
+            "provider-a/model-x"
+        );
+        assert_eq!(
+            super::subagent_model_for_request(&config, &explore, Some(" ")).unwrap(),
+            "cheap-model"
+        );
+        assert_eq!(
+            super::subagent_model_for_request(&config, &build, None).unwrap(),
+            "main-model"
+        );
+
+        config.kind = ProviderKind::Local;
+        assert!(
+            super::subagent_model_for_request(&config, &explore, Some("other-model"))
+                .unwrap_err()
+                .contains("currently loaded model")
+        );
+        assert_eq!(
+            super::subagent_model_for_request(&config, &explore, Some("main-model")).unwrap(),
+            "main-model"
+        );
     }
 
     #[test]

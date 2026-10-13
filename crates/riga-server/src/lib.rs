@@ -16,7 +16,7 @@ use axum::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
 };
 use riga_kernel::{
     events::{RigaEvent, RigaEventEnvelope},
@@ -211,6 +211,12 @@ pub struct HealthResponse {
 pub fn router(state: ServerState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/provider/models", get(provider_models))
+        .route(
+            "/providers",
+            get(provider_profiles).post(save_provider_profile),
+        )
+        .route("/providers/{provider_id}", delete(delete_provider_profile))
         .route("/catalog", get(tool_catalog))
         .route(
             "/mcp/registry",
@@ -297,6 +303,61 @@ async fn health() -> Json<HealthResponse> {
         adapter: ADAPTER_NAME,
         persistence_backend: secure_store::database_backend(),
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct ProviderModelsQuery {
+    provider_id: Option<String>,
+}
+
+async fn provider_models(
+    State(state): State<ServerState>,
+    Query(query): Query<ProviderModelsQuery>,
+) -> Result<Json<Vec<String>>, (StatusCode, String)> {
+    ipc::IpcService::new(state)
+        .remote_models_for(query.provider_id.as_deref())
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+async fn provider_profiles(
+    State(state): State<ServerState>,
+) -> Result<Json<Vec<ipc::ProviderProfileSummary>>, (StatusCode, String)> {
+    ipc::IpcService::new(state)
+        .provider_profiles()
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error))
+}
+
+async fn save_provider_profile(
+    State(state): State<ServerState>,
+    Json(request): Json<ipc::ProviderProfileInput>,
+) -> Result<Json<ipc::ProviderProfileSummary>, (StatusCode, String)> {
+    ipc::IpcService::new(state)
+        .save_provider_profile(request)
+        .await
+        .map(Json)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+async fn delete_provider_profile(
+    State(state): State<ServerState>,
+    Path(provider_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    ipc::IpcService::new(state)
+        .delete_provider_profile(&provider_id)
+        .await
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|error| {
+            let status = if error.contains("was not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, error)
+        })
 }
 
 // ---------------------------------------------------------------------------
