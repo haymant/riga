@@ -90,6 +90,12 @@ on Debian/Ubuntu). The wrapper detects the glibc/CUDA `cospi`, `sinpi`, and
 `rsqrt` `noexcept` conflict shown by CUDA 12.6 and creates a private patched
 header include tree; it never edits the root-owned CUDA installation.
 
+llama.cpp/ggml and the CUDA runtime (cuBLAS, cuBLASLt, cudart) are linked
+**dynamically**, so the executable stays small and the shared llama.cpp libraries
+are staged next to it. A machine that *runs* a CUDA build therefore needs both
+the NVIDIA driver and the CUDA runtime libraries on its loader path; installing
+the CUDA Toolkit configures this via `ld.so.conf`.
+
 CUDA is a compile-time backend choice; merely running the CPU binary on a
 CUDA-capable machine does not enable GPU offload. If a direct Cargo build was
 interrupted and reports `CMAKE = None` or `Makefile: No such file`, first run:
@@ -158,7 +164,9 @@ to the memory actually free, so it does not blindly offload every layer.
 The demo ships a wrapper that runs Tauri with the `cuda` feature and does the
 build setup for you — a coherent CUDA toolkit, position-independent CUDA objects
 for the cdylib link, and (on glibc ≥ 2.41) a header shim for the `rsqrt`
-exception-specification clash:
+exception-specification clash. Because the CUDA build links dynamically, the
+llama.cpp shared libraries are copied next to the executable (`$ORIGIN`) so it
+runs straight from `target/`:
 
 ```bash
 npm run tauri:dev:cuda     # or: npm run tauri:build:cuda
@@ -181,14 +189,14 @@ npm run tauri:build --prefix demo -- --features cuda --bundles deb
 ```
 
 The installer lands in `demo/src-tauri/target/release/bundle/deb/` (the demo is
-its own Cargo workspace). Drop `--bundles deb` to build every Linux format, but
-the rpm and AppImage steps are slow on the large CUDA binary. On an Apple
+its own Cargo workspace); it installs the llama.cpp shared libraries to
+`/usr/lib/riga`. Drop `--bundles deb` to build every Linux format. On an Apple
 Silicon Mac the same command with `--features metal` builds the Metal variant
 (no extra flags beyond Xcode's command-line tools).
 
 `CUDA_LIBRARY_PATH` matters when more than one CUDA toolkit is installed: it is
 the only variable the build script uses for the linker's library search order,
-so it pins `-lcuda`/`-lcudart_static` to that toolkit. Pass the CUDA **root**
+so it pins `-lcuda`/`-lcudart` to that toolkit. Pass the CUDA **root**
 (the script appends `lib64` and `lib64/stubs` itself). Without it the linker
 falls back to `/usr/local/cuda`, and a newer toolkit there can fail the link
 with `undefined symbol: cudaGetDeviceProperties_v2` (CUDA 13 dropped the `_v2`

@@ -13,7 +13,13 @@ description = "RIGA authenticated HTTP adapter"
 # not switched on merely by running the app on a CUDA-capable computer. Enabling
 # `metal` needs macOS / Apple Silicon build tools (Xcode / Metal).
 default = []
-cuda = ["llama-cpp-2/cuda"]
+# `dynamic-link` builds llama.cpp/ggml as shared libraries and links the CUDA
+# runtime (cuBLAS/cuBLASLt/cudart) dynamically instead of baking the ~500 MB
+# static CUDA archives into the executable. `build.rs` copies the shared
+# libraries next to the binaries; the machine that *runs* the app then needs the
+# NVIDIA driver plus the CUDA toolkit's cuBLAS/cudart libraries on its loader
+# path (installing the toolkit configures this via ld.so.conf).
+cuda = ["llama-cpp-2/cuda", "llama-cpp-2/dynamic-link"]
 metal = ["llama-cpp-2/metal"]
 
 [dependencies]

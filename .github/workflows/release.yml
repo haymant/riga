@@ -95,7 +95,8 @@ jobs:
             - `linux` / `windows` — CPU builds
             - `macos` — Apple Silicon with Metal (and CPU fallback)
             - `linux-cuda` — optional NVIDIA build, produced on demand and
-              published as a `RIGA-CUDA-…` asset (needs a CUDA driver to run)
+              published as a `RIGA-CUDA-…` asset (needs the NVIDIA driver and
+              the matching CUDA runtime libraries)
           releaseDraft: false
           prerelease: false
 
@@ -159,7 +160,8 @@ jobs:
             - `linux` / `windows` — CPU builds
             - `macos` — Apple Silicon with Metal (and CPU fallback)
             - `linux-cuda` — optional NVIDIA build, produced on demand and
-              published as a `RIGA-CUDA-…` asset (needs a CUDA driver to run)
+              published as a `RIGA-CUDA-…` asset (needs the NVIDIA driver and
+              the matching CUDA runtime libraries)
           releaseDraft: false
           prerelease: false
           args: --target aarch64-apple-darwin --features metal
@@ -167,7 +169,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # 3. Linux with CUDA — manual only. Built without a release upload, then
   #    published under a `RIGA-CUDA-` prefixed name so it never replaces the CPU
-  #    installer (a CUDA binary needs `libcuda` at runtime).
+  #    installer (a CUDA binary needs `libcuda` plus the CUDA runtime libraries
+  #    at runtime). llama.cpp is linked dynamically, so the .deb also carries the
+  #    llama.cpp/ggml shared libraries under /usr/lib/riga.
   # ---------------------------------------------------------------------------
   cuda:
     name: Build desktop app (linux-cuda)
@@ -198,9 +202,9 @@ jobs:
           method: network
           # The action prefixes `cuda-` and appends `-<major>-<minor>`; `cublas`
           # is not a cuda-prefixed package (it is `libcublas`), so install the
-          # toolkit meta-package instead: nvcc plus the cudart/cublas dev
-          # packages (the static libs llama.cpp links) without the driver
-          # packages the `cuda` meta-package would pull onto a GPU-less runner.
+          # toolkit meta-package instead: nvcc plus the cudart/cublas libraries
+          # llama.cpp links, without the driver packages the `cuda`
+          # meta-package would pull onto a GPU-less runner.
           sub-packages: '["toolkit"]'
           log-file-suffix: "linux-cuda.txt"
 
@@ -211,15 +215,14 @@ jobs:
       # `CUDA_LIBRARY_PATH` is the only variable the build script uses for the
       # linker search order (it appends `lib64`/`lib64/stubs` to each entry, so
       # pass the toolkit root). Pin it to the installed toolkit so `-lcuda` and
-      # `-lcudart_static` cannot bind to a newer preinstalled CUDA (which drops
+      # `-lcudart` cannot bind to a newer preinstalled CUDA (which drops
       # the `cudaGetDeviceProperties_v2` symbol) instead.
       - name: Configure CUDA build
         run: |
           echo "CMAKE_CUDA_ARCHITECTURES=75;80;86;89;90" >> "$GITHUB_ENV"
-          # The demo crate is a cdylib (`libriga_demo.so`), so every object it
-          # links must be position-independent. llama.cpp's CUDA objects are not
-          # built with -fPIC by default, which fails the link with
-          # "relocation R_X86_64_PC32 cannot be used against symbol 'stderr'".
+          # llama.cpp is built as shared libraries here, so its objects are PIC
+          # by default; keep the flag explicit so a static fallback still links
+          # into the demo's cdylib.
           echo "CMAKE_POSITION_INDEPENDENT_CODE=ON" >> "$GITHUB_ENV"
           echo "CMAKE_CUDA_FLAGS=-Xcompiler=-fPIC" >> "$GITHUB_ENV"
           if [ -n "${CUDA_PATH:-}" ]; then
@@ -250,9 +253,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: demo
-          # Only a .deb: rpm packaging is very slow on the large CUDA binary and
-          # the AppImage step downloads tooling. The CPU Linux release already
-          # ships the rpm and AppImage.
+          # Only a .deb: the AppImage step downloads tooling and rpm packaging is
+          # slow. The CPU Linux release already ships the rpm and AppImage.
           args: --features cuda --bundles deb
 
       - name: Publish CUDA bundles to the release

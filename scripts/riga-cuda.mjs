@@ -113,6 +113,27 @@ if (process.platform === "linux" && env.RIGA_CUDA_HEADER_SHIM !== "off") {
   }
 }
 
+/**
+ * Drop dangling `libllama`/`libggml` symlinks. `llama-cpp-sys-2` stages its
+ * libraries by hard-linking symlinks from the CMake install tree; a leftover
+ * dangling link makes its next run panic on `hard_link` with `EEXIST`.
+ */
+function sweepDanglingLlamaLinks(root) {
+  for (const profile of ["debug", "release"]) {
+    for (const sub of ["", "deps", "examples"]) {
+      const dir = path.join(root, profile, sub);
+      if (!fs.existsSync(dir)) continue;
+      for (const entry of fs.readdirSync(dir)) {
+        if (!/^lib(llama|ggml).*\.so/.test(entry)) continue;
+        const link = path.join(dir, entry);
+        if (!fs.existsSync(link)) fs.rmSync(link, { force: true });
+      }
+    }
+  }
+}
+
+sweepDanglingLlamaLinks(targetRoot);
+
 // A killed or interrupted CMake configure can leave out/build without a
 // Makefile/build.ninja. Remove only that stale output so Cargo reconfigures.
 for (const profile of ["debug", "release"]) {
@@ -122,13 +143,23 @@ for (const profile of ["debug", "release"]) {
     if (!entry.startsWith("llama-cpp-sys-2-")) continue;
     const out = path.join(buildRoot, entry, "out");
     const cmakeBuild = path.join(out, "build");
-    const hasBuildSystem = fs.existsSync(path.join(cmakeBuild, "Makefile")) || fs.existsSync(path.join(cmakeBuild, "build.ninja"));
+    // Ignore the compiled-build-script directory (no `out/build`): only an
+    // executed build script has a CMake tree to inspect.
+    if (!fs.existsSync(cmakeBuild)) continue;
     const cache = path.join(cmakeBuild, "CMakeCache.txt");
     const cacheText = fs.existsSync(cache) ? fs.readFileSync(cache, "utf8") : "";
+    // The CPU and CUDA variants get different Cargo hashes, so each has its own
+    // directory. Only a tree already configured for CUDA is relevant here; a
+    // `GGML_CUDA=OFF` cache belongs to another variant (e.g. `cargo test`) and
+    // removing it would force needless rebuilds of that variant.
+    if (cacheText && !/^GGML_CUDA:BOOL=ON$/m.test(cacheText)) continue;
+    const hasBuildSystem = fs.existsSync(path.join(cmakeBuild, "Makefile")) || fs.existsSync(path.join(cmakeBuild, "build.ninja"));
     const cacheFlags = cacheText.match(/^CMAKE_CUDA_FLAGS:STRING=(.*)$/m)?.[1] || "";
     const missingShim = cudaShimInclude && !cacheFlags.includes(cudaShimInclude);
-    const missingCuda = cacheText && !/^GGML_CUDA:BOOL=ON$/m.test(cacheText);
-    if (fs.existsSync(cmakeBuild) && (!hasBuildSystem || missingShim || missingCuda)) {
+    // The CUDA build links llama.cpp/ggml dynamically; an older CMake cache with
+    // BUILD_SHARED_LIBS=OFF would silently relink the static CUDA archives.
+    const missingShared = cacheText && !/^BUILD_SHARED_LIBS:BOOL=ON$/m.test(cacheText);
+    if (!hasBuildSystem || missingShim || missingShared) {
       console.log(`Removing stale CUDA CMake output: ${cmakeBuild}`);
       fs.rmSync(out, { recursive: true, force: true });
     }

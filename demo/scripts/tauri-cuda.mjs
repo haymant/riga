@@ -268,37 +268,46 @@ function hasMissingBindings(profile, root) {
   const buildRoot = join(root, profile, "build");
   const entries = (existsSync(buildRoot) ? readdirSync(buildRoot) : [])
     .filter((entry) => entry.startsWith(`${LLAMA_SYS}-`))
-    .map((entry) => join(buildRoot, entry));
+    .map((entry) => join(buildRoot, entry))
+    // Cargo keeps the compiled build script in a second `<crate>-<hash>`
+    // directory that has no `out`; only an executed build script can be missing
+    // its generated bindings.
+    .filter((entry) => existsSync(join(entry, "out")));
   return entries.some((entry) => !existsSync(join(entry, "out", "bindings.rs")));
 }
 
 function staleReason(profile, root) {
-  const profileRoot = join(root, profile);
-  const depsRoot = join(profileRoot, "deps");
-  const hasArtifacts =
-    existsSync(depsRoot) &&
-    readdirSync(depsRoot).some((entry) => entry.startsWith(`lib${LLAMA_SYS.replace(/-/g, "_")}-`));
-
-  const buildRoot = join(profileRoot, "build");
-  const entries = (existsSync(buildRoot) ? readdirSync(buildRoot) : [])
+  const readCache = (file) => {
+    try {
+      return readFileSync(file, "utf8");
+    } catch {
+      return "";
+    }
+  };
+  const buildRoot = join(root, profile, "build");
+  // The CPU and CUDA variants get different Cargo hashes, so each has its own
+  // `llama-cpp-sys-2-*` directory. Only directories already configured for CUDA
+  // are relevant: a `GGML_CUDA=OFF` cache belongs to the other variant (a plain
+  // `tauri dev`) and must not make the CUDA build look stale.
+  const dirs = (existsSync(buildRoot) ? readdirSync(buildRoot) : [])
     .filter((entry) => entry.startsWith(`${LLAMA_SYS}-`))
-    .map((entry) => join(buildRoot, entry));
-  if (entries.some((entry) => !existsSync(join(entry, "out", "bindings.rs")))) {
+    .map((entry) => join(buildRoot, entry))
+    .filter((dir) => /^GGML_CUDA:BOOL=ON$/m.test(readCache(join(dir, "out", "build", "CMakeCache.txt"))));
+
+  if (dirs.some((dir) => !existsSync(join(dir, "out", "bindings.rs")))) {
     return "missing generated Rust bindings";
   }
-  const trees = entries
-    .map((entry) => join(entry, "out", "build"))
-    .filter((dir) => existsSync(dir));
-
-  if (trees.length === 0) return hasArtifacts ? "archive without a CMake tree" : null;
-  for (const tree of trees) {
+  for (const dir of dirs) {
+    const tree = join(dir, "out", "build");
     const hasBuildSystem = existsSync(join(tree, "Makefile")) || existsSync(join(tree, "build.ninja"));
     if (!hasBuildSystem) return "half-configured CMake tree";
-    const cache = readFileSync(join(tree, "CMakeCache.txt"), "utf8");
-    // A plain `tauri dev` shares this CMake tree and reconfigures it with
-    // `GGML_CUDA=OFF`, so a CUDA run that reused it would silently fall back to
-    // CPU. Treat a cache without CUDA as stale and rebuild.
-    if (!/^GGML_CUDA:BOOL=ON$/m.test(cache)) return "CMake cache built without CUDA";
+    const cache = readCache(join(tree, "CMakeCache.txt"));
+    // The CUDA build links llama.cpp/ggml dynamically; a cache left by the old
+    // static build (BUILD_SHARED_LIBS=OFF) would silently relink the huge static
+    // CUDA archives, so treat it as stale.
+    if (!/^BUILD_SHARED_LIBS:BOOL=ON$/m.test(cache)) {
+      return "CMake cache built without dynamic llama.cpp";
+    }
     const cudaFlags = cache.match(/^CMAKE_CUDA_FLAGS:STRING=(.*)$/m)?.[1] ?? "";
     const missing = requiredCudaFlags.filter((flag) => !cudaFlags.includes(flag));
     if (missing.length > 0) return `CMake cache missing ${missing.join(" ")}`;
@@ -306,7 +315,28 @@ function staleReason(profile, root) {
   return null;
 }
 
+/**
+ * Drop dangling `libllama`/`libggml` symlinks. `llama-cpp-sys-2` stages its
+ * libraries by hard-linking symlinks from the CMake install tree; if a build is
+ * interrupted, or the versioned soname is missing, the leftover dangling link
+ * makes its next run panic on `hard_link` with `EEXIST`.
+ */
+function sweepDanglingLlamaLinks(root) {
+  for (const profile of ["debug", "release"]) {
+    for (const sub of ["", "deps", "examples"]) {
+      const dir = join(root, profile, sub);
+      if (!existsSync(dir)) continue;
+      for (const entry of readdirSync(dir)) {
+        if (!/^lib(llama|ggml).*\.so/.test(entry)) continue;
+        const link = join(dir, entry);
+        if (!existsSync(link)) rmSync(link, { force: true });
+      }
+    }
+  }
+}
+
 function resetStaleLlamaCpp() {
+  for (const root of targetRoots) sweepDanglingLlamaLinks(root);
   const stale = [];
   for (const root of targetRoots) {
     for (const profile of ["debug", "release"]) {
