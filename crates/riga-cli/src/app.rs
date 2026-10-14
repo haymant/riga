@@ -2540,6 +2540,79 @@ async fn write_jsonl_export(path: &Path, jsonl: &str) -> Result<(), String> {
     file.flush().await.map_err(|error| error.to_string())
 }
 
+fn spawn_workspace_command<T: RigaTransport>(
+    command: UiCommand,
+    app: &mut UiState,
+    transport: &T,
+    completion_tx: &mpsc::UnboundedSender<BackgroundResult>,
+) -> bool {
+    match command {
+        UiCommand::LoadWorkspaceEntries { session_id, path } => {
+            let tx = completion_tx.clone();
+            let transport = transport.clone();
+            tokio::spawn(async move {
+                let result = transport
+                    .workspace_entries(session_id.clone(), path.clone())
+                    .await;
+                let _ = tx.send(BackgroundResult::WorkspaceEntries {
+                    session_id,
+                    path,
+                    result,
+                });
+            });
+        }
+        UiCommand::LoadWorkspaceFile { session_id, path } => {
+            let tx = completion_tx.clone();
+            let transport = transport.clone();
+            tokio::spawn(async move {
+                let result = transport
+                    .workspace_file(session_id.clone(), path.clone())
+                    .await;
+                let _ = tx.send(BackgroundResult::WorkspaceFile {
+                    session_id,
+                    path,
+                    result,
+                });
+            });
+        }
+        UiCommand::RefreshGit { session_id } => {
+            app.git_refreshing = true;
+            app.workspace_error = None;
+            let tx = completion_tx.clone();
+            let transport = transport.clone();
+            tokio::spawn(async move {
+                let (status, commits) = tokio::join!(
+                    transport.git_status(session_id.clone()),
+                    transport.git_log(session_id.clone(), 60),
+                );
+                let _ = tx.send(BackgroundResult::GitRefresh {
+                    session_id,
+                    status,
+                    commits,
+                });
+            });
+        }
+        UiCommand::LoadGitDiff { session_id, path } => {
+            let tx = completion_tx.clone();
+            let transport = transport.clone();
+            tokio::spawn(async move {
+                let result = transport.git_diff(session_id.clone(), path).await;
+                let _ = tx.send(BackgroundResult::GitDiff { session_id, result });
+            });
+        }
+        UiCommand::LoadGitCommitDiff { session_id, commit } => {
+            let tx = completion_tx.clone();
+            let transport = transport.clone();
+            tokio::spawn(async move {
+                let result = transport.git_commit_diff(session_id.clone(), commit).await;
+                let _ = tx.send(BackgroundResult::GitDiff { session_id, result });
+            });
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn session_title_from_response(response: &str) -> Option<String> {
     let line = response
         .lines()
@@ -2986,16 +3059,26 @@ pub async fn run_with_transport<T: RigaTransport>(
             match event::read().map_err(|error| error.to_string())? {
                 Event::Mouse(mouse) => {
                     let size = terminal.size().map_err(|error| error.to_string())?;
-                    if let Some(UiCommand::SelectSession { session_id }) =
-                        app.handle_mouse(mouse, size.width, size.height)
-                    {
-                        app.set_selected_session(session_id.clone());
-                        app.set_session_history(
-                            transport.session_history(session_id.clone()).await,
-                        );
-                        app.state.active_run = None;
-                        app.current_prompt = None;
-                        events = None;
+                    if let Some(command) = app.handle_mouse(mouse, size.width, size.height) {
+                        match command {
+                            UiCommand::SelectSession { session_id } => {
+                                app.set_selected_session(session_id.clone());
+                                app.set_session_history(
+                                    transport.session_history(session_id.clone()).await,
+                                );
+                                app.state.active_run = None;
+                                app.current_prompt = None;
+                                events = None;
+                            }
+                            command => {
+                                let _ = spawn_workspace_command(
+                                    command,
+                                    &mut app,
+                                    &transport,
+                                    &completion_tx,
+                                );
+                            }
+                        }
                     }
                 }
                 Event::Paste(text) => {
@@ -3225,66 +3308,44 @@ pub async fn run_with_transport<T: RigaTransport>(
                             }
                         }
                         UiCommand::LoadWorkspaceEntries { session_id, path } => {
-                            let tx = completion_tx.clone();
-                            let transport = transport.clone();
-                            tokio::spawn(async move {
-                                let result = transport
-                                    .workspace_entries(session_id.clone(), path.clone())
-                                    .await;
-                                let _ = tx.send(BackgroundResult::WorkspaceEntries {
-                                    session_id,
-                                    path,
-                                    result,
-                                });
-                            });
+                            let _ = spawn_workspace_command(
+                                UiCommand::LoadWorkspaceEntries { session_id, path },
+                                &mut app,
+                                &transport,
+                                &completion_tx,
+                            );
                         }
                         UiCommand::LoadWorkspaceFile { session_id, path } => {
-                            let tx = completion_tx.clone();
-                            let transport = transport.clone();
-                            tokio::spawn(async move {
-                                let result = transport
-                                    .workspace_file(session_id.clone(), path.clone())
-                                    .await;
-                                let _ = tx.send(BackgroundResult::WorkspaceFile {
-                                    session_id,
-                                    path,
-                                    result,
-                                });
-                            });
+                            let _ = spawn_workspace_command(
+                                UiCommand::LoadWorkspaceFile { session_id, path },
+                                &mut app,
+                                &transport,
+                                &completion_tx,
+                            );
                         }
                         UiCommand::RefreshGit { session_id } => {
-                            app.git_refreshing = true;
-                            app.workspace_error = None;
-                            let tx = completion_tx.clone();
-                            let transport = transport.clone();
-                            tokio::spawn(async move {
-                                let (status, commits) = tokio::join!(
-                                    transport.git_status(session_id.clone()),
-                                    transport.git_log(session_id.clone(), 60),
-                                );
-                                let _ = tx.send(BackgroundResult::GitRefresh {
-                                    session_id,
-                                    status,
-                                    commits,
-                                });
-                            });
+                            let _ = spawn_workspace_command(
+                                UiCommand::RefreshGit { session_id },
+                                &mut app,
+                                &transport,
+                                &completion_tx,
+                            );
                         }
                         UiCommand::LoadGitDiff { session_id, path } => {
-                            let tx = completion_tx.clone();
-                            let transport = transport.clone();
-                            tokio::spawn(async move {
-                                let result = transport.git_diff(session_id.clone(), path).await;
-                                let _ = tx.send(BackgroundResult::GitDiff { session_id, result });
-                            });
+                            let _ = spawn_workspace_command(
+                                UiCommand::LoadGitDiff { session_id, path },
+                                &mut app,
+                                &transport,
+                                &completion_tx,
+                            );
                         }
                         UiCommand::LoadGitCommitDiff { session_id, commit } => {
-                            let tx = completion_tx.clone();
-                            let transport = transport.clone();
-                            tokio::spawn(async move {
-                                let result =
-                                    transport.git_commit_diff(session_id.clone(), commit).await;
-                                let _ = tx.send(BackgroundResult::GitDiff { session_id, result });
-                            });
+                            let _ = spawn_workspace_command(
+                                UiCommand::LoadGitCommitDiff { session_id, commit },
+                                &mut app,
+                                &transport,
+                                &completion_tx,
+                            );
                         }
                         UiCommand::CommitGit {
                             session_id,
@@ -4410,6 +4471,39 @@ mod tests {
             );
             assert!(app.workspace_preview_open);
         }
+    }
+
+    #[test]
+    fn mouse_clicking_a_git_change_emits_its_diff_preview_request() {
+        let mut app = UiState {
+            panel: UiPanel::Git,
+            ..UiState::default()
+        };
+        app.state.selected_session = Some("session-git".into());
+        app.git_changes.push(riga_server::files::GitChange {
+            path: "src/main.rs".into(),
+            status: "modified".into(),
+            staged: false,
+            untracked: false,
+        });
+
+        assert_eq!(
+            app.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 90,
+                    row: 10,
+                    modifiers: KeyModifiers::NONE,
+                },
+                120,
+                40,
+            ),
+            Some(UiCommand::LoadGitDiff {
+                session_id: "session-git".into(),
+                path: "src/main.rs".into(),
+            })
+        );
+        assert!(app.workspace_preview_open);
     }
 
     #[test]
