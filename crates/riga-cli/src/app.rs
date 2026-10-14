@@ -394,6 +394,13 @@ impl UiState {
         self.panel_cursor = 0;
     }
 
+    fn set_selected_session(&mut self, session_id: String) {
+        if self.state.selected_session.as_deref() != Some(session_id.as_str()) {
+            self.reset_workspace_state();
+        }
+        self.state.selected_session = Some(session_id);
+    }
+
     pub fn set_session_history(&mut self, turns: Vec<riga_server::ws::ConversationTurn>) {
         self.state.session_history = turns
             .into_iter()
@@ -1815,6 +1822,7 @@ impl UiState {
                         if path.is_empty() {
                             self.workspace_entries.clear();
                             self.workspace_expanded.clear();
+                            self.workspace_loading.clear();
                             self.workspace_selected_path = None;
                             self.panel_cursor = 0;
                         } else {
@@ -1825,6 +1833,9 @@ impl UiState {
                             self.workspace_expanded.retain(|entry_path| {
                                 entry_path == &path || !entry_path.starts_with(&prefix)
                             });
+                            self.workspace_loading.remove(&path);
+                            self.workspace_loading
+                                .retain(|entry_path| !entry_path.starts_with(&prefix));
                         }
                         self.workspace_file = None;
                         self.workspace_preview_open = false;
@@ -2978,10 +2989,10 @@ pub async fn run_with_transport<T: RigaTransport>(
                     if let Some(UiCommand::SelectSession { session_id }) =
                         app.handle_mouse(mouse, size.width, size.height)
                     {
+                        app.set_selected_session(session_id.clone());
                         app.set_session_history(
                             transport.session_history(session_id.clone()).await,
                         );
-                        app.state.selected_session = Some(session_id);
                         app.state.active_run = None;
                         app.current_prompt = None;
                         events = None;
@@ -3076,11 +3087,10 @@ pub async fn run_with_transport<T: RigaTransport>(
                             }
                         }
                         UiCommand::SelectSession { session_id } => {
-                            app.reset_workspace_state();
+                            app.set_selected_session(session_id.clone());
                             app.set_session_history(
                                 transport.session_history(session_id.clone()).await,
                             );
-                            app.state.selected_session = Some(session_id);
                             app.state.active_run = None;
                             app.current_prompt = None;
                             events = None;
@@ -3096,8 +3106,7 @@ pub async fn run_with_transport<T: RigaTransport>(
                                 app.set_session_history(Vec::new());
                                 app.current_prompt = None;
                             }
-                            app.reset_workspace_state();
-                            app.state.selected_session = Some(session.id.clone());
+                            app.set_selected_session(session.id.clone());
                             app.state.sessions.push(session);
                         }
                         UiCommand::RenameSession { session_id, title } => {
@@ -3184,7 +3193,7 @@ pub async fn run_with_transport<T: RigaTransport>(
                                             .cloned();
                                         if let Some(session) = replacement {
                                             app.history_archived_view = session.archived;
-                                            app.state.selected_session = Some(session.id.clone());
+                                            app.set_selected_session(session.id.clone());
                                             app.set_session_history(
                                                 transport.session_history(session.id.clone()).await,
                                             );
@@ -3199,7 +3208,7 @@ pub async fn run_with_transport<T: RigaTransport>(
                                                     workspace,
                                                 })
                                                 .await?;
-                                            app.state.selected_session = Some(session.id.clone());
+                                            app.set_selected_session(session.id.clone());
                                             app.state.sessions.push(session);
                                             app.history_archived_view = false;
                                             app.set_session_history(Vec::new());
@@ -3432,7 +3441,7 @@ pub async fn run_with_transport<T: RigaTransport>(
                             match transport.subscribe_run(run_id.clone(), 0).await {
                                 Ok(receiver) => {
                                     app.notice = None;
-                                    app.state.selected_session = Some(session_id);
+                                    app.set_selected_session(session_id);
                                     app.state.select_run(Some(run_id));
                                     events = Some(receiver);
                                 }
@@ -4819,6 +4828,52 @@ mod tests {
             })
         );
         assert!(app.workspace_expanded.contains("src"));
+    }
+
+    #[test]
+    fn switching_sessions_clears_stale_workspace_and_git_loading_state() {
+        let mut app = UiState::default();
+        app.state.selected_session = Some("old-session".into());
+        app.workspace_loading.insert(String::new());
+        app.workspace_entries.insert(String::new(), Vec::new());
+        app.git_refreshing = true;
+        app.git_changes.push(riga_server::files::GitChange {
+            path: "old.rs".into(),
+            status: "modified".into(),
+            staged: false,
+            untracked: false,
+        });
+
+        app.set_selected_session("new-session".into());
+        assert_eq!(app.state.selected_session.as_deref(), Some("new-session"));
+        assert!(app.workspace_loading.is_empty());
+        assert!(app.workspace_entries.is_empty());
+        assert!(!app.git_refreshing);
+        assert!(app.git_changes.is_empty());
+
+        app.workspace_loading.insert(String::new());
+        app.git_refreshing = true;
+        app.set_selected_session("new-session".into());
+        assert!(app.workspace_loading.contains(""));
+        assert!(app.git_refreshing);
+    }
+
+    #[test]
+    fn explorer_refresh_retries_a_stale_root_loading_marker() {
+        let mut app = UiState {
+            panel: UiPanel::Files,
+            ..UiState::default()
+        };
+        app.state.selected_session = Some("session-files".into());
+        app.workspace_loading.insert(String::new());
+        assert_eq!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+            Some(UiCommand::LoadWorkspaceEntries {
+                session_id: "session-files".into(),
+                path: String::new(),
+            })
+        );
+        assert!(app.workspace_loading.contains(""));
     }
 
     #[test]
