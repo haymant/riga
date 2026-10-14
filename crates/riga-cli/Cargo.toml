@@ -21,7 +21,7 @@ riga-server = { version = "0.1.14", path = "../riga-server" }
 base64 = "0.22.1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
-ratatui = "0.29"
+ratatui = "0.30"
 pulldown-cmark = "0.13"
 serde_json = "1"
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread"] }
