@@ -20,7 +20,15 @@ pub struct McpRuntime {
     connected: Arc<RwLock<Vec<String>>>,
     aliases: Arc<RwLock<HashMap<String, String>>>,
     server_tools: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    /// Per-server time of the last connect attempt. A server that exits or fails
+    /// is not respawned until [`RECONNECT_COOLDOWN`] has passed, so a host that
+    /// calls `connect_records` repeatedly (a reconnect loop, a fresh transport
+    /// per window) cannot spawn a child process storm.
+    cooldown: Arc<RwLock<HashMap<String, std::time::Instant>>>,
 }
+
+/// Minimum delay before a disconnected/failed MCP server is retried.
+const RECONNECT_COOLDOWN: Duration = Duration::from_secs(30);
 
 impl McpRuntime {
     pub fn new() -> Self {
@@ -29,6 +37,7 @@ impl McpRuntime {
             connected: Arc::new(RwLock::new(Vec::new())),
             aliases: Arc::new(RwLock::new(HashMap::new())),
             server_tools: Arc::new(RwLock::new(HashMap::new())),
+            cooldown: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -39,14 +48,27 @@ impl McpRuntime {
     }
 
     async fn connect_record(&self, record: McpServerRecord) {
+        let name = record.summary.name.clone();
         if self
             .connected_names()
             .await
             .iter()
-            .any(|name| name == &record.summary.name)
+            .any(|existing| existing == &name)
         {
             return;
         }
+        // Reserve the attempt before doing any work: a second concurrent call, or
+        // one after a failure/exit, is skipped until the cooldown elapses.
+        {
+            let mut cooldown = self.cooldown.write().await;
+            if let Some(last) = cooldown.get(&name)
+                && last.elapsed() < RECONNECT_COOLDOWN
+            {
+                return;
+            }
+            cooldown.insert(name.clone(), std::time::Instant::now());
+        }
+        tracing::info!(server = %name, "starting MCP server");
         let existing_tools = self
             .tools
             .tool_defs(None)
@@ -57,8 +79,8 @@ impl McpRuntime {
             .collect::<HashSet<_>>();
         let handler = McpClientHandler::new(ClientInfo::default(), self.tools.clone())
             .with_refresh_timeout(Duration::from_secs(20));
-        let name = record.summary.name.clone();
         let connected = self.connected.clone();
+        let cooldown = self.cooldown.clone();
         let service = match record.summary.transport.as_deref() {
             Some("stdio") | None => {
                 let command_name = if record.summary.name == "riga-health-stdio" {
@@ -148,6 +170,12 @@ impl McpRuntime {
                 }
             }
             connected.write().await.retain(|item| item != &name);
+            // Hold the server in cooldown so the next connect does not immediately
+            // respawn it.
+            cooldown
+                .write()
+                .await
+                .insert(name.clone(), std::time::Instant::now());
         });
     }
 

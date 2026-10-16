@@ -32,6 +32,7 @@ pub mod health_stdio;
 pub mod ipc;
 pub mod local_model;
 pub mod mcp;
+pub mod opencode;
 pub mod secure_store;
 pub mod workspace;
 pub mod ws;
@@ -46,6 +47,10 @@ pub struct ServerState {
     pub(crate) secure_store: Option<Arc<secure_store::SecureStore>>,
     pub(crate) mcp_registry: Arc<RwLock<Vec<catalog::McpServerRecord>>>,
     pub(crate) mcp_runtime: mcp::McpRuntime,
+    /// Guards the one-time MCP connect the IPC host performs at startup, so a
+    /// reconnect loop or repeated runs cannot re-run it (and spawn child-process
+    /// storms).
+    pub(crate) mcp_connect_once: Arc<tokio::sync::OnceCell<()>>,
     /// Per-session conversation history, keyed by session id. Fed back to the
     /// model on the next turn so a follow-up has the context it refers to.
     pub(crate) transcripts:
@@ -129,7 +134,20 @@ impl Default for ServerState {
                     .ok()
                     .and_then(|text| serde_json::from_str(&text).ok())
             })
-            .unwrap_or_default();
+            .filter(|records: &Vec<catalog::McpServerRecord>| !records.is_empty())
+            // Fall back to the workspace `.mcp.json` (`mcpServers`) so a host can
+            // register MCP servers declaratively — the format `.mcp.json.example`
+            // documents — instead of relying on the Connectors UI. A `command`
+            // resolves from the process working directory, or may be on `PATH`.
+            .unwrap_or_else(|| {
+                catalog::load_mcp_servers(&workspace_root)
+                    .into_iter()
+                    .map(|summary| catalog::McpServerRecord {
+                        summary,
+                        api_key: None,
+                    })
+                    .collect()
+            });
         let next_id = next_session_number(&sessions);
         Self {
             sessions: Arc::new(RwLock::new(sessions)),
@@ -138,6 +156,7 @@ impl Default for ServerState {
             secure_store,
             mcp_registry: Arc::new(RwLock::new(mcp_registry)),
             mcp_runtime: mcp::McpRuntime::new(),
+            mcp_connect_once: Arc::new(tokio::sync::OnceCell::new()),
             transcripts: Arc::new(RwLock::new(transcripts)),
             local_models: Arc::new(local_model::LocalModelRuntime::default()),
             approvals: ws::ApprovalBroker::default(),

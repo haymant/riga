@@ -346,7 +346,7 @@ function authorizationHeader(password: string): string {
 
 async function main(): Promise<void> {
   const apiHost = env.RIGA_OPENCODE_HOST ?? "127.0.0.1";
-  const apiPort = positivePort(env.RIGA_OPENCODE_PORT, 8788);
+  const apiPort = positivePort(env.RIGA_OPENCODE_PORT, 8791);
   if (!isLoopbackHost(apiHost) && !env.RIGA_OPENCODE_API_KEY) {
     throw new Error("RIGA_OPENCODE_API_KEY is required when binding the Responses API outside localhost/loopback.");
   }

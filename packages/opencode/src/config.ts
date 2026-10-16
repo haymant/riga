@@ -14,6 +14,10 @@ export const DEFAULT_OPENCODE_CONFIG = JSON.stringify({
     { action: "shell", resource: "*", effect: "ask" },
     { action: "edit", resource: "*", effect: "ask" },
   ],
+  // OpenCode's `skill` tool loads skills by id from these paths, resolved
+  // relative to the project root. Point it at the workspace `skills/` tree so a
+  // "Use the <name> skill" request can load it instead of failing.
+  skills: { paths: ["skills"] },
 });
 
 export function opencodeConfigContent(configured: string | undefined): string {

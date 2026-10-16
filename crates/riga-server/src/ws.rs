@@ -2148,13 +2148,15 @@ async fn execute_tool(
             }
         }
         "skill" => {
-            if let Some(name) = input
-                .get("name")
+            // Accept `id` (the provider-facing spelling) or `name`; omit both to
+            // list every skill. Never requires a filesystem search.
+            let id = input
+                .get("id")
+                .or_else(|| input.get("name"))
                 .and_then(serde_json::Value::as_str)
-                .filter(|name| !name.trim().is_empty())
-            {
-                crate::catalog::execute_read(workspace_root, &format!("skills/{name}/SKILL.md"))
-                    .await
+                .filter(|value| !value.trim().is_empty());
+            if let Some(id) = id {
+                crate::catalog::execute_read(workspace_root, &format!("skills/{id}/SKILL.md")).await
             } else {
                 let skills = crate::catalog::load_skills(workspace_root);
                 serde_json::to_string_pretty(&skills).map_err(|error| error.to_string())
@@ -5050,8 +5052,8 @@ fn tool_schemas() -> Vec<serde_json::Value> {
         ),
         function_schema(
             "skill",
-            "Load a named repository skill document, or list all available skills when name is omitted",
-            serde_json::json!({"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}),
+            "Load a skill by `id` (or `name`) from `skills/<id>/SKILL.md` in the workspace root; omit both to list every skill. Skills live only under the workspace root — use this tool instead of searching the filesystem",
+            serde_json::json!({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"}},"required":[]}),
         ),
         function_schema(
             "update_plan",
@@ -5159,6 +5161,7 @@ Tools:\n\
 - `task` runs a subagent, but only when you call it with `action: \"dispatch\"`, an `agent`, and a `prompt`. The `action: \"agents\"` form only lists profiles — listing agents is not progress, so never report work done because you listed them. \
 When the user addresses an agent with `@explore`, `@plan`, `@build`, or `@review`, dispatch it with `action: \"dispatch\"` and the matching `agent` rather than doing the work yourself when the profile's remit fits.\n\
 - When coordinating multiple dependent agents or interpreting live/blocked RunDeck work, read `skills/rundeck/SKILL.md` first. It contains the graph workflow, exact dispatch forms, status meanings, and profile-specific prompt templates; do not ask read-only children to dispatch.\n\
+- `skill` loads a skill by `id` from `skills/<id>/SKILL.md` relative to the workspace root (omit `id` to list every skill). Skills live **only** under that root — to apply one the user names (e.g. `Use the path-walkthrough skill`), call `skill` with that id; never look for it with a filesystem search from `/`, which walks the whole disk and wastes the turn.\n\
 - `update_plan` records the checklist you are working through and `update_todos` keeps your working list current. \
 Call `update_plan` once right after exploring, then `update_todos` as work is discovered, started, finished, fails, or is dropped, instead of narrating progress in prose.\n\
 - `update_graph` publishes a machine-readable DAG with unique node ids, known profiles, prompts, and `depends_on` edges. Use it when the work has dependencies; dispatch a graph node with `task` action `dispatch`, its `node_id`, and the matching profile. A node remains blocked until every dependency completes.\n\

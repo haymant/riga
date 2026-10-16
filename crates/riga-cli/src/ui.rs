@@ -3124,7 +3124,7 @@ mod tests {
             provider: ProviderForm {
                 provider_id: Some("profile-1".into()),
                 profile_name: "OpenCode local".into(),
-                endpoint: "http://127.0.0.1:8788/v1".into(),
+                endpoint: "http://127.0.0.1:8791/v1".into(),
                 api_key: "never-render-this-secret".into(),
                 model: "openai/gpt-4.1".into(),
                 provider_type: riga_server::ws::ProviderType::OpencodeOpenAiCompatible,
@@ -3136,7 +3136,7 @@ mod tests {
                 id: "profile-1".into(),
                 name: "OpenCode local".into(),
                 provider_type: riga_server::ws::ProviderType::OpencodeOpenAiCompatible,
-                endpoint: "http://127.0.0.1:8788/v1".into(),
+                endpoint: "http://127.0.0.1:8791/v1".into(),
                 model: "openai/gpt-4.1".into(),
                 reasoning_effort: "medium".into(),
                 api: riga_server::ws::ProviderApi::Responses,

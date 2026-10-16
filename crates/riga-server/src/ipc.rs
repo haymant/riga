@@ -455,6 +455,13 @@ impl IpcService {
             config.provider_id = existing.provider_id;
             config.provider_type = existing.provider_type;
         }
+        // An `opencode_open_ai_compatible` provider is served by the RIGA
+        // OpenCode adapter. Start it on demand and default the endpoint to it.
+        if config.provider_type == ws::ProviderType::OpencodeOpenAiCompatible
+            && let Some(endpoint) = crate::opencode::ensure_local_endpoint(&config.endpoint).await?
+        {
+            config.endpoint = endpoint;
+        }
         secure_store::save_json("provider", &config).await?;
         Ok(ProviderConfigured {
             endpoint: config.endpoint,
@@ -603,6 +610,14 @@ impl IpcService {
                 .iter()
                 .find(|profile| profile.id == provider_id)
                 .ok_or_else(|| format!("provider profile `{provider_id}` was not found"))?;
+            if profile.config.provider_type == ws::ProviderType::OpencodeOpenAiCompatible
+                && let Some(endpoint) =
+                    crate::opencode::ensure_local_endpoint(&profile.config.endpoint).await?
+            {
+                let mut config = profile.config.clone();
+                config.endpoint = endpoint;
+                return fetch_remote_models(&config).await;
+            }
             return fetch_remote_models(&profile.config).await;
         }
         self.remote_models().await
@@ -686,6 +701,27 @@ impl IpcService {
         self.state.local_models.subscribe()
     }
 
+    /// Connect every **registered** MCP server to the shared runtime. Runs **at
+    /// most once per process**: repeated calls (every run, a reconnect loop) are
+    /// no-ops, which is what keeps a host that calls it frequently from spawning
+    /// a child-process storm.
+    ///
+    /// The demo built-in health probes are deliberately **not** connected here.
+    /// `riga-health-stdio` spawns `current_exe` with the `mcp-health-stdio` arg;
+    /// in a desktop (Tauri) host `current_exe` is the GUI binary, which does not
+    /// handle that arg and would launch another app window — a fork bomb. The
+    /// WebSocket path (a headless `riga-server`/CLI binary) still uses them.
+    pub async fn connect_mcp(&self) {
+        self.state
+            .mcp_connect_once
+            .get_or_init(|| async {
+                let records = self.state.mcp_registry.read().await.clone();
+                tracing::info!(servers = records.len(), "connecting registered MCP servers");
+                self.state.mcp_runtime.connect_records(&records).await;
+            })
+            .await;
+    }
+
     pub async fn start_run(
         &self,
         run_id: String,
@@ -693,6 +729,10 @@ impl IpcService {
         prompt: String,
     ) -> Result<broadcast::Receiver<RigaEventEnvelope>, String> {
         self.ensure_transcripts_loaded().await?;
+        // Connect the registered MCP servers (plus the built-in health probes)
+        // before the run starts, so their tools are advertised to the model over
+        // the IPC path as well as the WebSocket path.
+        self.connect_mcp().await;
         ws::start_ipc_run(
             self.state.workspace_root.clone(),
             self.state.mcp_runtime.clone(),

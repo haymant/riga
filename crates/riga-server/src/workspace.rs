@@ -65,6 +65,7 @@ pub async fn ensure_worktree(base: &Path, session_id: &str) -> Result<PathBuf, S
     // `.git` directory. Checking for either distinguishes "already created"
     // from "not yet".
     if path.join(".git").exists() {
+        seed_worktree_config(base, &path);
         return Ok(path);
     }
     if !base.join(".git").exists() {
@@ -96,14 +97,74 @@ pub async fn ensure_worktree(base: &Path, session_id: &str) -> Result<PathBuf, S
     )
     .await
     {
+        seed_worktree_config(base, &path);
         return Ok(path);
     }
     if run_git(base, &["worktree", "add", &path.to_string_lossy(), &branch]).await {
+        seed_worktree_config(base, &path);
         return Ok(path);
     }
     Err(format!(
         "git worktree add failed for branch `{branch}`; run `git worktree list` in the workspace"
     ))
+}
+
+/// MCP configuration the base workspace may define, mirrored into every session
+/// worktree.
+///
+/// A linked worktree only contains **committed** files, so a `.mcp.json` that is
+/// not committed — and a `.riga-mcp-registry.json` that is gitignored — would be
+/// invisible under the isolated tree, and the `skill`/read tools that resolve
+/// against the worktree would not find them either. Copying keeps the two roots
+/// consistent.
+const WORKTREE_MCP_CONFIG: [&str; 2] = [".mcp.json", ".riga-mcp-registry.json"];
+
+/// Skill trees mirrored into every session worktree, so the `skill` tool and any
+/// file search find them regardless of which files happen to be committed.
+const WORKTREE_SKILL_DIRS: [&str; 1] = ["skills"];
+
+fn seed_worktree_config(base: &Path, worktree: &Path) {
+    for name in WORKTREE_MCP_CONFIG {
+        let from = base.join(name);
+        if !from.is_file() {
+            continue;
+        }
+        let to = worktree.join(name);
+        // `.riga-mcp-registry.json` is a runtime-generated mirror, so refresh it;
+        // `.mcp.json` may be edited inside the worktree, so leave an existing copy.
+        let refresh = name == ".riga-mcp-registry.json";
+        if to.is_file() && !refresh {
+            continue;
+        }
+        if let Err(error) = std::fs::copy(&from, &to) {
+            tracing::warn!(file = %name, %error, "could not mirror MCP config into the session worktree");
+        }
+    }
+    for name in WORKTREE_SKILL_DIRS {
+        if let Err(error) = mirror_dir(&base.join(name), &worktree.join(name)) {
+            tracing::warn!(dir = %name, %error, "could not mirror skills into the session worktree");
+        }
+    }
+}
+
+/// Recursively copy `from` into `to`, overwriting files. A missing source is a
+/// no-op. Used to bring the workspace's uncommitted `skills/` into a worktree,
+/// which a linked worktree does not otherwise contain.
+fn mirror_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+    if !from.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            mirror_dir(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 /// Reduce a client-supplied file name to a safe path component.
@@ -215,6 +276,47 @@ mod tests {
     fn worktree_path_is_under_the_ignored_directory() {
         let path = worktree_path(std::path::Path::new("/repo"), "abc");
         assert!(path.ends_with(".riga/worktrees/abc"), "{}", path.display());
+    }
+
+    #[tokio::test]
+    async fn worktrees_mirror_the_base_mcp_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(base)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(base.join("seed.txt"), "from head").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "seed"]);
+        // `.mcp.json` is committed; the registry is gitignored (never in git).
+        std::fs::write(base.join(".mcp.json"), "{\"mcpServers\":{}}").unwrap();
+        std::fs::write(base.join(".riga-mcp-registry.json"), "[{\"name\":\"riga-flow\"}]").unwrap();
+        // Skills that are uncommitted must still reach the worktree.
+        std::fs::create_dir_all(base.join("skills/demo")).unwrap();
+        std::fs::write(base.join("skills/demo/SKILL.md"), "---\nname: demo\n---\nbody").unwrap();
+
+        let worktree = ensure_worktree(base, "session-1").await.unwrap();
+        assert!(worktree.join(".mcp.json").is_file(), "committed config not mirrored");
+        assert!(
+            worktree.join(".riga-mcp-registry.json").is_file(),
+            "gitignored registry not mirrored into the worktree"
+        );
+        assert!(
+            worktree.join("skills/demo/SKILL.md").is_file(),
+            "uncommitted skills not mirrored into the worktree"
+        );
+        // A second call (worktree already exists) still mirrors the registry.
+        std::fs::remove_file(worktree.join(".riga-mcp-registry.json")).unwrap();
+        let again = ensure_worktree(base, "session-1").await.unwrap();
+        assert!(again.join(".riga-mcp-registry.json").is_file());
     }
 
     #[tokio::test]

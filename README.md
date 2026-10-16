@@ -269,6 +269,25 @@ attach rather than spawning another server. OpenCode v2 requires HTTP Basic
 authentication, so also set `OPENCODE_PASSWORD` (the server password) when
 attaching; the adapter authenticates as user `opencode`.
 
+### Ports and lifecycle
+
+RIGA keeps each process on its own port so nothing collides:
+
+| Process | Default port |
+| --- | --- |
+| `riga-server` (HTTP/WebSocket) | 8787 |
+| `riga-mcp` (riga-flow atlas) | 8788 |
+| RIGA OpenCode Responses adapter | 8791 |
+
+When a provider of type **OpenCode OpenAI compatible** is saved, activated, or has
+its models listed, `riga-server` starts the adapter on demand, points the provider
+at it and waits for `/health`. No `npm` is required: the adapter is resolved as
+`RIGA_OPENCODE_BIN` → `riga-opencode` on `PATH` (or `RIGA_OPENCODE_ADAPTER` for a
+`.js` entrypoint run with `node`). If it cannot start — binary missing, port taken,
+or the adapter exits — the reason (including the adapter's own output) is returned
+to the UI as a toast instead of failing silently. `RIGA_OPENCODE_PORT` overrides
+the adapter port.
+
 The adapter implements `GET /v1/models`, `POST /v1/responses`, and
 `GET /v1/responses/{id}`. Model IDs use OpenCode's `provider/model` convention.
 The adapter returns the OpenCode session ID directly as both `response.id` and

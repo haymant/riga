@@ -90,9 +90,19 @@ function CodeBlock({ children, className }: { children?: ReactNode; className?: 
 /**
  * External links get `target`/`rel`; without `rel="noreferrer"` a model-supplied
  * link leaks the opener to the destination. `noopener` covers older browsers.
+ *
+ * Under a desktop host (Tauri) a `_blank` navigation opens a **second app
+ * window**, so no `target` is emitted there; the click is routed to the host via
+ * the `riga:open-link` event instead (the host opens it in the OS browser).
  */
+const DESKTOP_HOST = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+function isExternal(href: string | undefined): href is string {
+  return Boolean(href && /^https?:/i.test(href));
+}
+
 function linkTarget(href: string | undefined): { target?: string; rel?: string } {
-  if (!href || !/^https?:/i.test(href)) return {};
+  if (!isExternal(href) || DESKTOP_HOST) return {};
   return { target: "_blank", rel: "noopener noreferrer" };
 }
 
@@ -108,7 +118,19 @@ const components = {
     return <pre>{children}</pre>;
   },
   a({ href, children }: { href?: string; children?: ReactNode }) {
-    return <a href={href} {...linkTarget(href)}>{children}</a>;
+    return (
+      <a
+        href={href}
+        {...linkTarget(href)}
+        onClick={(event) => {
+          if (!DESKTOP_HOST || !isExternal(href)) return;
+          event.preventDefault();
+          window.dispatchEvent(new CustomEvent("riga:open-link", { detail: { url: href } }));
+        }}
+      >
+        {children}
+      </a>
+    );
   },
 };
 

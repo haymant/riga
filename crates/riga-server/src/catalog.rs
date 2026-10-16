@@ -161,7 +161,7 @@ pub fn builtins() -> Vec<CatalogItem> {
             "Create or inspect tasks, or dispatch a specialized RIGA agent",
             false,
         ),
-        ("skill", "Load a repository skill document", false),
+        ("skill", "Load a skill from skills/<name>/SKILL.md in the workspace (list all when name is omitted)", false),
         (
             "find_symbol",
             "Find symbol definitions with file:line evidence",
