@@ -1,5 +1,9 @@
 @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
 
+/* Scoped to the `riga` cascade layer (declared lowest by the host) so this
+   stylesheet can never override the embedding application's rules. */
+@layer riga {
+
 :root { font-family: 'Manrope', ui-sans-serif, system-ui, sans-serif; color: #e8eaf0; background: #090b0f; font-synthesis: none; color-scheme: dark; --bg: #090b0f; --panel: #0f1218; --panel-2: #131720; --line: #242a36; --muted: #8b93a4; --soft: #b8bfcd; --purple: #a78bfa; --purple-2: #7c5ce5; --green: #7ce3b1; --amber: #f2c879; --scroll-thumb: rgba(233,237,245,.18); --scroll-thumb-hover: rgba(233,237,245,.36); }
 * { box-sizing: border-box; }
 
@@ -141,7 +145,7 @@ h1 { margin: 0; color: #f4f4f6; font-size: clamp(28px, 4vw, 42px); letter-spacin
 .message-meta { display: flex; gap: 9px; align-items: baseline; }
 .message-meta strong { color: #c4cad5; font-size: 11px; }
 .message-meta span { color: #646e80; font: 10px 'DM Mono', monospace; }
-.message-body p { color: #aeb6c5; line-height: 1.7; font-size: 13px; margin: 6px 0 0; }
+.message-body p { color: #aeb6c5; line-height: 1.9; font-size: 13px; margin: 6px 0 0; }
 .tool-card { border: 1px solid #2b3442; background: #121820; border-radius: 9px; overflow: hidden; margin-left: 39px; max-width: 700px; }
 .tool-card-top { display: flex; gap: 10px; align-items: center; padding: 12px 13px; }
 .tool-symbol { width: 25px; height: 25px; display: grid; place-items: center; color: #a8d2c5; background: #19342e; border-radius: 6px; }
@@ -490,13 +494,13 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 .markdown { min-width: 0; }
 .markdown > :first-child { margin-top: 0; }
 .markdown > :last-child { margin-bottom: 0; }
-.message-body .markdown p { color: var(--text); line-height: 1.7; font-size: 13px; margin: 0 0 11px; }
+.message-body .markdown p { color: var(--text); line-height: 1.9; font-size: 13px; margin: 0 0 16px; }
 .message-body .markdown h1,
 .message-body .markdown h2,
 .message-body .markdown h3,
 .message-body .markdown h4 {
-  color: var(--text); font-weight: 700; letter-spacing: -.015em; line-height: 1.3;
-  margin: 18px 0 8px;
+  color: var(--text); font-weight: 700; letter-spacing: -.015em; line-height: 1.35;
+  margin: 24px 0 10px;
 }
 .message-body .markdown h1 { font-size: 19px; }
 .message-body .markdown h2 { font-size: 16px; }
@@ -504,7 +508,7 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
 .message-body .markdown h4 { font-size: 13px; color: var(--text-muted); }
 .message-body .markdown ul,
 .message-body .markdown ol { margin: 0 0 11px; padding-left: 20px; }
-.message-body .markdown li { color: var(--text); line-height: 1.7; font-size: 13px; margin: 3px 0; }
+.message-body .markdown li { color: var(--text); line-height: 1.85; font-size: 13px; margin: 6px 0; }
 .message-body .markdown li::marker { color: var(--text-muted); }
 .message-body .markdown li > ul,
 .message-body .markdown li > ol { margin: 3px 0; }
@@ -862,4 +866,13 @@ kbd { color: #868f9e; border: 1px solid #2f3542; border-radius: 3px; padding: 1p
   .workspace-tree { overflow: auto; }
   .workspace-preview { flex: 1 1 auto !important; min-height: 0; }
   .workspace-divider { display: none; }
+}
+  /* Keep the transcript the same width as the composer: wide content (code,
+     tables, tool output) scrolls inside its own block instead of widening the
+     column and forcing a horizontal page scroll. */
+  .transcript { overflow-x: hidden; }
+  .message-row, .tool-card, .tool-timeline, .reasoning-block, .tool-output,
+  .markdown, .code-block, .code-block pre, .message-body { min-width: 0; max-width: 100%; }
+  .markdown pre, .markdown table, .markdown, .tool-output, .workspace-code-body { overflow-x: auto; max-width: 100%; }
+
 }

@@ -12,6 +12,19 @@ export const RIGA_ASSISTANT_UI_VERSION = "0.1.0" as const;
 export type AssistantUiOptions = {
   /** Show the compact session-history button in the chat header. */
   showSessionHistoryButton?: boolean;
+  /**
+   * Show RIGA's own title bar (brand + transport pill + theme / full-width
+   * toggles). Hide it when embedding the surface in a host that already provides
+   * a header, so the assistant does not look non-native and the composer is not
+   * pushed off-screen. Defaults to `true`.
+   */
+  showHeader?: boolean;
+  /**
+   * Controlled theme. When set, the host owns the theme (e.g. fina-builder's
+   * light/dark switch) and RIGA follows it instead of managing its own. Omit to
+   * let RIGA own the theme (the standalone demo).
+   */
+  theme?: "dark" | "light";
   /** Let the chat surface expand to the full width of its parent container. */
   fullWidth?: boolean;
   /**
@@ -29,5 +42,6 @@ export type AssistantUiOptions = {
 
 export const DEFAULT_ASSISTANT_UI_OPTIONS = {
   showSessionHistoryButton: true,
+  showHeader: true,
   fullWidth: false,
 } as const;

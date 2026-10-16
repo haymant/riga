@@ -152,6 +152,8 @@ export type AssistantUIProps = AssistantUiOptions & {
 
 function AssistantUIInner({
   showSessionHistoryButton = DEFAULT_ASSISTANT_UI_OPTIONS.showSessionHistoryButton,
+  showHeader = DEFAULT_ASSISTANT_UI_OPTIONS.showHeader,
+  theme: controlledTheme,
   fullWidth: initialFullWidth = DEFAULT_ASSISTANT_UI_OPTIONS.fullWidth,
   serverUrl,
   transport: suppliedTransport,
@@ -214,7 +216,10 @@ function AssistantUIInner({
   const [evidence, setEvidence] = useState<EvidenceView[]>([]);
   const [knowledge, setKnowledge] = useState<KnowledgeView[]>([]);
   const [runDeckCollapsed, setRunDeckCollapsed] = useState(() => loadLocal("riga.run-deck.default.collapsed", true));
-  const [theme, setTheme] = useState<"dark" | "light">(() => loadLocal("riga.theme.v1", "dark"));
+  const [internalTheme, setInternalTheme] = useState<"dark" | "light">(() => loadLocal("riga.theme.v1", "dark"));
+  // The host may own the theme (e.g. fina-builder's light/dark switch); otherwise
+  // RIGA manages it itself.
+  const theme = controlledTheme ?? internalTheme;
   const [fullWidthEnabled, setFullWidthEnabled] = useState(initialFullWidth);
   const [transportStatus, setTransportStatus] = useState<"connecting" | "connected" | "closed" | "error">("connecting");
   const [catalogOpen, setCatalogOpen] = useState(false);
@@ -303,9 +308,13 @@ function AssistantUIInner({
   };
 
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    window.localStorage.setItem("riga.theme.v1", theme);
-  }, [theme]);
+    // When the host controls the theme, it also owns `data-theme` (fina-builder's
+    // ThemeProvider sets it), so RIGA must not fight it.
+    if (!controlledTheme) {
+      document.documentElement.dataset.theme = theme;
+      window.localStorage.setItem("riga.theme.v1", theme);
+    }
+  }, [theme, controlledTheme]);
 
   useEffect(() => {
     const key = `riga.run-deck.${activeSession.id}`;
@@ -1145,10 +1154,12 @@ function AssistantUIInner({
   return (
     <div className={`app-shell theme-${theme}`}>
       <main className="main-panel">
-        <header className="app-header">
-          <div className="app-brand"><div className="brand-mark"><Code2 size={15} strokeWidth={2.6} /></div><strong>RIGA</strong><span>@rigai/assistant-ui</span></div>
-          <div className="app-header-actions"><span className={transportStatus === "connected" ? "connection-pill connected" : "connection-pill"}><span /> {transportStatus}</span><button className="icon-button" aria-label="Toggle theme" title="Toggle theme" onClick={() => setTheme((value) => value === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}</button><button className={`icon-button ${fullWidthEnabled ? "selected" : ""}`} aria-label="Toggle full-width chat" title={fullWidthEnabled ? "Use centered chat width" : "Use full-width chat"} onClick={() => setFullWidthEnabled((value) => !value)}>{fullWidthEnabled ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button></div>
-        </header>
+        {showHeader ? (
+          <header className="app-header">
+            <div className="app-brand"><div className="brand-mark"><Code2 size={15} strokeWidth={2.6} /></div><strong>RIGA</strong><span>@rigai/assistant-ui</span></div>
+            <div className="app-header-actions"><span className={transportStatus === "connected" ? "connection-pill connected" : "connection-pill"}><span /> {transportStatus}</span>{!controlledTheme && <button className="icon-button" aria-label="Toggle theme" title="Toggle theme" onClick={() => setInternalTheme((value) => value === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}</button>}<button className={`icon-button ${fullWidthEnabled ? "selected" : ""}`} aria-label="Toggle full-width chat" title={fullWidthEnabled ? "Use centered chat width" : "Use full-width chat"} onClick={() => setFullWidthEnabled((value) => !value)}>{fullWidthEnabled ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button></div>
+          </header>
+        ) : null}
         <section className={`content-column${fullWidthEnabled ? " full-width" : ""}`}>
           <header className="chat-header">
             <div className="chat-session-label"><div className="chat-session-icon"><MessageSquare size={14} /></div><div><span>Session</span><strong>{activeSession.title}</strong></div><button className="icon-button session-rename-trigger" aria-label={`Rename session ${activeSession.title}`} title="Rename session" disabled={!activeSession.id} onClick={() => beginSessionRename(activeSession)}><Pencil size={13} /></button></div>

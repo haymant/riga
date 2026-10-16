@@ -1,4 +1,4 @@
-import { memo, useCallback, useState, type ReactNode } from "react";
+import { memo, useCallback, useMemo, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -134,6 +134,69 @@ const components = {
   },
 };
 
+export type MarkdownSegment = { thinking: boolean; content: string };
+
+/**
+ * Split a reply into final-answer prose and inline reasoning.
+ *
+ * Models that fold their reasoning into the reply emit `<think>…</think>`
+ * (or `<thinking>`/`<reasoning>`/`<thought>`) in the text stream. Raw HTML is
+ * escaped here by design, so without this the tags (and a stray `</think>`)
+ * render literally. A still-streaming opening tag is treated as thinking to the
+ * end; a stray closing tag is dropped.
+ */
+export function splitThinking(text: string): MarkdownSegment[] {
+  const pattern = /<(think|thinking|reasoning|thought)>([\s\S]*?)(<\/(?:think|thinking|reasoning|thought)>|$)/gi;
+  const segments: MarkdownSegment[] = [];
+  let last = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > last) segments.push({ thinking: false, content: text.slice(last, match.index) });
+    segments.push({ thinking: true, content: match[2] });
+    last = pattern.lastIndex;
+    if (match[3] === "") break; // unterminated: the rest of the stream is reasoning
+  }
+  if (last < text.length) segments.push({ thinking: false, content: text.slice(last) });
+  return segments
+    .map((segment) =>
+      segment.thinking
+        ? segment
+        : {
+            ...segment,
+            // A closing tag that survived on its own (its opener was consumed as
+            // reasoning elsewhere) is a paragraph boundary, not noise. Replace it
+            // with a blank line so the text after it starts a new paragraph.
+            content: segment.content.replace(
+              /<\/?(?:think|thinking|reasoning|thought)>/gi,
+              "\n\n",
+            ),
+          },
+    )
+    .filter((segment) => segment.content.trim().length > 0);
+}
+
+function Prose({ text }: { text: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      {normalizeFences(text)}
+    </ReactMarkdown>
+  );
+}
+
+function Thinking({ content }: { content: string }) {
+  return (
+    <details className="reasoning-block thinking-block">
+      <summary>
+        <span className="reasoning-summary">
+          <strong>Thinking</strong>
+          <span>reasoning</span>
+        </span>
+      </summary>
+      <div className="reasoning-text">{content.trim()}</div>
+    </details>
+  );
+}
+
 /**
  * Renders model prose as markdown.
  *
@@ -151,11 +214,16 @@ const components = {
  * the whole transcript re-parses whenever any sibling state changes.
  */
 export const Markdown = memo(function Markdown({ text }: { text: string }) {
+  const segments = useMemo(() => splitThinking(text), [text]);
   return (
     <div className="markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
-        {normalizeFences(text)}
-      </ReactMarkdown>
+      {segments.map((segment, index) =>
+        segment.thinking ? (
+          <Thinking key={index} content={segment.content} />
+        ) : (
+          <Prose key={index} text={segment.content} />
+        ),
+      )}
     </div>
   );
 });
