@@ -748,6 +748,34 @@ impl IpcService {
             .collect()
     }
 
+    /// Call a registered MCP server's tool by `<server>/<tool>`. Connects the
+    /// registry first (idempotent), verifies the server advertises the tool, and
+    /// returns the tool's rendered output.
+    ///
+    /// The ToolServer registers MCP tools under their **bare** name (the name
+    /// from `tools/list`), so the server part is used for validation, not for
+    /// name resolution.
+    pub async fn call_mcp_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        input: serde_json::Value,
+    ) -> Result<String, String> {
+        self.connect_mcp().await;
+        let tools = self.state.mcp_runtime.server_tool_names(server).await;
+        if !tools.iter().any(|name| name == tool) {
+            return Err(if tools.is_empty() {
+                format!("server '{server}' is not connected (or advertises no tools); run --tools")
+            } else {
+                format!(
+                    "server '{server}' does not advertise '{tool}' (available: {})",
+                    tools.join(", ")
+                )
+            });
+        }
+        self.state.mcp_runtime.execute(tool, &input).await
+    }
+
     pub async fn start_run(
         &self,
         run_id: String,

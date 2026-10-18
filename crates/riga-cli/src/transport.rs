@@ -340,6 +340,16 @@ impl IpcTransport {
         self.service.mcp_status().await
     }
 
+    /// Call a registered MCP tool by `<server>/<tool>` and return its output.
+    pub async fn call_mcp_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        input: serde_json::Value,
+    ) -> Result<String, String> {
+        self.service.call_mcp_tool(server, tool, input).await
+    }
+
     pub async fn local_models(&self) -> LocalModelOverview {
         self.service.local_models().await
     }

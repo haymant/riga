@@ -2,6 +2,7 @@ mod app;
 mod input;
 mod markdown;
 mod model;
+mod report;
 mod terminal;
 mod transport;
 mod ui;
@@ -36,7 +37,13 @@ struct Args {
     /// Print the connected MCP servers and their tools (markdown).
     #[arg(long)]
     tools: bool,
-    /// Emit JSON instead of markdown for the flags that support it (--tools).
+    /// Call an MCP tool: `<server>/<tool>` (e.g. `riga-flow/price_put`).
+    #[arg(long)]
+    call: Option<String>,
+    /// JSON input for --call: inline JSON, or `@path/to/file.json`.
+    #[arg(long)]
+    input: Option<String>,
+    /// Emit JSON instead of markdown for the flags that support it (--tools, --call).
     #[arg(long)]
     json: bool,
     /// Start the interactive Ratatui terminal UI.
@@ -121,7 +128,11 @@ async fn main() -> Result<(), String> {
     // The headless flags remain deterministic; interactive mode uses the same
     // IPC runtime boundary and is enabled explicitly with --tui.
     if args.health
-        || (!args.list_sessions && args.create_session.is_none() && !args.catalog && !args.tools)
+        || (!args.list_sessions
+            && args.create_session.is_none()
+            && !args.catalog
+            && !args.tools
+            && args.call.is_none())
     {
         println!(
             "{}",
@@ -167,6 +178,30 @@ async fn main() -> Result<(), String> {
             );
         } else {
             print!("{}", render_mcp_tools(&status));
+        }
+    }
+
+    if let Some(target) = args.call.as_deref() {
+        let (server, tool) = target
+            .split_once('/')
+            .ok_or_else(|| format!("--call expects <server>/<tool>, got '{target}'"))?;
+        let input: serde_json::Value = match args.input.as_deref() {
+            None => serde_json::json!({}),
+            Some(text) if text.starts_with('@') => {
+                let path = &text[1..];
+                let body = std::fs::read_to_string(path)
+                    .map_err(|error| format!("{path}: {error}"))?;
+                serde_json::from_str(&body).map_err(|error| format!("{path}: {error}"))?
+            }
+            Some(text) => {
+                serde_json::from_str(text).map_err(|error| format!("--input: {error}"))?
+            }
+        };
+        let output = transport.call_mcp_tool(server, tool, input).await?;
+        if args.json {
+            println!("{output}");
+        } else {
+            print!("{}", report::tool_output_to_markdown(&output));
         }
     }
 
