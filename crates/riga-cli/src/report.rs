@@ -179,6 +179,25 @@ pub fn tool_output_to_markdown(text: &str) -> String {
         return "_(empty)_".to_string();
     }
     match serde_json::from_str::<Value>(trimmed) {
+        // A tool result renders as content blocks:
+        //   [{"type":"json","value":{…}}, {"type":"text","text":"…"}]
+        // Prefer the structured block so the output reads as tables, not as a
+        // one-row envelope with the payload escaped inside a cell.
+        Ok(Value::Array(items)) => {
+            if let Some(value) = items
+                .iter()
+                .find(|block| block.get("type").and_then(Value::as_str) == Some("json"))
+                .and_then(|block| block.get("value"))
+            {
+                return json_to_markdown(value);
+            }
+            if let Some(text) = items.iter().find_map(|block| block.get("text").and_then(Value::as_str)) {
+                return tool_output_to_markdown(text);
+            }
+            json_to_markdown(&Value::Array(items))
+        }
+        // Some tools render a single object envelope instead.
+        Ok(Value::Object(map)) if map.contains_key("json") => json_to_markdown(&map["json"]),
         Ok(value) => json_to_markdown(&value),
         Err(_) => format!("```\n{trimmed}\n```"),
     }
@@ -245,5 +264,18 @@ mod tests {
         assert!(tool_output_to_markdown("{\"pv\": 1}").contains("| pv | 1 |"));
         assert!(tool_output_to_markdown("not json").starts_with("```"));
         assert_eq!(tool_output_to_markdown("   "), "_(empty)_");
+    }
+
+    #[test]
+    fn a_tool_envelope_renders_its_structured_payload() {
+        // An object envelope: {"json": …}.
+        let envelope = r#"{"json":{"pv":1.5},"text":"{\"pv\":1.5}"}"#;
+        assert_eq!(tool_output_to_markdown(envelope), json_to_markdown(&json!({"pv": 1.5})));
+        // A content-block array: [{"type":"json","value":…}, {"type":"text","text":"…"}].
+        let blocks = r#"[{"type":"json","value":{"pv":1.5}},{"type":"text","text":"{\"pv\":1.5}"}]"#;
+        assert_eq!(tool_output_to_markdown(blocks), json_to_markdown(&json!({"pv": 1.5})));
+        // A text-only result whose text is JSON still becomes a table.
+        let text_only = r#"[{"type":"text","text":"{\"pv\":2}"}]"#;
+        assert_eq!(tool_output_to_markdown(text_only), json_to_markdown(&json!({"pv": 2})));
     }
 }

@@ -1,0 +1,35 @@
+{
+  "trade": {
+    "trade_id": "termsheet1",
+    "initial_spots": [239.97, 260.0],
+    "maturity_years": 0.4027397260273973,
+    "steps": 105,
+    "strike": 0.78,
+    "knock_in_barrier": 0.7,
+    "knock_out_barrier": 1.1,
+    "coupon_barrier": 1.0,
+    "coupon_rate": 0.009642,
+    "memory_coupon": true,
+    "coupon_periods": 5,
+    "fixed_first_coupon": false,
+    "call_start_step": 0
+  },
+  "market": {
+    "as_of": "2026-09-07",
+    "spots": [267.885, 258.355],
+    "vols": [0.47463, 0.40003],
+    "risk_free_rate": 0.0389,
+    "dividend_yields": [0.0, 0.0065],
+    "correlation": [
+      [1.0, 0.4041],
+      [0.4041, 1.0]
+    ]
+  },
+  "config": {
+    "paths": 30000,
+    "path_block_size": 4096,
+    "seed": 1729,
+    "trace_level": "aggregated"
+  },
+  "as_of": "2026-09-07"
+}

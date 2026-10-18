@@ -3,6 +3,7 @@ mod input;
 mod markdown;
 mod model;
 mod report;
+mod template;
 mod terminal;
 mod transport;
 mod ui;
@@ -43,6 +44,14 @@ struct Args {
     /// JSON input for --call: inline JSON, or `@path/to/file.json`.
     #[arg(long)]
     input: Option<String>,
+    /// PriceRequest template for --call. Defaults to the embedded worst-of
+    /// Phoenix baseline (`templates/termsheet1.request.json`).
+    #[arg(long)]
+    template: Option<String>,
+    /// Patch the template: `path=value`, repeatable. e.g. `--set trade.strike=0.6`
+    /// or `--set market.vols[0]=0.48`.
+    #[arg(long = "set", value_name = "PATH=VALUE")]
+    set: Vec<String>,
     /// Emit JSON instead of markdown for the flags that support it (--tools, --call).
     #[arg(long)]
     json: bool,
@@ -185,7 +194,7 @@ async fn main() -> Result<(), String> {
         let (server, tool) = target
             .split_once('/')
             .ok_or_else(|| format!("--call expects <server>/<tool>, got '{target}'"))?;
-        let input: serde_json::Value = match args.input.as_deref() {
+        let base_input: serde_json::Value = match args.input.as_deref() {
             None => serde_json::json!({}),
             Some(text) if text.starts_with('@') => {
                 let path = &text[1..];
@@ -197,6 +206,22 @@ async fn main() -> Result<(), String> {
                 serde_json::from_str(text).map_err(|error| format!("--input: {error}"))?
             }
         };
+        // The template is used when one is given explicitly, or implicitly when
+        // there are overrides to apply to the shipped baseline.
+        let mut request: Option<serde_json::Value> = if let Some(path) = args.template.as_deref() {
+            let body = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
+            Some(
+                serde_json::from_str(&body).map_err(|error| format!("{path}: {error}"))?,
+            )
+        } else if !args.set.is_empty() {
+            Some(template::default_template())
+        } else {
+            None
+        };
+        if let Some(request) = request.as_mut() {
+            template::apply_overrides(request, &args.set)?;
+        }
+        let input = template::compose_input(tool, Some(base_input), request);
         let output = transport.call_mcp_tool(server, tool, input).await?;
         if args.json {
             println!("{output}");
