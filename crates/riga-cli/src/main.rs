@@ -8,7 +8,7 @@ mod ui;
 
 use clap::Parser;
 use model::{CatalogEntry, CompletionItem, ConnectionState, ProviderForm};
-use riga_server::{CreateSessionRequest, ServerState, catalog::McpServerSummary};
+use riga_server::{CreateSessionRequest, ServerState, catalog::McpServerSummary, ipc::McpToolStatus};
 use serde_json::json;
 use transport::IpcTransport;
 
@@ -33,6 +33,12 @@ struct Args {
     /// Print the discovered catalog.
     #[arg(long)]
     catalog: bool,
+    /// Print the connected MCP servers and their tools (markdown).
+    #[arg(long)]
+    tools: bool,
+    /// Emit JSON instead of markdown for the flags that support it (--tools).
+    #[arg(long)]
+    json: bool,
     /// Start the interactive Ratatui terminal UI.
     #[arg(long)]
     tui: bool,
@@ -83,6 +89,17 @@ async fn main() -> Result<(), String> {
         if let Some(session_id) = app.state.selected_session.clone() {
             app.set_session_history(transport.session_history(&session_id).await);
         }
+        // Preflight: connect the registered MCP servers so their tools are
+        // advertised, and warn about any that are unreachable (stdout is the TUI,
+        // so the warning goes to stderr).
+        for server in transport.mcp_status().await {
+            if !server.connected {
+                eprintln!(
+                    "riga-cli: MCP server '{}' is unreachable — its tools will be missing (build/start it, then restart riga-cli)",
+                    server.name
+                );
+            }
+        }
         let catalog_data = transport.catalog().await;
         app.set_catalog(parse_catalog(catalog_data.clone()));
         let mcp_registry = transport.mcp_registry().await;
@@ -103,7 +120,9 @@ async fn main() -> Result<(), String> {
 
     // The headless flags remain deterministic; interactive mode uses the same
     // IPC runtime boundary and is enabled explicitly with --tui.
-    if args.health || (!args.list_sessions && args.create_session.is_none() && !args.catalog) {
+    if args.health
+        || (!args.list_sessions && args.create_session.is_none() && !args.catalog && !args.tools)
+    {
         println!(
             "{}",
             serde_json::to_string_pretty(&transport.health()).map_err(|error| error.to_string())?
@@ -139,8 +158,52 @@ async fn main() -> Result<(), String> {
         );
     }
 
+    if args.tools {
+        let status = transport.mcp_status().await;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&status).map_err(|error| error.to_string())?
+            );
+        } else {
+            print!("{}", render_mcp_tools(&status));
+        }
+    }
+
     let _ = args.plain;
     Ok(())
+}
+
+/// Markdown listing of the registered MCP servers, their connection state and
+/// their tools — the headless counterpart of the TUI `/mcp` browser.
+fn render_mcp_tools(status: &[McpToolStatus]) -> String {
+    let mut out = format!("# MCP servers ({})\n", status.len());
+    for server in status {
+        let state = if server.connected { "connected" } else { "unreachable" };
+        out.push_str(&format!(
+            "\n## {} — {} · {} tools\n\n",
+            server.name,
+            state,
+            server.tools.len()
+        ));
+        if server.tools.is_empty() {
+            out.push_str(if server.connected {
+                "_connected but advertises no tools_\n"
+            } else {
+                "_not connected — build/start the server, then retry_\n"
+            });
+            continue;
+        }
+        let mut tools = server.tools.clone();
+        tools.sort();
+        let rendered = tools
+            .iter()
+            .map(|tool| format!("`{tool}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!("{rendered}\n"));
+    }
+    out
 }
 
 fn parse_catalog(
@@ -468,5 +531,39 @@ mod tests {
                 .insert_text,
             "Use the read tool: "
         );
+    }
+
+    #[test]
+    fn mcp_tools_markdown_lists_servers_and_flags_unreachable() {
+        let status = vec![
+            McpToolStatus {
+                name: "riga-flow".into(),
+                connected: true,
+                tools: vec!["b_tool".into(), "a_tool".into()],
+            },
+            McpToolStatus {
+                name: "tac-engine".into(),
+                connected: false,
+                tools: Vec::new(),
+            },
+        ];
+        let text = render_mcp_tools(&status);
+        assert!(text.contains("# MCP servers (2)"), "{text}");
+        assert!(text.contains("## riga-flow — connected · 2 tools"), "{text}");
+        // Tools are sorted, so the listing is stable.
+        assert!(text.contains("`a_tool`, `b_tool`"), "{text}");
+        assert!(text.contains("## tac-engine — unreachable · 0 tools"), "{text}");
+        assert!(text.contains("not connected"), "{text}");
+    }
+
+    #[test]
+    fn mcp_tools_markdown_flags_a_connected_server_without_tools() {
+        let status = vec![McpToolStatus {
+            name: "empty".into(),
+            connected: true,
+            tools: Vec::new(),
+        }];
+        let text = render_mcp_tools(&status);
+        assert!(text.contains("advertises no tools"), "{text}");
     }
 }

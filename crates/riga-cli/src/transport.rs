@@ -335,6 +335,11 @@ impl IpcTransport {
         self.service.list_mcp_registry().await
     }
 
+    /// Connect the registered MCP servers (idempotent) and report their state.
+    pub async fn mcp_status(&self) -> Vec<riga_server::ipc::McpToolStatus> {
+        self.service.mcp_status().await
+    }
+
     pub async fn local_models(&self) -> LocalModelOverview {
         self.service.local_models().await
     }

@@ -174,6 +174,14 @@ pub struct IpcAttachment {
     pub session_id: Option<String>,
 }
 
+/// One registered MCP server, its live connection state, and its tools.
+#[derive(Debug, Clone, Serialize)]
+pub struct McpToolStatus {
+    pub name: String,
+    pub connected: bool,
+    pub tools: Vec<String>,
+}
+
 impl IpcService {
     pub fn new(state: ServerState) -> Self {
         Self { state }
@@ -720,6 +728,24 @@ impl IpcService {
                 self.state.mcp_runtime.connect_records(&records).await;
             })
             .await;
+    }
+
+    /// Connect every registered MCP server (idempotent) and report each one's
+    /// connection state plus the tools it advertises — the headless
+    /// "are the engines reachable, and what can they do?" probe behind
+    /// `riga-cli --tools`.
+    pub async fn mcp_status(&self) -> Vec<McpToolStatus> {
+        self.connect_mcp().await;
+        let connected = self.state.mcp_runtime.connected_names().await;
+        self.list_mcp_registry()
+            .await
+            .into_iter()
+            .map(|server| McpToolStatus {
+                connected: connected.iter().any(|name| name == &server.name),
+                name: server.name,
+                tools: server.tools,
+            })
+            .collect()
     }
 
     pub async fn start_run(
