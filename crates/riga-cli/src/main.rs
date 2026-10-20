@@ -215,6 +215,11 @@ async fn main() -> Result<(), String> {
             )
         } else if !args.set.is_empty() {
             Some(template::default_template())
+        } else if tool == "price_trade" {
+            // `price_trade` requires a request; without one the call would be a
+            // guaranteed validation error. Default to the shipped template (the
+            // canonical termsheet1 request), so the baseline matches `price_put`.
+            Some(template::default_template())
         } else {
             None
         };
