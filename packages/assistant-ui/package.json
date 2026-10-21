@@ -25,7 +25,7 @@
   },
   "homepage": "https://github.com/haymant/riga#readme",
   "dependencies": {
-    "lucide-react": "^1.52.0",
+    "lucide-react": "^1.55.0",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1"
   },
