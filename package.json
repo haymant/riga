@@ -23,7 +23,7 @@
     "tauri:build:cuda": "npm run tauri:build:cuda --prefix demo"
   },
   "devDependencies": {
-    "@tauri-apps/api": "^2.12.1",
+    "@tauri-apps/api": "^2.12.3",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
     "@vitest/coverage-v8": "^5.0.3",
